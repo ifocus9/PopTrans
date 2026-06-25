@@ -4,9 +4,9 @@
 
 ## 📸 预览
 
-![翻译效果预览](images/screenshot-20260625-161049.png)
+![翻译效果预览](images/screenshot-20260625-165441.png)
 
-![设置界面预览](images/Snipaste_2026-06-25_16-10-33.png)
+![设置界面预览](images/screenshot-20260625-161049.png)
 
 ## ✨ 功能特点
 
@@ -22,15 +22,15 @@
 
 ## 🛠️ 技术栈
 
-| 组件 | 技术 | 说明 |
-|------|------|------|
-| 翻译引擎 | llama-cpp-python + Hy-MT2-1.8B-GGUF | 高质量中英文翻译模型 |
-| GUI 框架 | tkinter | 轻量级跨平台 GUI |
-| 热键监听 | pynput | 全局快捷键捕获 |
-| 系统托盘 | pystray | 系统托盘图标管理 |
-| 剪贴板 | pyperclip | 剪贴板读写操作 |
-| 图像处理 | Pillow | 托盘图标生成 |
-| 模型下载 | huggingface_hub | 从 HuggingFace 下载模型 |
+| 组件     | 技术                                | 说明                    |
+| -------- | ----------------------------------- | ----------------------- |
+| 翻译引擎 | llama-cpp-python + Hy-MT2-1.8B-GGUF | 高质量中英文翻译模型    |
+| GUI 框架 | tkinter                             | 轻量级跨平台 GUI        |
+| 热键监听 | pynput                              | 全局快捷键捕获          |
+| 系统托盘 | pystray                             | 系统托盘图标管理        |
+| 剪贴板   | pyperclip                           | 剪贴板读写操作          |
+| 图像处理 | Pillow                              | 托盘图标生成            |
+| 模型下载 | huggingface_hub                     | 从 HuggingFace 下载模型 |
 
 ## 📦 安装
 
@@ -45,11 +45,13 @@ pip install -r requirements.txt
 #### Windows 安装 llama-cpp-python
 
 **方法一：使用预编译的 wheel（推荐）**
+
 ```bash
 pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 ```
 
 **方法二：从源码编译**
+
 1. 安装 Visual Studio Build Tools（包含 C++ 编译器）
 2. 或者安装 MinGW-w64
 3. 然后运行：`pip install llama-cpp-python`
@@ -72,13 +74,13 @@ python main.py
 
 ### 快捷操作
 
-| 操作 | 说明 |
-|------|------|
-| `Ctrl+Alt+Q` | 翻译选中文本（默认快捷键，可自定义） |
-| `Esc` | 关闭翻译窗口 |
-| 点击窗口外部 | 关闭翻译窗口 |
-| 拖拽标题栏 | 移动翻译窗口 |
-| 点击「复制译文」 | 复制翻译结果到剪贴板 |
+| 操作             | 说明                                 |
+| ---------------- | ------------------------------------ |
+| `Ctrl+Alt+Q`     | 翻译选中文本（默认快捷键，可自定义） |
+| `Esc`            | 关闭翻译窗口                         |
+| 点击窗口外部     | 关闭翻译窗口                         |
+| 拖拽标题栏       | 移动翻译窗口                         |
+| 点击「复制译文」 | 复制翻译结果到剪贴板                 |
 
 ### 自定义快捷键
 
@@ -127,15 +129,15 @@ python test_llama_cpp.py
 
 ## 📊 模型信息
 
-| 属性 | 值 |
-|------|-----|
-| 模型名称 | 腾讯 Hy-MT2-1.8B |
-| 模型格式 | GGUF (Q4_K_M 量化) |
-| 模型大小 | 约 1.13GB |
-| 支持语言 | 中英文互译 |
-| 推理引擎 | llama.cpp |
-| 加速方式 | CPU 多线程 |
-| 上下文窗口 | 4096 tokens |
+| 属性       | 值                 |
+| ---------- | ------------------ |
+| 模型名称   | 腾讯 Hy-MT2-1.8B   |
+| 模型格式   | GGUF (Q4_K_M 量化) |
+| 模型大小   | 约 1.13GB          |
+| 支持语言   | 中英文互译         |
+| 推理引擎   | llama.cpp          |
+| 加速方式   | CPU 多线程         |
+| 上下文窗口 | 4096 tokens        |
 
 ## 🐛 故障排除
 
@@ -143,6 +145,7 @@ python test_llama_cpp.py
 
 **问题**：`pip install llama-cpp-python` 报错
 **解决方案**：
+
 - 使用预编译的 wheel（推荐）：
   ```bash
   pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
@@ -153,6 +156,7 @@ python test_llama_cpp.py
 
 **问题**：首次运行时模型下载失败
 **解决方案**：
+
 - 检查网络连接
 - 尝试使用 HuggingFace 镜像：
   ```bash
@@ -165,6 +169,7 @@ python test_llama_cpp.py
 
 **问题**：翻译响应时间过长
 **解决方案**：
+
 - 确保使用 CPU 多线程（默认启用）
 - 检查系统 CPU 使用率，关闭其他占用 CPU 的程序
 - 考虑使用更小的量化版本（如 Q2_K）
@@ -173,6 +178,7 @@ python test_llama_cpp.py
 
 **问题**：按下快捷键没有反应
 **解决方案**：
+
 - 以管理员权限运行程序
 - 检查是否有其他软件占用了相同快捷键
 - 通过托盘菜单重新设置快捷键
@@ -182,6 +188,7 @@ python test_llama_cpp.py
 
 **问题**：翻译窗口显示但没有结果
 **解决方案**：
+
 - 检查选中的文本是否有效
 - 查看日志文件 `translate.log` 获取错误信息
 - 尝试重启程序
@@ -247,6 +254,7 @@ GENERATION_CONFIG = {
 ### 扩展开发
 
 如需添加其他语言支持：
+
 1. 下载对应的 GGUF 模型
 2. 修改 `translator.py` 中的 `MODEL_ID` 和 `MODEL_FILENAME`
 3. 更新 `PROMPT_TEMPLATE` 以支持新的语言对
