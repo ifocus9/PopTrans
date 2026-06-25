@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Model files
+models/
+*.gguf
+*.bin
+*.pt
+*.pth
+
+# Config files with sensitive data
+settings.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+dist/
+build/
+*.spec

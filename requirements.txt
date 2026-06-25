@@ -1,0 +1,7 @@
+llama-cpp-python>=0.3.0
+huggingface_hub>=0.20.0
+pynput>=1.7.0
+pyperclip>=1.8.2
+pystray>=0.19.5
+Pillow>=10.0.0
+requests>=2.31.0
