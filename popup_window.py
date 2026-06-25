@@ -48,6 +48,7 @@ FONT_SIZE_BTN = 13
 # 窗口配置
 WINDOW_WIDTH = 420
 WINDOW_MIN_HEIGHT = 180
+WINDOW_MAX_HEIGHT = 500  # 最大高度限制
 WINDOW_ALPHA = 0.96
 WINDOW_PADDING = 24
 FADE_STEP = 0.05
@@ -425,23 +426,38 @@ class TranslationPopup:
             pady=1,
         ).pack()
 
+        # 计算文本高度，限制最大高度
+        text_height = self._calc_text_height(translated_text, self._layout_width)
+        max_text_height = (WINDOW_MAX_HEIGHT - 200) // 15  # 估算最大行数
+        
+        # 译文内容容器（支持滚动）
+        text_container = tk.Frame(frame, bg=COLORS["bg"])
+        text_container.pack(anchor="w", fill="x")
+        
         # 译文内容
         text_widget = tk.Text(
-            frame,
+            text_container,
             font=(FONT_FAMILY, FONT_SIZE_TEXT + 1),
             fg=COLORS["text_result"],
             bg=COLORS["bg"],
             wrap="word",
             borderwidth=0,
             highlightthickness=0,
-            height=self._calc_text_height(translated_text, self._layout_width),
+            height=min(text_height, max_text_height),
             padx=0,
             pady=6,
             cursor="arrow",
         )
+        
+        # 添加滚动条（当内容较多时）
+        if text_height > max_text_height:
+            scrollbar = tk.Scrollbar(text_container, command=text_widget.yview)
+            scrollbar.pack(side="right", fill="y")
+            text_widget.config(yscrollcommand=scrollbar.set)
+        
         text_widget.insert("1.0", translated_text)
         text_widget.config(state="disabled")
-        text_widget.pack(anchor="w", fill="x")
+        text_widget.pack(side="left", anchor="w", fill="x", expand=True)
 
     def _build_copy_button(self, parent, text_to_copy: str):
         """构建复制按钮"""
@@ -487,6 +503,9 @@ class TranslationPopup:
 
         win_w = self._layout_width
         win_h = self.window.winfo_reqheight()
+        
+        # 限制窗口最大高度
+        win_h = min(win_h, WINDOW_MAX_HEIGHT)
 
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
