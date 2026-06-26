@@ -48,7 +48,7 @@ FONT_SIZE_BTN = 13
 # 窗口配置
 WINDOW_WIDTH = 420
 WINDOW_MIN_HEIGHT = 180
-WINDOW_MAX_HEIGHT = 500  # 最大高度限制
+WINDOW_MAX_HEIGHT_RATIO = 0.72  # 超过屏幕高度的 72% 后使用滚动条
 WINDOW_ALPHA = 0.96
 WINDOW_PADDING = 24
 FADE_STEP = 0.05
@@ -393,7 +393,7 @@ class TranslationPopup:
             wrap="word",
             borderwidth=0,
             highlightthickness=0,
-            height=self._calc_text_height(source_text, self._layout_width),
+            height=self._calc_text_height(source_text, self._layout_width, FONT_SIZE_TEXT),
             padx=0,
             pady=6,
             cursor="arrow",
@@ -426,9 +426,9 @@ class TranslationPopup:
             pady=1,
         ).pack()
 
-        # 计算文本高度，限制最大高度
-        text_height = self._calc_text_height(translated_text, self._layout_width)
-        max_text_height = (WINDOW_MAX_HEIGHT - 200) // 15  # 估算最大行数
+        # 计算文本高度，超过屏幕一定比例后再滚动
+        text_height = self._calc_text_height(translated_text, self._layout_width, FONT_SIZE_TEXT + 1)
+        max_text_height = max(3, (self._get_max_window_height() - 200) // 15)  # 估算最大行数
         
         # 译文内容容器（支持滚动）
         text_container = tk.Frame(frame, bg=COLORS["bg"])
@@ -505,7 +505,7 @@ class TranslationPopup:
         win_h = self.window.winfo_reqheight()
         
         # 限制窗口最大高度
-        win_h = min(win_h, WINDOW_MAX_HEIGHT)
+        win_h = min(win_h, self._get_max_window_height())
 
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
@@ -577,13 +577,32 @@ class TranslationPopup:
     # ── 辅助方法 ──────────────────────────────────────────
 
     @staticmethod
-    def _calc_text_height(text: str, wrap_width: int = WINDOW_WIDTH) -> int:
-        """根据文本内容和窗口宽度估算 Text 组件高度"""
-        lines = text.count("\n") + 1
-        chars_per_line = max(18, (wrap_width - WINDOW_PADDING * 2 - 12) // 8)
+    def _calc_text_height(text: str, wrap_width: int = WINDOW_WIDTH, font_size: int = FONT_SIZE_TEXT) -> int:
+        """根据实际字体宽度估算 Text 组件需要的显示行数。"""
+        font = tkfont.Font(family=FONT_FAMILY, size=font_size)
+        max_line_width = max(80, wrap_width - WINDOW_PADDING * 2 - 12)
+        total_lines = 0
 
-        for line in text.split("\n"):
-            if len(line) > chars_per_line:
-                lines += -(-len(line) // chars_per_line) - 1
+        for paragraph in text.split("\n"):
+            if not paragraph:
+                total_lines += 1
+                continue
 
-        return max(lines, 1)
+            line_width = 0
+            paragraph_lines = 1
+            for char in paragraph:
+                char_width = font.measure(char)
+                if line_width > 0 and line_width + char_width > max_line_width:
+                    paragraph_lines += 1
+                    line_width = char_width
+                else:
+                    line_width += char_width
+
+            total_lines += paragraph_lines
+
+        return max(total_lines, 1)
+
+    def _get_max_window_height(self) -> int:
+        """Calculate the popup height cap from the current screen height."""
+        screen_h = self.root.winfo_screenheight()
+        return max(WINDOW_MIN_HEIGHT, int(screen_h * WINDOW_MAX_HEIGHT_RATIO))
