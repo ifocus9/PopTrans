@@ -265,11 +265,55 @@ class TranslateApp:
     @staticmethod
     def _force_exit():
         """Flush logs, then make sure PyInstaller leaves no process behind."""
+        # 释放互斥量
+        global mutex_handle
+        if 'mutex_handle' in globals() and mutex_handle:
+            ctypes.windll.kernel32.CloseHandle(mutex_handle)
+            mutex_handle = None
+        
         logging.shutdown()
         os._exit(0)
+# ── 防多开检查 ────────────────────────────────────────────
+
+def check_single_instance():
+    """检查是否已有实例在运行，防止程序多开"""
+    import ctypes
+    from ctypes import wintypes
+    
+    # 创建命名互斥量
+    mutex_name = "TranslatePlugin_SingleInstance_Mutex"
+    mutex = ctypes.windll.kernel32.CreateMutexW(None, False, mutex_name)
+    
+    # 检查是否已存在
+    last_error = ctypes.windll.kernel32.GetLastError()
+    ERROR_ALREADY_EXISTS = 183
+    
+    if last_error == ERROR_ALREADY_EXISTS:
+        # 已有实例在运行
+        ctypes.windll.kernel32.CloseHandle(mutex)
+        
+        # 弹窗提示
+        try:
+            from tkinter import messagebox
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showwarning("选中翻译工具", "程序已在运行中！\n请检查系统托盘区域。")
+            root.destroy()
+        except:
+            pass
+        
+        return False
+    
+    return mutex
+
 # ── 入口 ──────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # 防多开检查
+    mutex_handle = check_single_instance()
+    if mutex_handle is False:
+        sys.exit(0)
+    
     try:
         TranslateApp()
     except Exception as e:
@@ -287,6 +331,10 @@ if __name__ == "__main__":
             root.destroy()
         except:
             pass
+        
+        # 释放互斥量
+        if 'mutex_handle' in globals() and mutex_handle:
+            ctypes.windll.kernel32.CloseHandle(mutex_handle)
 
 
 
