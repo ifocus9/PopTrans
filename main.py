@@ -9,6 +9,7 @@ import sys
 import os
 import io
 import logging
+from logging.handlers import RotatingFileHandler
 import threading
 import ctypes
 def _configure_tcl_tk():
@@ -55,6 +56,8 @@ from settings_window import SettingsWindow
 # ── 日志配置 ──────────────────────────────────────────────
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+LOG_MAX_BYTES = 10 * 1024 * 1024
+LOG_BACKUP_COUNT = 5
 
 # 支持 PyInstaller 打包：日志写到 exe 所在目录
 if getattr(sys, 'frozen', False):
@@ -76,7 +79,12 @@ logging.basicConfig(
     level=logging.INFO,
     format=LOG_FORMAT,
     handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        RotatingFileHandler(
+            LOG_FILE,
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        ),
         _stream_handler,
     ],
 )

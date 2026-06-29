@@ -147,6 +147,7 @@ python test_llama_cpp.py
 - 默认使用 CPU 多线程推理，无需 GPU
 - 自定义快捷键设置会自动保存到 `settings.json` 文件中
 - 已优化高 DPI 显示器支持，文字显示清晰且大小合适
+- 日志写入 `translate.log`，按大小轮转：单文件最大 `10MB`，最多保留 `5` 个历史文件
 
 ## 📊 模型信息
 
