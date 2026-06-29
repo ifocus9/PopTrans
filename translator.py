@@ -11,6 +11,7 @@ import sys
 import re
 import threading
 import logging
+from collections import OrderedDict
 from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -37,12 +38,16 @@ os.environ["NO_PROXY"] = "hf-mirror.com,huggingface.co"
 os.environ["no_proxy"] = "hf-mirror.com,huggingface.co"
 
 # Hy-MT2 推荐参数
+MODEL_N_CTX = 1536
+TRANSLATION_MAX_TOKENS = 384
+CACHE_MAX_ENTRIES = 256
+
 GENERATION_CONFIG = {
     "temperature": 0.7,
     "top_p": 0.6,
     "top_k": 20,
     "repeat_penalty": 1.05,
-    "max_tokens": 4096,
+    "max_tokens": TRANSLATION_MAX_TOKENS,
 }
 
 # 语言名称映射
@@ -75,6 +80,8 @@ class Translator:
         self.ready = False
         self._model = None
         self._setup_lock = threading.Lock()
+        self._cache_lock = threading.Lock()
+        self._translation_cache = OrderedDict()
         self._status_message = "翻译引擎未初始化"
 
     @property
@@ -164,7 +171,7 @@ class Translator:
 
         self._model = Llama(
             model_path=MODEL_PATH,
-            n_ctx=4096,  # 上下文窗口大小
+            n_ctx=MODEL_N_CTX,  # 划词翻译以短文本为主，收紧上下文可减少推理开销
             n_threads=os.cpu_count(),  # 使用所有 CPU 核心
             verbose=False,  # 关闭详细日志
         )
@@ -196,6 +203,11 @@ class Translator:
         if not text:
             return None, "文本为空"
 
+        cached_result = self._get_cached_translation(text)
+        if cached_result is not None:
+            logger.info(f"翻译缓存命中: {text[:30]}...")
+            return cached_result, None
+
         try:
             # 自动检测翻译方向
             if self._is_chinese(text):
@@ -219,6 +231,7 @@ class Translator:
             if response and "choices" in response and len(response["choices"]) > 0:
                 result = response["choices"][0]["message"]["content"].strip()
                 if result:
+                    self._store_cached_translation(text, result)
                     logger.info(f"翻译成功 [{direction}]: {text[:30]}...")
                     return result, None
                 else:
@@ -243,6 +256,25 @@ class Translator:
         if total_chars == 0:
             return False
         return (cjk_chars / total_chars) > 0.3
+
+    def _get_cached_translation(self, text: str) -> Optional[str]:
+        """返回缓存中的翻译结果，并在命中时刷新 LRU 顺序。"""
+        with self._cache_lock:
+            cached_result = self._translation_cache.get(text)
+            if cached_result is None:
+                return None
+
+            self._translation_cache.move_to_end(text)
+            return cached_result
+
+    def _store_cached_translation(self, text: str, result: str):
+        """缓存成功的翻译结果，避免重复文本反复推理。"""
+        with self._cache_lock:
+            self._translation_cache[text] = result
+            self._translation_cache.move_to_end(text)
+
+            while len(self._translation_cache) > CACHE_MAX_ENTRIES:
+                self._translation_cache.popitem(last=False)
 
     def translate_async(self, text: str, callback):
         """

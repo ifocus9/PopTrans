@@ -106,9 +106,28 @@ translate-plugin/
 ├── models/              # 模型存储目录（自动创建）
 ├── settings.json        # 用户配置文件（自动生成）
 ├── requirements.txt     # Python 依赖
+├── build.bat             # Windows 打包脚本（PyInstaller）
 ├── test_llama_cpp.py    # llama.cpp 集成测试脚本
 └── README.md            # 项目说明
 ```
+
+## 📦 打包
+
+使用 `build.bat` 可将项目打包为 Windows 可执行文件（.exe），无需 Python 环境即可运行：
+
+```batch
+build.bat
+```
+
+打包流程：
+1. 清理旧的构建文件
+2. 使用 PyInstaller 打包 Python 脚本为 exe
+3. 拷贝模型文件到输出目录
+4. 清理临时文件
+
+打包完成后，可执行文件位于 `dist\选中翻译\` 目录下。
+
+**注意**：打包前请确保已安装 PyInstaller 并完成模型下载。
 
 ## 🔧 测试
 
