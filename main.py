@@ -1,4 +1,4 @@
-﻿"""
+"""
 main.py — 选中翻译工具主入口
 
 Windows 桌面翻译工具：选中任意文本，按下 Ctrl+Alt+Q 即可弹窗显示翻译结果。
@@ -91,6 +91,26 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _set_window_icon(window: tk.Tk) -> None:
+    """Prefer the PNG asset at runtime and fall back to ICO on Windows."""
+    png_icon_path = os.path.join(_BASE_DIR, "icon.png")
+    if os.path.exists(png_icon_path):
+        try:
+            icon_image = tk.PhotoImage(file=png_icon_path)
+            window.iconphoto(True, icon_image)
+            window._icon_image_ref = icon_image
+            return
+        except Exception as e:
+            logger.error(f"无法设置 PNG 窗口图标: {e}")
+
+    ico_icon_path = os.path.join(_BASE_DIR, "icon.ico")
+    if os.path.exists(ico_icon_path):
+        try:
+            window.iconbitmap(ico_icon_path)
+        except Exception as e:
+            logger.error(f"无法设置 ICO 窗口图标: {e}")
+
+
 class TranslateApp:
     """选中翻译应用主控制器"""
 
@@ -105,7 +125,8 @@ class TranslateApp:
         self._is_quitting = False
         self.root.withdraw()  # 隐藏主窗口
         self.root.title("选中翻译")
-        
+        _set_window_icon(self.root)
+
         # 设置字体渲染质量
         try:
             # 设置 DPI 缩放

@@ -13,56 +13,25 @@ from pystray import MenuItem as Item
 logger = logging.getLogger(__name__)
 
 
+import os
+
 def _create_icon_image(size: int = 64) -> Image.Image:
     """
-    动态生成托盘图标：紫色圆角矩形背景 + 白色 "译" 字。
+    加载静态托盘图标
     """
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-
-    # 绘制圆角矩形背景
-    margin = 4
-    draw.rounded_rectangle(
-        [margin, margin, size - margin, size - margin],
-        radius=size // 5,
-        fill=(139, 92, 246),  # #8b5cf6
-    )
-
-    # 尝试使用系统中文字体绘制 "译" 字
-    label = "译"
-    font_size = size // 2
-    font = None
-
-    # 按优先级尝试中文字体
-    font_candidates = [
-        "msyh.ttc",         # 微软雅黑
-        "msyhbd.ttc",       # 微软雅黑 Bold
-        "simhei.ttf",       # 黑体
-        "simsun.ttc",       # 宋体
-    ]
-    for font_name in font_candidates:
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
+    if os.path.exists(icon_path):
         try:
-            font = ImageFont.truetype(font_name, font_size)
-            break
-        except (OSError, IOError):
-            continue
-
-    if font is None:
-        # 回退：使用默认字体，显示 "T" 代替
-        try:
-            font = ImageFont.truetype("arial.ttf", font_size)
-        except (OSError, IOError):
-            font = ImageFont.load_default()
-        label = "T"
-
-    # 居中绘制文字
-    bbox = draw.textbbox((0, 0), label, font=font)
-    text_w = bbox[2] - bbox[0]
-    text_h = bbox[3] - bbox[1]
-    text_x = (size - text_w) // 2
-    text_y = (size - text_h) // 2 - bbox[1]  # 修正 baseline 偏移
-    draw.text((text_x, text_y), label, fill="white", font=font)
-
+            img = Image.open(icon_path)
+            # Ensure it's RGBA
+            if img.mode != 'RGBA':
+                img = img.convert('RGBA')
+            return img.resize((size, size), Image.Resampling.LANCZOS)
+        except Exception as e:
+            logger.error(f"无法加载图标文件 {icon_path}: {e}")
+    
+    # 回退到简单的绘制
+    img = Image.new("RGBA", (size, size), (139, 92, 246, 255))
     return img
 
 

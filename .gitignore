@@ -52,3 +52,6 @@ Thumbs.db
 dist/
 build/
 *.spec
+
+# WorkBuddy workspace
+.workbuddy/

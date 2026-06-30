@@ -106,7 +106,11 @@ translate-plugin/
 ├── models/              # 模型存储目录（自动创建）
 ├── settings.json        # 用户配置文件（自动生成）
 ├── requirements.txt     # Python 依赖
-├── build.bat             # Windows 打包脚本（PyInstaller）
+├── build.bat            # Windows 打包入口（调用 build_release.py）
+├── build_release.py     # PyInstaller 打包脚本 + ICO 生成器
+├── clear_icon_cache.bat # Windows 图标缓存清理工具
+├── icon.png             # 图标源文件（PNG，透明背景）
+├── icon.ico             # 打包用图标（构建时自动生成）
 ├── test_llama_cpp.py    # llama.cpp 集成测试脚本
 └── README.md            # 项目说明
 ```
@@ -293,6 +297,40 @@ GENERATION_CONFIG = {
 ## 📄 许可证
 
 本项目采用 MIT 许可证。详见 [LICENSE](LICENSE) 文件。
+
+## 📋 更新日志
+
+### v1.1.0 — 2026-06-30
+
+#### 🎨 图标系统重构
+- **修复 exe 图标白底问题**：手动构造 BMP-32 + AND mask 格式 ICO，绕开 Pillow 默认 ICO 写入器的透明度 bug
+  - 7 个尺寸（16~256px）全部正确保留 alpha 通道
+  - 桌面/资源管理器中 exe 图标透明背景完美渲染
+- **托盘图标改用静态 PNG**：替换原动态生成「译」字图标的方案，直接加载 `icon.png`，更清晰且统一品牌
+- **窗口图标支持**：主窗口标题栏图标优先使用 PNG，回退到 ICO
+- 新增 `icon.png` / `icon.ico` 图标资源文件
+- 新增 `clear_icon_cache.bat`：Windows 图标缓存清理工具（重新打包后桌面图标未刷新时使用）
+
+#### 🏗️ 构建系统优化
+- **重构打包脚本**：`build.bat` 现调用 `build_release.py`，构建逻辑从批处理迁移到 Python
+  - 自动从 `icon.png` 生成多尺寸 ICO
+  - 路径解析基于 `sys.executable`，不再硬编码 Python 安装路径
+  - UTF-8 编码处理更健壮
+
+#### 🔧 其他改进
+- 主入口增加窗口图标设置逻辑
+- 托盘图标加载失败时回退到纯色占位图
+
+---
+
+### v1.0.0 — 初始版本
+
+- 一键选中文本翻译（Ctrl+Alt+Q）
+- 基于腾讯 Hy-MT2-1.8B 离线翻译模型
+- 自定义快捷键、系统托盘常驻
+- 深色毛玻璃风格悬浮窗
+- 单实例保护、日志轮转
+- 高 DPI 显示支持
 
 ## 🙏 致谢
 
