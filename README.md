@@ -108,7 +108,6 @@ translate-plugin/
 ├── requirements.txt     # Python 依赖
 ├── build.bat            # Windows 打包入口（调用 build_release.py）
 ├── build_release.py     # PyInstaller 打包脚本 + ICO 生成器
-├── clear_icon_cache.bat # Windows 图标缓存清理工具
 ├── icon.png             # 图标源文件（PNG，透明背景）
 ├── icon.ico             # 打包用图标（构建时自动生成）
 ├── test_llama_cpp.py    # llama.cpp 集成测试脚本
@@ -309,7 +308,6 @@ GENERATION_CONFIG = {
 - **托盘图标改用静态 PNG**：替换原动态生成「译」字图标的方案，直接加载 `icon.png`，更清晰且统一品牌
 - **窗口图标支持**：主窗口标题栏图标优先使用 PNG，回退到 ICO
 - 新增 `icon.png` / `icon.ico` 图标资源文件
-- 新增 `clear_icon_cache.bat`：Windows 图标缓存清理工具（重新打包后桌面图标未刷新时使用）
 
 #### 🏗️ 构建系统优化
 - **重构打包脚本**：`build.bat` 现调用 `build_release.py`，构建逻辑从批处理迁移到 Python
