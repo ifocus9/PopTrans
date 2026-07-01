@@ -1,6 +1,6 @@
 # 选中翻译 — Windows 快捷翻译工具
 
-一款轻量级 Windows 桌面工具：选中任意文本，按下快捷键，即可弹出悬浮窗显示翻译结果。
+一款 Windows 桌面翻译工具。选中文本或框选屏幕区域，按下快捷键即可弹出翻译结果。基于腾讯 Hy-MT2-1.8B 离线翻译与 RapidOCR 引擎，支持中英文互译、OCR 截图翻译、自定义快捷键、深色主题 UI。
 
 ## 📸 预览
 
@@ -137,6 +137,7 @@ build.bat
 ```
 
 打包流程：
+
 1. 清理旧的构建文件
 2. 使用 PyInstaller 打包 Python 脚本为 exe
 3. 拷贝模型文件到输出目录
@@ -322,6 +323,7 @@ GENERATION_CONFIG = {
 ### v1.2.0 — 2026-07-01
 
 #### 🖼️ OCR 截图翻译
+
 - **新增 OCR 翻译模式**：针对无法选中文本的场景（图片、视频字幕、PDF、UI 界面等），通过鼠标框选截图区域进行 OCR 识别后翻译
   - 基于 [RapidOCR](https://github.com/RapidAI/RapidOCR) (ONNX Runtime) 离线识别引擎，3 个模型约 15MB，随 pip 包内置无需额外下载
   - 独立第二热键触发（默认 `Ctrl+Alt+E`，可自定义）
@@ -340,6 +342,7 @@ GENERATION_CONFIG = {
   - RapidOCR 参数调优：`det_box_thresh=0.4`、`det_unclip_ratio=2.2`、`use_cls=False`
 
 #### 🐛 修复
+
 - **热键冲突**：两个 `GlobalHotKeys` 监听器共享 `Ctrl+Alt` 前缀导致误触发，合并为单监听器
 - **遮罩重复**：OCR 框选防重入保护，避免重复按热键产生多层遮罩
 - **鼠标事件吞入**：框选窗口创建后延迟 100ms 绑定鼠标事件，避免吞入按键时的残留鼠标状态
@@ -349,6 +352,7 @@ GENERATION_CONFIG = {
 ### v1.1.0 — 2026-06-30
 
 #### 🎨 图标系统重构
+
 - **修复 exe 图标白底问题**：手动构造 BMP-32 + AND mask 格式 ICO，绕开 Pillow 默认 ICO 写入器的透明度 bug
   - 7 个尺寸（16~256px）全部正确保留 alpha 通道
   - 桌面/资源管理器中 exe 图标透明背景完美渲染
@@ -357,12 +361,14 @@ GENERATION_CONFIG = {
 - 新增 `icon.png` / `icon.ico` 图标资源文件
 
 #### 🏗️ 构建系统优化
+
 - **重构打包脚本**：`build.bat` 现调用 `build_release.py`，构建逻辑从批处理迁移到 Python
   - 自动从 `icon.png` 生成多尺寸 ICO
   - 路径解析基于 `sys.executable`，不再硬编码 Python 安装路径
   - UTF-8 编码处理更健壮
 
 #### 🔧 其他改进
+
 - 主入口增加窗口图标设置逻辑
 - 托盘图标加载失败时回退到纯色占位图
 
