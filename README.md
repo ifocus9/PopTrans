@@ -4,9 +4,9 @@
 
 ## 📸 预览
 
-![翻译效果预览](images/screenshot-20260625-165441.png)
+![翻译效果预览](images/translate.png)
 
-![设置界面预览](images/screenshot-20260625-161049.png)
+![设置界面预览](images/setting.png)
 
 ## ✨ 功能特点
 
