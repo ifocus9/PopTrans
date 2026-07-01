@@ -12,6 +12,8 @@ import logging
 from logging.handlers import RotatingFileHandler
 import threading
 import ctypes
+
+
 def _configure_tcl_tk():
     """Point Tkinter at bundled Tcl/Tk files when PyInstaller cannot auto-detect them."""
     if getattr(sys, 'frozen', False):
@@ -35,14 +37,33 @@ def _configure_tcl_tk():
 
 _configure_tcl_tk()
 
-# 设置 DPI 感知，解决高 DPI 显示器上的模糊问题
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(1)  # PROCESS_SYSTEM_DPI_AWARE
-except Exception:
+
+def _enable_dpi_awareness():
+    """Enable the best Windows DPI awareness available before Tk is imported."""
+    if not sys.platform.startswith("win"):
+        return
+
+    # Windows 10+: per-monitor v2 keeps Tk/root coordinates aligned on mixed-DPI displays.
+    try:
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return
+    except Exception:
+        pass
+
+    # Windows 8.1+: per-monitor awareness.
+    try:
+        if ctypes.windll.shcore.SetProcessDpiAwareness(2) == 0:
+            return
+    except Exception:
+        pass
+
     try:
         ctypes.windll.user32.SetProcessDPIAware()
     except Exception:
         pass
+
+
+_enable_dpi_awareness()
 
 import tkinter as tk
 
@@ -50,7 +71,11 @@ from translator import Translator
 from hotkey_manager import HotkeyManager
 from popup_window import TranslationPopup
 from tray_icon import TrayIcon
-from config_manager import load_config, get_hotkey, get_hotkey_display, set_hotkey
+from ocr_engine import OCREngine
+from config_manager import (
+    load_config, get_hotkey, get_hotkey_display, set_hotkey,
+    get_ocr_enabled, get_ocr_hotkey, get_ocr_hotkey_display, set_ocr_config,
+)
 from settings_window import SettingsWindow
 
 # ── 日志配置 ──────────────────────────────────────────────
@@ -140,12 +165,29 @@ class TranslateApp:
         self.config = load_config()
         self.current_hotkey = get_hotkey()
         self.current_hotkey_display = get_hotkey_display()
+        self.ocr_enabled = get_ocr_enabled()
+        self.ocr_hotkey = get_ocr_hotkey()
+        self.ocr_hotkey_display = get_ocr_hotkey_display()
 
         # ── 初始化各模块 ──
         self.translator = Translator()
         self.popup = TranslationPopup(self.root)
-        self.hotkey_manager = HotkeyManager(on_translate=self._on_text_captured, hotkey=self.current_hotkey)
-        self.tray = TrayIcon(on_quit=self._quit, on_settings=self._open_settings)
+        self.ocr_engine = OCREngine(self.root)
+        # 仅在 OCR 启用时传 on_ocr 回调，HotkeyManager 会据此注册第二热键
+        ocr_callback = self._on_ocr_trigger if self.ocr_enabled else None
+        self.hotkey_manager = HotkeyManager(
+            on_translate=self._on_text_captured,
+            hotkey=self.current_hotkey,
+            on_ocr=ocr_callback,
+            ocr_hotkey=self.ocr_hotkey,
+        )
+        self.tray = TrayIcon(
+            on_quit=self._quit,
+            on_settings=self._open_settings,
+            on_toggle_ocr=self._on_toggle_ocr,
+        )
+        # 同步托盘 OCR 状态
+        self.tray.update_ocr_state(self.ocr_enabled, self.ocr_hotkey_display)
 
         # ── 启动翻译引擎（异步下载模型） ──
         self.translator.setup(
@@ -177,31 +219,58 @@ class TranslateApp:
 
     def _open_settings(self):
         """打开快捷键设置窗口"""
-        def on_hotkey_saved(pynput_hotkey, display_hotkey):
-            """快捷键保存回调"""
-            logger.info(f"快捷键已更新: {pynput_hotkey} ({display_hotkey})")
-            
-            # 保存到配置文件
-            if set_hotkey(pynput_hotkey, display_hotkey):
-                # 更新当前快捷键
-                self.current_hotkey = pynput_hotkey
-                self.current_hotkey_display = display_hotkey
-                
-                # 重新注册热键
-                self.hotkey_manager.stop()
-                self.hotkey_manager = HotkeyManager(on_translate=self._on_text_captured, hotkey=pynput_hotkey)
-                self.hotkey_manager.start()
-                
-                # 更新托盘菜单
-                self.tray.update_hotkey_display(display_hotkey)
-                
-                logger.info(f"快捷键已重新注册: {display_hotkey}")
-            else:
-                logger.error("保存快捷键配置失败")
-        
+        def on_saved(pynput_hotkey, display_hotkey, ocr_enabled, ocr_pynput, ocr_display):
+            """设置保存回调（主热键 + OCR 配置）"""
+            # ── 处理主翻译热键 ──
+            if pynput_hotkey and display_hotkey:
+                logger.info(f"翻译热键已更新: {pynput_hotkey} ({display_hotkey})")
+                if set_hotkey(pynput_hotkey, display_hotkey):
+                    self.current_hotkey = pynput_hotkey
+                    self.current_hotkey_display = display_hotkey
+                    self.hotkey_manager.stop()
+                    self.hotkey_manager = HotkeyManager(
+                        on_translate=self._on_text_captured,
+                        hotkey=pynput_hotkey,
+                        on_ocr=self._on_ocr_trigger if self.ocr_enabled else None,
+                        ocr_hotkey=self.ocr_hotkey,
+                    )
+                    self.hotkey_manager.start()
+                    self.tray.update_hotkey_display(display_hotkey)
+                else:
+                    logger.error("保存翻译热键配置失败")
+
+            # ── 处理 OCR 配置 ──
+            ocr_changed = False
+            if ocr_pynput and ocr_display and ocr_pynput != self.ocr_hotkey:
+                # OCR 热键变更
+                ocr_changed = True
+
+            if ocr_enabled != self.ocr_enabled or ocr_changed:
+                self.ocr_enabled = ocr_enabled
+                if ocr_changed:
+                    self.ocr_hotkey = ocr_pynput
+                    self.ocr_hotkey_display = ocr_display
+                # 持久化
+                set_ocr_config(self.ocr_enabled, self.ocr_hotkey, self.ocr_hotkey_display)
+                logger.info(f"OCR 配置已更新: enabled={self.ocr_enabled}, hotkey={self.ocr_hotkey}")
+
+                # 动态注册/注销 OCR 热键
+                if self.ocr_enabled:
+                    self.hotkey_manager.register_ocr_hotkey(self._on_ocr_trigger, self.ocr_hotkey)
+                else:
+                    self.hotkey_manager.unregister_ocr_hotkey()
+                    self.ocr_engine.release()
+
+                # 更新托盘
+                self.tray.update_ocr_state(self.ocr_enabled, self.ocr_hotkey_display)
+
         # 打开设置窗口
-        settings_window = SettingsWindow(self.root, on_saved=on_hotkey_saved)
-        settings_window.show(self.current_hotkey_display)
+        settings_window = SettingsWindow(self.root, on_saved=on_saved)
+        settings_window.show(
+            self.current_hotkey_display,
+            ocr_enabled=self.ocr_enabled,
+            ocr_current_display=self.ocr_hotkey_display,
+        )
 
     # ── 回调处理 ──────────────────────────────────────────
 
@@ -251,6 +320,59 @@ class TranslateApp:
             logger.info(f"翻译完成: {result[:80]}...")
             self.popup.update_to_result(original, result)
 
+    # ── OCR 翻译 ──────────────────────────────────────────
+
+    def _on_ocr_trigger(self):
+        """OCR 热键触发（热键线程调用，调度到主线程）"""
+        self.root.after(0, self._run_ocr)
+
+    def _run_ocr(self):
+        """启动 OCR 截图框选 + 识别流程"""
+        logger.info("启动 OCR 翻译流程")
+        started = self.ocr_engine.capture_and_recognize(
+            on_done=lambda text: self.root.after(0, self._on_ocr_done, text),
+            on_error=lambda msg: self.root.after(0, self._on_ocr_error, msg),
+        )
+        if started:
+            self.tray.set_status("OCR 识别中...")
+
+    def _on_ocr_done(self, text: str):
+        """OCR 识别完成（主线程）"""
+        if not text or not text.strip():
+            logger.info("OCR 未识别到文本")
+            self.tray.set_status("OCR 未识别到文本")
+            return
+        logger.info(f"OCR 识别完成: {text[:80]}...")
+        self.tray.set_status("就绪")
+        # 复用现有翻译管线
+        self._on_text_captured(text)
+
+    def _on_ocr_error(self, msg: str):
+        """OCR 出错/取消（主线程）"""
+        if msg == "已取消":
+            self.tray.set_status("就绪")
+        else:
+            logger.warning(f"OCR 错误: {msg}")
+            self.tray.set_status(f"OCR 错误: {msg}")
+
+    def _on_toggle_ocr(self, enabled: bool):
+        """托盘菜单切换 OCR 开关（pystray 线程调用，调度到主线程）"""
+        self.root.after(0, lambda: self._apply_ocr_toggle(enabled))
+
+    def _apply_ocr_toggle(self, enabled: bool):
+        """在主线程中应用 OCR 开关切换"""
+        self.ocr_enabled = enabled
+        set_ocr_config(enabled, self.ocr_hotkey, self.ocr_hotkey_display)
+        logger.info(f"OCR 开关切换: {enabled}")
+
+        if enabled:
+            self.hotkey_manager.register_ocr_hotkey(self._on_ocr_trigger, self.ocr_hotkey)
+        else:
+            self.hotkey_manager.unregister_ocr_hotkey()
+            self.ocr_engine.release()
+
+        self.tray.update_ocr_state(enabled, self.ocr_hotkey_display)
+
     # ── 退出 ──────────────────────────────────────────────
 
     def _quit(self):
@@ -271,6 +393,11 @@ class TranslateApp:
             self.hotkey_manager.stop()
         except Exception as e:
             logger.warning(f"停止热键时出错: {e}")
+
+        try:
+            self.ocr_engine.release()
+        except Exception as e:
+            logger.warning(f"释放 OCR 引擎时出错: {e}")
 
         try:
             self.translator.close()
@@ -364,7 +491,4 @@ if __name__ == "__main__":
         # 释放互斥量
         if 'mutex_handle' in globals() and mutex_handle:
             ctypes.windll.kernel32.CloseHandle(mutex_handle)
-
-
-
 

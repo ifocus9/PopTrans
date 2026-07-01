@@ -64,7 +64,7 @@ _SPECIAL_KEY_DISPLAY = {
 class SettingsWindow:
     """快捷键设置对话框"""
 
-    def __init__(self, root: tk.Tk, on_saved: Optional[Callable[[str, str], None]] = None):
+    def __init__(self, root: tk.Tk, on_saved: Optional[Callable] = None):
         self.root = root
         self.on_saved = on_saved
         self.window: Optional[tk.Toplevel] = None
@@ -79,17 +79,32 @@ class SettingsWindow:
         self._is_listening = False
         self._blink_after_id = None
         self._blink_state = False
+        # OCR 相关
+        self._capture_target = "main"  # "main" 或 "ocr"，标记当前捕获目标
+        self._ocr_enabled_var: Optional[tk.BooleanVar] = None
+        self._ocr_display_label: Optional[tk.Label] = None
+        self._ocr_hint_label: Optional[tk.Label] = None
+        self._ocr_capture_frame: Optional[tk.Frame] = None
+        self._main_capture_frame: Optional[tk.Frame] = None
+        self._ocr_current_display = ""
+        self._ocr_captured_pynput = ""
+        self._ocr_captured_display = ""
 
-    def show(self, current_display: str = "Ctrl+Alt+Q"):
+    def show(self, current_display: str = "Ctrl+Alt+Q",
+             ocr_enabled: bool = False, ocr_current_display: str = "Ctrl+Alt+E"):
         """显示设置窗口"""
         if self.window and self.window.winfo_exists():
             self.window.lift()
             return
 
         self._current_display = current_display
+        self._ocr_current_display = ocr_current_display
         self._captured_pynput = ""
         self._captured_display = ""
+        self._ocr_captured_pynput = ""
+        self._ocr_captured_display = ""
         self._pressed_modifiers = set()
+        self._capture_target = "main"
 
         win = tk.Toplevel(self.root)
         self.window = win
@@ -144,7 +159,7 @@ class SettingsWindow:
 
         # 当前快捷键
         tk.Label(
-            content, text=f"当前快捷键：{current_display}",
+            content, text=f"当前：{current_display}",
             font=(FONT_FAMILY, 14),
             fg=COLORS["text_muted"], bg=COLORS["bg"],
         ).pack(pady=(18, 4), padx=20, anchor="w")
@@ -152,31 +167,98 @@ class SettingsWindow:
         # 分隔线
         tk.Frame(content, bg=COLORS["divider"], height=1).pack(fill="x", padx=20, pady=(10, 0))
 
-        # 捕获区
-        capture_frame = tk.Frame(content, bg=COLORS["bg"])
-        capture_frame.pack(fill="x", padx=20, pady=(16, 0))
+        # 翻译快捷键捕获区
+        self._main_capture_frame = tk.Frame(content, bg=COLORS["bg"], highlightbackground=COLORS["accent"], highlightthickness=2)
+        self._main_capture_frame.pack(fill="x", padx=20, pady=(12, 0))
+
+        capture_inner = tk.Frame(self._main_capture_frame, bg=COLORS["bg"], padx=12, pady=8)
+        capture_inner.pack(fill="x")
 
         self._display_label = tk.Label(
-            capture_frame,
+            capture_inner,
             text="按下新的快捷键...",
             font=(FONT_FAMILY, 20, "bold"),
             fg=COLORS["accent"],
             bg=COLORS["bg"],
             height=2,
+            cursor="hand2",
         )
         self._display_label.pack(fill="x")
+        self._display_label.bind("<Button-1>", lambda e: self._switch_capture_target("main"))
 
         self._hint_label = tk.Label(
-            capture_frame,
+            capture_inner,
             text="请按下包含修饰键的组合键（如 Ctrl+Shift+T）",
-            font=(FONT_FAMILY, 13),
+            font=(FONT_FAMILY, 12),
             fg=COLORS["text_muted"],
             bg=COLORS["bg"],
+            cursor="hand2",
         )
         self._hint_label.pack(fill="x", pady=(4, 0))
+        self._hint_label.bind("<Button-1>", lambda e: self._switch_capture_target("main"))
+
+        # ── OCR 翻译分区 ──
+        tk.Frame(content, bg=COLORS["divider"], height=1).pack(fill="x", padx=20, pady=(14, 0))
+
+        ocr_header = tk.Frame(content, bg=COLORS["bg"])
+        ocr_header.pack(fill="x", padx=20, pady=(10, 0))
+
+        self._ocr_enabled_var = tk.BooleanVar(value=ocr_enabled)
+        ocr_check = tk.Checkbutton(
+            ocr_header,
+            text="启用 OCR 翻译",
+            font=(FONT_FAMILY, 14),
+            fg=COLORS["text_result"],
+            bg=COLORS["bg"],
+            selectcolor=COLORS["header_bg"],
+            activebackground=COLORS["bg"],
+            activeforeground=COLORS["text_result"],
+            variable=self._ocr_enabled_var,
+            command=self._on_ocr_toggle,
+        )
+        ocr_check.pack(anchor="w")
+
+        tk.Label(
+            content, text=f"当前：{ocr_current_display}",
+            font=(FONT_FAMILY, 13),
+            fg=COLORS["text_muted"], bg=COLORS["bg"],
+        ).pack(pady=(4, 0), padx=20, anchor="w")
+
+        # OCR 快捷键捕获区
+        self._ocr_capture_frame = tk.Frame(content, bg=COLORS["bg"], highlightbackground=COLORS["border"], highlightthickness=1)
+        self._ocr_capture_frame.pack(fill="x", padx=20, pady=(6, 0))
+
+        ocr_inner = tk.Frame(self._ocr_capture_frame, bg=COLORS["bg"], padx=12, pady=8)
+        ocr_inner.pack(fill="x")
+
+        self._ocr_display_label = tk.Label(
+            ocr_inner,
+            text="按下 OCR 快捷键...",
+            font=(FONT_FAMILY, 20, "bold"),
+            fg=COLORS["text_muted"],
+            bg=COLORS["bg"],
+            height=2,
+            cursor="hand2",
+        )
+        self._ocr_display_label.pack(fill="x")
+        self._ocr_display_label.bind("<Button-1>", lambda e: self._switch_capture_target("ocr"))
+
+        self._ocr_hint_label = tk.Label(
+            ocr_inner,
+            text="先勾选上方开关，再按下组合键",
+            font=(FONT_FAMILY, 12),
+            fg=COLORS["text_muted"],
+            bg=COLORS["bg"],
+            cursor="hand2",
+        )
+        self._ocr_hint_label.pack(fill="x", pady=(4, 0))
+        self._ocr_hint_label.bind("<Button-1>", lambda e: self._switch_capture_target("ocr"))
+
+        # 根据初始状态调整 OCR 捕获区外观
+        self._on_ocr_toggle()
 
         # 分隔线
-        tk.Frame(content, bg=COLORS["divider"], height=1).pack(fill="x", padx=20, pady=(16, 0))
+        tk.Frame(content, bg=COLORS["divider"], height=1).pack(fill="x", padx=20, pady=(14, 0))
 
         # 按钮区
         btn_frame = tk.Frame(content, bg=COLORS["bg"])
@@ -218,13 +300,49 @@ class SettingsWindow:
 
         # 居中
         win.update_idletasks()
-        w, h = 460, 300
+        w, h = 460, 500
         x = (win.winfo_screenwidth() - w) // 2
         y = (win.winfo_screenheight() - h) // 2
         win.geometry(f"{w}x{h}+{x}+{y}")
 
         win.focus_force()
         self._start_blink()
+
+    # ── 捕获目标切换 ──────────────────────────────────
+
+    def _switch_capture_target(self, target: str):
+        """切换当前键盘捕获目标（main / ocr）"""
+        if target == "ocr" and not self._ocr_enabled_var.get():
+            # OCR 未启用时不允许切换到 OCR 捕获，回退到 main
+            self._capture_target = "main"
+        else:
+            self._capture_target = target
+        self._update_capture_highlight()
+
+    def _update_capture_highlight(self):
+        """高亮当前活跃的捕获区，灰化非活跃区"""
+        if not self._main_capture_frame or not self._ocr_capture_frame:
+            return
+        if self._capture_target == "main":
+            self._main_capture_frame.config(highlightbackground=COLORS["accent"], highlightthickness=2)
+            self._ocr_capture_frame.config(highlightbackground=COLORS["border"], highlightthickness=1)
+        else:
+            self._main_capture_frame.config(highlightbackground=COLORS["border"], highlightthickness=1)
+            self._ocr_capture_frame.config(highlightbackground=COLORS["accent"], highlightthickness=2)
+
+    def _on_ocr_toggle(self):
+        """OCR 开关切换时的 UI 联动"""
+        enabled = self._ocr_enabled_var.get()
+        if not enabled:
+            # 关闭时切回主捕获区
+            self._capture_target = "main"
+            self._update_capture_highlight()
+            # 灰化 OCR 捕获区
+            if self._ocr_display_label:
+                self._ocr_display_label.config(fg=COLORS["text_muted"])
+        else:
+            if self._ocr_display_label:
+                self._ocr_display_label.config(fg=COLORS["accent"])
 
     # ── 拖拽事件 ──────────────────────────────────────
 
@@ -245,8 +363,15 @@ class SettingsWindow:
         if not self._is_listening:
             return
 
+        # OCR 未启用时强制捕获目标为 main
+        if self._capture_target == "ocr" and not self._ocr_enabled_var.get():
+            self._capture_target = "main"
+
         keysym = event.keysym.lower()
-        logger.debug(f"KeyPress: keysym={keysym}, keycode={event.keycode}")
+        logger.debug(f"KeyPress: keysym={keysym}, keycode={event.keycode}, target={self._capture_target}")
+
+        # 根据捕获目标选择对应的 label
+        target_label = self._ocr_display_label if self._capture_target == "ocr" else self._display_label
 
         # 判断是否为修饰键
         if keysym in _MODIFIER_TO_PYNPUT:
@@ -259,14 +384,15 @@ class SettingsWindow:
                 if disp and disp not in seen:
                     parts.append(disp)
                     seen.add(disp)
-            if parts:
-                self._update_display(" + ".join(parts) + " + ...", waiting=True)
+            if parts and target_label:
+                target_label.config(text=" + ".join(parts) + " + ...", fg=COLORS["accent"])
             return
 
         # 非修饰键：组合成快捷键
         if not self._pressed_modifiers:
-            self._update_display("需要包含修饰键！", error=True)
-            self.root.after(1500, self._reset_display)
+            if target_label:
+                target_label.config(text="需要包含修饰键！", fg=COLORS["error_text"])
+            self.root.after(1500, lambda: self._reset_display(self._capture_target))
             return
 
         # 构建 pynput 格式
@@ -297,13 +423,22 @@ class SettingsWindow:
             display_parts.append(main_key)
             pynput_parts.append(main_key)
 
-        self._captured_pynput = "+".join(pynput_parts)
-        self._captured_display = "+".join(display_parts)
+        captured_pynput = "+".join(pynput_parts)
+        captured_display = "+".join(display_parts)
+
+        # 根据捕获目标存储
+        if self._capture_target == "ocr":
+            self._ocr_captured_pynput = captured_pynput
+            self._ocr_captured_display = captured_display
+        else:
+            self._captured_pynput = captured_pynput
+            self._captured_display = captured_display
 
         self._stop_blink()
-        self._update_display(self._captured_display, success=True)
+        if target_label:
+            target_label.config(text=captured_display, fg=COLORS["success_text"])
         self._save_btn.config(state="normal")
-        logger.info(f"捕获快捷键: {self._captured_pynput} ({self._captured_display})")
+        logger.info(f"捕获快捷键 [{self._capture_target}]: {captured_pynput} ({captured_display})")
 
     def _on_key_release(self, event):
         if not self._is_listening:
@@ -326,12 +461,27 @@ class SettingsWindow:
             fg = COLORS["text_muted"]
         self._display_label.config(text=text, fg=fg)
 
-    def _reset_display(self):
+    def _reset_display(self, target: str = "main"):
+        """重置指定捕获区的显示"""
         self._pressed_modifiers.clear()
-        self._captured_pynput = ""
-        self._captured_display = ""
-        self._save_btn.config(state="disabled")
-        self._update_display("按下新的快捷键...", waiting=False)
+        if target == "ocr":
+            self._ocr_captured_pynput = ""
+            self._ocr_captured_display = ""
+            label = self._ocr_display_label
+            placeholder = "按下 OCR 快捷键..."
+        else:
+            self._captured_pynput = ""
+            self._captured_display = ""
+            label = self._display_label
+            placeholder = "按下新的快捷键..."
+
+        # 只要有任一捕获区有结果就保持保存按钮可用
+        has_result = bool(self._captured_pynput or self._ocr_captured_pynput)
+        self._save_btn.config(state="normal" if has_result else "disabled")
+
+        if label:
+            fg = COLORS["accent"] if (target == "ocr" and self._ocr_enabled_var.get()) else COLORS["accent"]
+            label.config(text=placeholder, fg=fg)
         self._start_blink()
 
     # ── 闪烁动画 ──────────────────────────────────────
@@ -367,21 +517,44 @@ class SettingsWindow:
     # ── 操作 ──────────────────────────────────────────
 
     def _save(self):
-        if not self._captured_pynput:
+        # 至少有一个捕获区有结果才能保存
+        has_main = bool(self._captured_pynput)
+        has_ocr = bool(self._ocr_captured_pynput) and self._ocr_enabled_var.get()
+        if not has_main and not has_ocr:
             return
-        logger.info(f"保存快捷键: {self._captured_pynput} ({self._captured_display})")
+
+        ocr_enabled = self._ocr_enabled_var.get()
+        # OCR 快捷键：如果用户没改但勾选了开关，用当前值
+        ocr_pynput = self._ocr_captured_pynput or ""
+        ocr_display = self._ocr_captured_display or ""
+
+        logger.info(
+            f"保存设置: 翻译热键={self._captured_pynput or '(未改)'}, "
+            f"OCR enabled={ocr_enabled}, OCR 热键={ocr_pynput or '(未改)'}"
+        )
         if self.on_saved:
-            self.on_saved(self._captured_pynput, self._captured_display)
+            self.on_saved(
+                self._captured_pynput,
+                self._captured_display,
+                ocr_enabled,
+                ocr_pynput,
+                ocr_display,
+            )
         self._close()
 
     def _reset_to_default(self):
         from config_manager import DEFAULT_CONFIG
         self._captured_pynput = DEFAULT_CONFIG["hotkey"]
         self._captured_display = DEFAULT_CONFIG["hotkey_display"]
+        self._ocr_captured_pynput = DEFAULT_CONFIG["ocr_hotkey"]
+        self._ocr_captured_display = DEFAULT_CONFIG["ocr_hotkey_display"]
         self._stop_blink()
-        self._update_display(f"{self._captured_display}（默认）", success=True)
+        if self._display_label:
+            self._display_label.config(text=f"{self._captured_display}（默认）", fg=COLORS["success_text"])
+        if self._ocr_display_label:
+            self._ocr_display_label.config(text=f"{self._ocr_captured_display}（默认）", fg=COLORS["success_text"])
         self._save_btn.config(state="normal")
-        logger.info("恢复默认快捷键")
+        logger.info("恢复默认快捷键（含 OCR）")
 
     def _close(self):
         self._is_listening = False

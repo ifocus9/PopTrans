@@ -23,37 +23,71 @@ class HotkeyManager:
     """全局热键管理器（基于 pynput）"""
 
     DEFAULT_HOTKEY = "<ctrl>+<alt>+q"
+    DEFAULT_OCR_HOTKEY = "<ctrl>+<alt>+e"
 
-    def __init__(self, on_translate, hotkey: str = None):
+    def __init__(self, on_translate, hotkey: str = None, on_ocr=None, ocr_hotkey: str = None):
         """
         Args:
             on_translate: 获取到选中文本后的回调 callback(text: str)
             hotkey: 自定义快捷键，默认为 Ctrl+Alt+Q
+            on_ocr: OCR 触发回调 callback()，不传则不注册 OCR 热键
+            ocr_hotkey: OCR 快捷键，默认为 Ctrl+Alt+E
         """
         self.on_translate = on_translate
         self.hotkey = hotkey or self.DEFAULT_HOTKEY
+        self.on_ocr = on_ocr
+        self.ocr_hotkey = ocr_hotkey or self.DEFAULT_OCR_HOTKEY
         self._active = False
         self._lock = threading.Lock()
-        self._listener = None
         self._hotkey_listener = None
+
+    def _build_hotkey_map(self):
+        """根据当前配置构建热键字典（单 listener 管理所有热键，避免双 listener 冲突）"""
+        mapping = {self.hotkey: self._on_hotkey_pressed}
+        if self.on_ocr and self.ocr_hotkey:
+            mapping[self.ocr_hotkey] = self._on_ocr_hotkey_pressed
+        return mapping
 
     def start(self):
         """注册全局热键并开始监听"""
         if self._active:
             return
 
-        # 使用 pynput 的 GlobalHotKeys 监听组合键
-        self._hotkey_listener = keyboard.GlobalHotKeys({
-            self.hotkey: self._on_hotkey_pressed,
-        })
+        self._start_listener()
+        self._active = True
+        logger.info(f"全局热键已注册: {', '.join(self._build_hotkey_map().keys())}")
+
+    def _start_listener(self):
+        """创建并启动全局热键 listener（单实例管理所有热键）"""
+        self._hotkey_listener = keyboard.GlobalHotKeys(self._build_hotkey_map())
         self._hotkey_listener.daemon = True
         self._hotkey_listener.start()
 
-        self._active = True
-        logger.info(f"全局热键已注册: {self.hotkey}")
+    def _restart_listener(self):
+        """重启 listener（热键映射变化时调用）"""
+        if self._hotkey_listener:
+            try:
+                self._hotkey_listener.stop()
+            except Exception as e:
+                logger.warning(f"停止热键 listener 时出错: {e}")
+            self._hotkey_listener = None
+        self._start_listener()
+
+    def register_ocr_hotkey(self, on_ocr, hotkey: str):
+        """动态注册 OCR 热键（重启 listener 以包含新热键）"""
+        self.on_ocr = on_ocr
+        self.ocr_hotkey = hotkey
+        self._restart_listener()
+        logger.info(f"OCR 热键已注册: {hotkey}")
+
+    def unregister_ocr_hotkey(self):
+        """注销 OCR 热键（重启 listener 以移除 OCR 热键）"""
+        self.on_ocr = None
+        self._restart_listener()
+        logger.info("OCR 热键已注销")
 
     def stop(self):
-        """停止监听并注销热键"""
+        """停止监听并注销所有热键"""
         if not self._active:
             return
 
@@ -64,8 +98,24 @@ class HotkeyManager:
         except Exception as e:
             logger.warning(f"注销热键时出错: {e}")
 
+        self.on_ocr = None
         self._active = False
         logger.info("全局热键已注销")
+
+    def _on_ocr_hotkey_pressed(self):
+        """OCR 热键按下：直接触发回调（无需模拟 Ctrl+C）"""
+        # 使用与主翻译热键相同的锁，防止两个热键同时触发
+        # （Ctrl+Alt+Q 和 Ctrl+Alt+E 共享 Ctrl+Alt 修饰键，pynput 可能同时回调）
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            if self.on_ocr:
+                logger.info("OCR 热键触发")
+                self.on_ocr()
+        except Exception as e:
+            logger.error(f"OCR 热键处理出错: {e}")
+        finally:
+            self._lock.release()
 
     def _on_hotkey_pressed(self):
         """

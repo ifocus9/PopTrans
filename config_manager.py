@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONFIG: Dict[str, Any] = {
     "hotkey": "<ctrl>+<alt>+q",
     "hotkey_display": "Ctrl+Alt+Q",
+    "ocr_enabled": False,
+    "ocr_hotkey": "<ctrl>+<alt>+e",
+    "ocr_hotkey_display": "Ctrl+Alt+E",
 }
 
 
@@ -71,5 +74,31 @@ def set_hotkey(hotkey: str, display: str) -> bool:
     config = load_config()
     config["hotkey"] = hotkey
     config["hotkey_display"] = display
+    return save_config(config)
+
+
+# ── OCR 配置 ──────────────────────────────────────────
+
+def get_ocr_enabled() -> bool:
+    """是否启用 OCR 翻译模式"""
+    return load_config().get("ocr_enabled", DEFAULT_CONFIG["ocr_enabled"])
+
+
+def get_ocr_hotkey() -> str:
+    """获取 OCR 快捷键（pynput 格式）"""
+    return load_config().get("ocr_hotkey", DEFAULT_CONFIG["ocr_hotkey"])
+
+
+def get_ocr_hotkey_display() -> str:
+    """获取 OCR 快捷键显示文本"""
+    return load_config().get("ocr_hotkey_display", DEFAULT_CONFIG["ocr_hotkey_display"])
+
+
+def set_ocr_config(enabled: bool, hotkey: str, display: str) -> bool:
+    """更新 OCR 配置并持久化"""
+    config = load_config()
+    config["ocr_enabled"] = enabled
+    config["ocr_hotkey"] = hotkey
+    config["ocr_hotkey_display"] = display
     return save_config(config)
 

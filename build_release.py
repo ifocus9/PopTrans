@@ -169,9 +169,15 @@ def _pyinstaller_command() -> list[str]:
         "--add-data",
         "tray_icon.py;.",
         "--add-data",
+        "ocr_engine.py;.",
+        "--add-data",
         "icon.png;.",
         "--add-data",
         f"{SITE_PACKAGES_DIR / 'llama_cpp'};llama_cpp",
+        # OCR 引擎依赖：rapidocr-onnxruntime + onnxruntime 需要完整收集
+        "--collect-all", "rapidocr_onnxruntime",
+        "--collect-all", "onnxruntime",
+        "--hidden-import", "onnxruntime",
         "main.py",
     ]
 
