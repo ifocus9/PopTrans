@@ -52,6 +52,20 @@ Thumbs.db
 dist/
 build/
 *.spec
+!ai_engine.spec
+dist-go/
+.gocache/
+.gopath/
+.gobin/
+.gotelemetry/
+.npmcache/
+.npmhome/
+.wails-template/
+.pyinstaller/
+build-ai/
+dist-ai/
+frontend/node_modules/
+translate-go.exe
 
 # WorkBuddy workspace
 .workbuddy/

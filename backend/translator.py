@@ -1,4 +1,4 @@
-﻿"""
+"""
 translator.py — Hy-MT2-1.8B 翻译引擎模块
 
 使用腾讯 Hy-MT2-1.8B 提供高质量离线翻译。
@@ -14,6 +14,8 @@ import logging
 from collections import OrderedDict
 from typing import Optional, Tuple
 
+from backend.runtime_paths import application_dir
+
 logger = logging.getLogger(__name__)
 
 # ── 模型配置 ──────────────────────────────────────────────
@@ -21,12 +23,7 @@ logger = logging.getLogger(__name__)
 MODEL_ID = "tencent/Hy-MT2-1.8B-GGUF"
 MODEL_FILENAME = "Hy-MT2-1.8B-Q4_K_M.gguf"
 
-# 支持 PyInstaller 打包：优先使用 exe 所在目录，否则使用脚本所在目录
-if getattr(sys, 'frozen', False):
-    # PyInstaller 打包后，模型放在 exe 同级目录
-    _BASE_DIR = os.path.dirname(sys.executable)
-else:
-    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_BASE_DIR = os.fspath(application_dir())
 
 MODEL_DIR = os.path.join(_BASE_DIR, "models", "Hy-MT2-1.8B-GGUF")
 MODEL_PATH = os.path.join(MODEL_DIR, MODEL_FILENAME)
@@ -64,6 +61,26 @@ def _create_no_proxy_session():
     session.trust_env = False
     session.proxies = {"http": "", "https": ""}
     return session
+
+
+def _configure_huggingface_http():
+    """Configure a direct HTTP client across huggingface_hub versions."""
+    try:
+        from huggingface_hub import configure_http_backend
+    except ImportError:
+        import httpx
+        from huggingface_hub import set_client_factory
+
+        set_client_factory(
+            lambda: httpx.Client(
+                trust_env=False,
+                follow_redirects=True,
+                timeout=None,
+            )
+        )
+        return
+
+    configure_http_backend(backend_factory=_create_no_proxy_session)
 
 
 # 翻译 prompt 模板
@@ -138,13 +155,13 @@ class Translator:
 
     def _download_model(self, update_status):
         """下载 Hy-MT2 GGUF 模型"""
-        from huggingface_hub import hf_hub_download, configure_http_backend
+        from huggingface_hub import hf_hub_download
 
         update_status("正在从 HuggingFace 镜像下载模型...")
         os.makedirs(MODEL_DIR, exist_ok=True)
 
         # 禁用代理，直连镜像
-        configure_http_backend(backend_factory=lambda: _create_no_proxy_session())
+        _configure_huggingface_http()
 
         # 下载模型到本地目录
         hf_hub_download(
@@ -166,7 +183,7 @@ class Translator:
             if os.path.exists(_lib_dir):
                 os.add_dll_directory(_lib_dir)
                 os.environ["PATH"] = _lib_dir + os.pathsep + os.environ.get("PATH", "")
-        
+
         from llama_cpp import Llama
 
         self._model = Llama(
@@ -242,6 +259,42 @@ class Translator:
         except Exception as e:
             logger.exception(f"翻译失败: {text[:30]}...")
             return None, f"翻译出错: {e}"
+
+    def chat_completion_stream(self, text: str):
+        """流式输出翻译结果的生成器"""
+        if not self.ready:
+            yield "翻译引擎未就绪"
+            return
+
+        text = text.strip()
+        if not text:
+            return
+
+        try:
+            if self._is_chinese(text):
+                tgt_lang = "英语"
+            else:
+                tgt_lang = "中文"
+
+            prompt = PROMPT_TEMPLATE.format(target_lang=tgt_lang, source_text=text)
+            messages = [{"role": "user", "content": prompt}]
+
+            response_stream = self._model.create_chat_completion(
+                messages=messages,
+                stream=True,
+                **GENERATION_CONFIG,
+            )
+
+            for chunk in response_stream:
+                if "choices" in chunk and len(chunk["choices"]) > 0:
+                    delta = chunk["choices"][0].get("delta", {})
+                    content = delta.get("content")
+                    if content:
+                        yield content
+
+        except Exception as e:
+            logger.exception(f"流式翻译失败: {text[:30]}...")
+            yield f"\n[翻译出错: {e}]"
 
     def _is_chinese(self, text: str) -> bool:
         """
