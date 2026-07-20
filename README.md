@@ -1,396 +1,265 @@
-# 选中翻译 — Windows 快捷翻译工具
+# 选中翻译
 
-一款 Windows 桌面翻译工具。选中文本或框选屏幕区域，按下快捷键即可弹出翻译结果。基于腾讯 Hy-MT2-1.8B 离线翻译与 RapidOCR 引擎，支持中英文互译、OCR 截图翻译、自定义快捷键、深色主题 UI。
+Windows 快捷翻译工具。选中文本或框选屏幕区域后按下快捷键，应用会调用本地翻译/OCR 服务，并通过 Wails 毛玻璃窗口显示结果。
 
-## 📸 预览
+- **当前版本**：v2.0.0（采用go重构）
+- **许可证**：MIT
+- **平台**：Windows 10/11 x64
 
-![翻译效果预览](images/translate.png)
+## 功能
 
-![设置界面预览](images/setting.png)
+- 选中文本后快捷翻译
+- Go 原生 OCR 屏幕框选、截图与识别
+- 中英文自动互译
+- Wails 翻译结果与设置界面
+- 系统托盘常驻、自定义快捷键和 OCR 开关
+- 可选运行日志，默认关闭并可在设置中启用
+- 本地模型推理与结果缓存
 
-## ✨ 功能特点
+## 架构
 
-- 🌐 **一键翻译** — 选中文本，按下快捷键即可翻译
-- 🖼️ **OCR 截图翻译** — 框选屏幕区域，识别图片/视频/PDF 中的文字并翻译
-- ⌨️ **自定义快捷键** — 翻译与 OCR 各自独立快捷键，通过托盘菜单设置
-- 🔄 **智能方向** — 自动识别中文→英文 / 英文→中文
-- 🔌 **离线工作** — 翻译用腾讯 Hy-MT2-1.8B 模型，OCR 用 RapidOCR，下载模型后无需联网
-- ⚡ **高性能** — 翻译基于 llama.cpp 推理引擎，OCR 基于 ONNX Runtime，CPU 多线程加速
-- 🎨 **现代 UI** — 深色半透明悬浮窗，毛玻璃风格
-- 📌 **系统托盘** — 后台常驻，不占任务栏空间
-- 📋 **一键复制** — 翻译结果支持一键复制到剪贴板
-- 🖱️ **智能定位** — 翻译窗口自动跟随鼠标位置
-- 📏 **自适应高度** — 翻译窗口高度随内容自动调整，支持滚动条
-- 🔒 **单实例保护** — 防止程序多开，重复运行时自动提示
-
-## 🛠️ 技术栈
-
-| 组件     | 技术                                | 说明                    |
-| -------- | ----------------------------------- | ----------------------- |
-| 翻译引擎 | llama-cpp-python + Hy-MT2-1.8B-GGUF | 高质量中英文翻译模型    |
-| OCR 引擎 | rapidocr-onnxruntime                | 离线多语种文字识别      |
-| GUI 框架 | tkinter                             | 轻量级跨平台 GUI        |
-| 热键监听 | pynput                              | 全局快捷键捕获          |
-| 系统托盘 | pystray                             | 系统托盘图标管理        |
-| 剪贴板   | pyperclip                           | 剪贴板读写操作          |
-| 图像处理 | Pillow                              | 托盘图标 / OCR 预处理   |
-| 模型下载 | huggingface_hub                     | 从 HuggingFace 下载模型 |
-
-## 📦 安装
-
-### 1. 安装 Python 依赖
-
-```bash
-pip install -r requirements.txt
+```text
+PopTrans.exe
+├── Go: 托盘、全局快捷键、剪贴板、OCR 框选与截图
+├── translate-ui.exe: 翻译结果和设置 UI
+├── ai_engine.exe: 内置 Python 运行时、翻译与 OCR HTTP 服务
+└── models/
+    ├── Hy-MT2-1.8B-GGUF/
+    └── rapidocr/（构建时复制到发行目录）
 ```
 
-**注意**：`llama-cpp-python` 可能需要 C++ 编译环境。如果安装失败，请参考以下说明：
+Wails 是唯一的桌面内容 UI。发布版通过 PyInstaller 将 Python、FastAPI、llama-cpp-python、RapidOCR 和 ONNX Runtime 打包进 `ai_engine.exe`，最终用户不需要安装 Python。GGUF 模型保存在根目录的 `models/` 中，RapidOCR 模型在构建时复制到 `dist-go/models/rapidocr/`。
 
-#### Windows 安装 llama-cpp-python
+## 技术栈
 
-**方法一：使用预编译的 wheel（推荐）**
+应用由三个进程组成，分别使用 Go、Web 前端和 Python 三套技术栈，通过本地 HTTP 与 Wails 桥接协作。
 
-```bash
-pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
-```
+### Go 启动器与系统集成（`PopTrans.exe`）
 
-**方法二：从源码编译**
+| 技术                     | 版本    | 用途                                                       |
+| ------------------------ | ------- | ---------------------------------------------------------- |
+| Go                       | 1.26    | 托盘应用、进程编排与 Windows 系统集成的主语言              |
+| Wails v2                 | v2.13.0 | 桌面 UI 框架，嵌入前端并暴露 Go ↔ JavaScript 绑定          |
+| golang.org/x/sys         | v0.44.0 | 通过 Win32 API 实现剪贴板、全局热键、窗口与截图            |
+| github.com/tc-hib/winres | v0.3.1  | 构建时生成 Windows 图标资源（`.syso`）                     |
+| WebView2 (go-webview2)   | v1.0.22 | Wails 在 Windows 上的渲染内核（依赖系统 WebView2 Runtime） |
 
-1. 安装 Visual Studio Build Tools（包含 C++ 编译器）
-2. 或者安装 MinGW-w64
-3. 然后运行：`pip install llama-cpp-python`
+- Windows 平台能力集中在 [internal/platform/windows/](internal/platform/windows/)：剪贴板、热键、窗口毛玻璃（DWM）、屏幕截图。
+- AI 引擎进程的启动、健康检查与 HTTP 调用由 [internal/backend/](internal/backend/) 的 supervisor 与 client 负责。
+- 框选、截图与应用生命周期在 [internal/app/](internal/app/)，配置读写在 [internal/config/](internal/config/)。
 
-### 2. 首次运行（下载模型）
+### 前端界面（`translate-ui.exe`）
 
-首次启动时会自动下载 Hy-MT2-1.8B GGUF 模型（约 1.13GB），需要联网。
-下载完成后即可离线使用。
+| 技术                         | 版本     | 用途                             |
+| ---------------------------- | -------- | -------------------------------- |
+| Vite                         | ^7.0.0   | 前端构建工具与开发服务器         |
+| lucide                       | ^0.468.0 | 界面图标库                       |
+| 原生 JavaScript / HTML / CSS | —        | 翻译结果与设置界面，无重量级框架 |
 
-```bash
-python main.py
-```
+- 前端源码在 [frontend/](frontend/)，Wails 生成的 JS/TS 桥接代码位于 [frontend/wailsjs/](frontend/wailsjs/)。
 
-## 🚀 使用方法
+### Python AI 服务（`ai_engine.exe`）
 
-1. 运行 `python main.py`，工具会最小化到系统托盘
-2. **选中文本翻译**：在任意应用中选中文本，按下 `Ctrl+Alt+Q`（可自定义）
-3. **OCR 截图翻译**：按下 `Ctrl+Alt+E`（可自定义），鼠标框选屏幕区域
+| 技术                 | 版本      | 用途                                                         |
+| -------------------- | --------- | ------------------------------------------------------------ |
+| FastAPI              | >=0.104.0 | 翻译 / OCR 的本地 HTTP 服务                                  |
+| uvicorn              | >=0.23.2  | ASGI 服务器                                                  |
+| python-multipart     | >=0.0.6   | 处理 OCR 图片上传                                            |
+| llama-cpp-python     | >=0.3.0   | 加载 GGUF 翻译模型并进行 CPU 推理                            |
+| huggingface_hub      | >=0.20.0  | 首次运行时下载模型（默认走 hf-mirror 镜像）                  |
+| rapidocr-onnxruntime | >=1.3.0   | 基于 ONNX Runtime 的离线 OCR 识别                            |
+| Pillow               | >=10.0.0  | OCR 前的图像预处理                                           |
+| requests             | >=2.31.0  | 内部 HTTP 请求                                               |
+| PyInstaller          | >=6.0,<7  | 将 Python 运行时与依赖打包为单一 `ai_engine.exe`（仅构建期） |
 
-### 快捷操作
+- 翻译引擎封装在 [backend/translator.py](backend/translator.py)，使用腾讯 Hy-MT2-1.8B GGUF 模型，内置结果 LRU 缓存。
+- OCR 封装在 [backend/ocr_service.py](backend/ocr_service.py)，HTTP 路由在 [backend/api_server.py](backend/api_server.py)。
 
-| 操作             | 说明                                 |
-| ---------------- | ------------------------------------ |
-| `Ctrl+Alt+Q`     | 翻译选中文本（默认快捷键，可自定义） |
-| `Ctrl+Alt+E`     | OCR 截图翻译（默认快捷键，可自定义） |
-| `Esc`            | 关闭翻译窗口 / 取消截图框选          |
-| 点击窗口外部     | 关闭翻译窗口                         |
-| 拖拽标题栏       | 移动翻译窗口                         |
-| 点击「复制译文」 | 复制翻译结果到剪贴板                 |
+### 模型
 
-### 自定义快捷键
+| 模型                               | 用途             |
+| ---------------------------------- | ---------------- |
+| tencent/Hy-MT2-1.8B-GGUF（Q4_K_M） | 中英文离线互译   |
+| RapidOCR（ONNX）                   | 屏幕截图文字识别 |
 
-1. 右键点击系统托盘图标
-2. 选择「设置快捷键」
-3. 在弹出的设置窗口中：
-   - 上方为「翻译快捷键」捕获区，按下新组合键即可
-   - 下方为「OCR 快捷键」捕获区（需先开启 OCR 开关）
-4. 点击「保存」按钮，快捷键立即生效
-5. 设置会自动保存，下次启动时自动加载
+## 目录结构与文件说明
 
-### OCR 截图翻译
+以下是当前源码树的主要结构。带有“生成”标记的目录或文件由构建流程创建，不需要手动维护。根目录只保留 Go 与 Wails 强制要求的地基文件；构建脚本、Python 打包配置和资源已分别收拢到 `scripts/`、`backend/` 和 `assets/`。
 
-适用于无法选中文本的场景：图片、视频字幕、PDF、UI 界面等。
-
-1. 在托盘菜单勾选「启用 OCR 翻译」（首次使用会加载模型，约 2-3s）
-2. 按 OCR 快捷键进入截图模式
-3. 鼠标拖拽框选要识别的区域（选区内清晰，选区外暗化）
-4. 松开鼠标，自动识别文字并翻译
-
-## 🏗️ 项目结构
-
-```
+```text
 translate-plugin/
-├── main.py              # 主入口，协调各模块
-├── translator.py        # Hy-MT2 翻译引擎封装（llama.cpp）
-├── ocr_engine.py        # OCR 引擎（RapidOCR + 截图框选）
-├── hotkey_manager.py    # 全局热键管理
-├── popup_window.py      # 悬浮翻译窗口（tkinter）
-├── tray_icon.py         # 系统托盘图标（pystray）
-├── config_manager.py    # 配置管理（快捷键设置持久化）
-├── settings_window.py   # 快捷键设置对话框
-├── models/              # 模型存储目录（自动创建）
-├── settings.json        # 用户配置文件（自动生成）
-├── requirements.txt     # Python 依赖
-├── build.bat            # Windows 打包入口（调用 build_release.py）
-├── build_release.py     # PyInstaller 打包脚本 + ICO 生成器
-├── icon.png             # 图标源文件（PNG，透明背景）
-├── icon.ico             # 打包用图标（构建时自动生成）
-├── test_llama_cpp.py    # llama.cpp 集成测试脚本
-└── README.md            # 项目说明
+├── backend/                         Python AI 服务源码与打包配置
+│   ├── api_server.py                FastAPI 翻译/OCR HTTP 服务
+│   ├── ocr_service.py               RapidOCR 服务封装
+│   ├── runtime_paths.py             开发模式与发布模式的路径解析
+│   ├── translator.py                llama.cpp / Hugging Face 翻译模型封装
+│   ├── ai_engine.spec               PyInstaller 打包配置
+│   ├── requirements.txt             Python 运行时依赖
+│   └── requirements-build.txt       Python 构建依赖
+├── cmd/translate-go/
+│   └── main.go                      Go 托盘应用入口
+├── internal/
+│   ├── app/                         框选、截图和应用生命周期
+│   ├── backend/                     AI 引擎进程管理与 HTTP 客户端
+│   ├── config/                      快捷键和本地设置读写
+│   ├── logging/                     可开关的 Go 日志输出
+│   ├── platform/windows/            Windows 剪贴板、热键、窗口和截图实现
+│   └── wailsui/                     Wails 窗口及前端桥接逻辑
+├── frontend/                        Wails 前端源码
+│   ├── src/main.js                  翻译结果与设置界面
+│   ├── src/styles.css               界面样式
+│   ├── index.html                   前端 HTML 入口
+│   ├── package.json                 npm 脚本和依赖声明
+│   ├── package-lock.json            npm 依赖锁定文件
+│   └── wailsjs/                     Wails 生成的 JavaScript/TypeScript 桥接代码
+├── scripts/                         构建脚本（切回项目根后调用工具链）
+│   ├── build_all.bat                构建并组装完整发行版
+│   ├── build_ai_engine.bat          构建独立 AI 引擎
+│   ├── build_go.bat                 构建 Go 启动器
+│   └── build_wails.bat              构建 Wails 界面
+├── tools/winres/                    Go 图标资源生成工具（生成 .syso）
+├── assets/
+│   └── icon.ico                     Windows 应用图标
+├── models/                          外部模型文件，不编译进源码
+│   └── Hy-MT2-1.8B-GGUF/            GGUF 翻译模型
+├── dist-go/                         完整发行目录（生成/本地保留）
+│   ├── ai_engine.exe                打包后的 Python 翻译/OCR 服务
+│   ├── PopTrans.exe                 Go 托盘启动器
+│   ├── translate-ui.exe             Wails 翻译窗口
+│   └── models/                      发行版使用的 GGUF 和 RapidOCR 模型
+├── go.mod / go.sum                  Go 模块依赖清单
+├── .gitignore                       Git 忽略规则
+├── wails.json                       Wails 项目配置
+├── wails_main.go                    Wails 嵌入和桌面应用入口
+├── docs/
+│   └── API.md                       本地 HTTP API 接口说明
+├── README.md                        项目使用、开发和构建说明
+└── LICENSE                          项目许可证
 ```
 
-## 📦 打包
+### 关键文件与目录职责
 
-使用 `build.bat` 可将项目打包为 Windows 可执行文件（.exe），无需 Python 环境即可运行：
+| 路径                          | 用途                                                     |
+| ----------------------------- | -------------------------------------------------------- |
+| `scripts/build_all.bat`       | 按顺序构建前端、AI 引擎和 Go 程序，并整理到 `dist-go/`。 |
+| `scripts/build_ai_engine.bat` | 使用 PyInstaller 将 `backend/` 打包为 `ai_engine.exe`。  |
+| `scripts/build_wails.bat`     | 安装/调用 Wails CLI，生成桌面 UI。                       |
+| `scripts/build_go.bat`        | 编译 `PopTrans.exe`。                                    |
+| `backend/ai_engine.spec`      | PyInstaller 打包配置。                                   |
+| `assets/icon.ico`             | Windows 应用图标，构建时复制到 Wails 资源与发行目录。    |
+| `wails_main.go`               | 配置 Wails 绑定、窗口和前端资源嵌入。                    |
+| `settings.json`               | 本机运行时设置，已被 Git 忽略。                          |
+| `dist-go/`                    | 发布产物目录，包含三个可执行文件、图标和模型。           |
 
-```batch
-build.bat
+`.claude/`、`.workbuddy/` 和 `.agents/` 是本地工具或工作区元数据，不属于应用运行时源码；构建缓存、日志和 Python 字节码均可安全删除并会在需要时重新生成。RapidOCR 模型由 `scripts/build_ai_engine.bat` 从 Python 依赖中复制到 `dist-go/models/rapidocr/`。
+
+## 快捷键
+
+| 操作                  | 默认快捷键   |
+| --------------------- | ------------ |
+| 翻译选中文本          | `Ctrl+Alt+Q` |
+| OCR 截图翻译          | `Ctrl+Alt+E` |
+| 关闭翻译窗口/取消框选 | `Esc`        |
+
+快捷键、OCR 开关、日志开关、界面主题和本地 AI 服务端口可从托盘菜单的“设置”中修改。服务端口默认为 `8989`，可设置为 `1024-65535`；修改端口后应用会自动重启本地服务。
+
+界面主题支持三种取值：`system`（跟随系统，默认）、`light`（浅色）、`dark`（深色）。
+
+## 设置项
+
+设置保存在应用目录下的 `settings.json` 中，由应用读写并已被 Git 忽略，通常无需手动编辑。字段说明如下：
+
+| 字段                 | 类型   | 默认值           | 说明                                    |
+| -------------------- | ------ | ---------------- | --------------------------------------- |
+| `hotkey`             | string | `<ctrl>+<alt>+q` | 翻译选中文本的快捷键（内部格式）        |
+| `hotkey_display`     | string | `Ctrl+Alt+Q`     | 翻译快捷键的显示文本                    |
+| `ocr_enabled`        | bool   | `false`          | 是否启用 OCR 截图翻译                   |
+| `ocr_hotkey`         | string | `<ctrl>+<alt>+e` | OCR 截图翻译的快捷键（内部格式）        |
+| `ocr_hotkey_display` | string | `Ctrl+Alt+E`     | OCR 快捷键的显示文本                    |
+| `logging_enabled`    | bool   | `false`          | 是否写入运行日志                        |
+| `server_port`        | int    | `8989`           | 本地 AI 服务端口，有效范围 `1024-65535` |
+| `theme`              | string | `system`         | 界面主题：`system` / `light` / `dark`   |
+
+字段默认值定义见 [internal/config/config.go](internal/config/config.go)。
+
+## 开发运行
+
+开发源码模式需要安装 Python 依赖：
+
+```powershell
+python -m pip install -r backend/requirements.txt
 ```
 
-打包流程：
+运行 Go 托盘进程：
 
-1. 清理旧的构建文件
-2. 使用 PyInstaller 打包 Python 脚本为 exe
-3. 拷贝模型文件到输出目录
-4. 清理临时文件
-
-打包完成后，可执行文件位于 `dist\选中翻译\` 目录下。
-
-**注意**：打包前请确保已安装 PyInstaller 并完成模型下载。
-
-## 🔧 测试
-
-运行测试脚本验证 llama.cpp 集成：
-
-```bash
-python test_llama_cpp.py
+```powershell
+go run ./cmd/translate-go
 ```
 
-## ⚠️ 注意事项
+开发模式需要先构建一次 Wails UI，或确保项目的 `build/bin/translate-ui.exe` 存在：
 
-- 需要 **Python 3.10+**
-- `pynput` 库在某些情况下可能需要 **管理员权限** 才能捕获全局热键
-- 首次运行需要联网下载 Hy-MT2-1.8B GGUF 模型（约 1.13GB）
-- 翻译质量基于腾讯 Hy-MT2-1.8B 模型，支持中英文高质量互译
-- 模型使用 Q4_K_M 量化，在保证质量的同时减少内存占用
-- 默认使用 CPU 多线程推理，无需 GPU
-- 自定义快捷键设置会自动保存到 `settings.json` 文件中
-- 已优化高 DPI 显示器支持，文字显示清晰且大小合适
-- 日志写入 `translate.log`，按大小轮转：单文件最大 `10MB`，最多保留 `5` 个历史文件
-
-## 📊 模型信息
-
-| 属性       | 值                 |
-| ---------- | ------------------ |
-| 模型名称   | 腾讯 Hy-MT2-1.8B   |
-| 模型格式   | GGUF (Q4_K_M 量化) |
-| 模型大小   | 约 1.13GB          |
-| 支持语言   | 中英文互译         |
-| 推理引擎   | llama.cpp          |
-| 加速方式   | CPU 多线程         |
-| 上下文窗口 | 4096 tokens        |
-
-## 🐛 故障排除
-
-### 1. llama-cpp-python 安装失败
-
-**问题**：`pip install llama-cpp-python` 报错
-**解决方案**：
-
-- 使用预编译的 wheel（推荐）：
-  ```bash
-  pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
-  ```
-- 或安装 Visual Studio Build Tools 后重新安装
-
-### 2. 模型下载失败
-
-**问题**：首次运行时模型下载失败
-**解决方案**：
-
-- 检查网络连接
-- 尝试使用 HuggingFace 镜像：
-  ```bash
-  set HF_ENDPOINT=https://hf-mirror.com
-  python main.py
-  ```
-- 或手动下载模型文件到 `models/Hy-MT2-1.8B-GGUF/` 目录
-
-### 3. 翻译速度慢
-
-**问题**：翻译响应时间过长
-**解决方案**：
-
-- 确保使用 CPU 多线程（默认启用）
-- 检查系统 CPU 使用率，关闭其他占用 CPU 的程序
-- 考虑使用更小的量化版本（如 Q2_K）
-
-### 4. 热键无响应
-
-**问题**：按下快捷键没有反应
-**解决方案**：
-
-- 以管理员权限运行程序
-- 检查是否有其他软件占用了相同快捷键
-- 通过托盘菜单重新设置快捷键
-- 查看日志文件 `translate.log` 获取详细信息
-
-### 5. 翻译结果为空
-
-**问题**：翻译窗口显示但没有结果
-**解决方案**：
-
-- 检查选中的文本是否有效
-- 查看日志文件 `translate.log` 获取错误信息
-- 尝试重启程序
-
-### 6. 程序提示已运行
-
-**问题**：启动程序时提示"程序已在运行中！"
-**解决方案**：
-
-- 检查系统托盘区域是否有翻译工具图标
-- 如果需要重新启动，先右键托盘图标选择「退出」
-- 或使用任务管理器结束进程后重新启动
-
-## 📝 开发说明
-
-### 核心模块
-
-1. **translator.py** - 翻译引擎
-   - 使用 `llama-cpp-python` 加载 GGUF 模型
-   - 支持自动下载模型（通过 `huggingface_hub`）
-   - 提供同步和异步翻译接口
-   - 自动检测翻译方向（中→英 / 英→中）
-
-2. **hotkey_manager.py** - 热键管理
-   - 使用 `pynput` 监听全局快捷键
-   - 通过模拟 Ctrl+C 获取选中文本
-   - 支持自定义快捷键
-
-3. **popup_window.py** - 悬浮窗口
-   - 使用 `tkinter` 实现无边框窗口
-   - 支持淡入动画和自动定位
-   - 深色主题，现代 UI 风格
-
-4. **tray_icon.py** - 系统托盘
-   - 使用 `pystray` 管理系统托盘图标
-   - 显示翻译状态和快捷键信息
-   - 提供设置快捷键和退出菜单
-
-5. **config_manager.py** - 配置管理
-   - 管理用户配置（快捷键等）
-   - 配置持久化到 `settings.json`
-   - 支持默认配置和用户配置合并
-
-6. **settings_window.py** - 设置窗口
-   - 快捷键设置对话框
-   - 支持实时捕获键盘输入
-   - 深色主题，与主界面风格一致
-
-7. **ocr_engine.py** - OCR 引擎
-   - 懒加载 RapidOCR（ONNX Runtime）
-   - 全屏遮罩 + 鼠标框选截图
-   - 图像预处理：灰度 + 自适应缩放 + 暗色模式反转
-   - 按需重试 + 文本框几何去重 + 质心聚类分行
-
-### 配置参数
-
-翻译参数可在 `translator.py` 中调整：
-
-```python
-GENERATION_CONFIG = {
-    "temperature": 0.7,      # 生成温度
-    "top_p": 0.6,           # 核采样参数
-    "top_k": 20,            # Top-K 采样
-    "repeat_penalty": 1.05, # 重复惩罚
-    "max_tokens": 4096,     # 最大生成长度
-}
+```powershell
+./scripts/build_wails.bat
 ```
 
-用户配置保存在 `settings.json` 文件中：
+## 构建
 
-```json
-{
-  "hotkey": "<ctrl>+<shift>+t",
-  "hotkey_display": "Ctrl+Shift+T"
-}
+构建机需要安装 Python、Go、Node.js，以及 AI 引擎打包依赖：
+
+```powershell
+python -m pip install -r backend/requirements-build.txt
 ```
 
-### 扩展开发
+完整构建：
 
-如需添加其他语言支持：
+```powershell
+./scripts/build_all.bat
+```
 
-1. 下载对应的 GGUF 模型
-2. 修改 `translator.py` 中的 `MODEL_ID` 和 `MODEL_FILENAME`
-3. 更新 `PROMPT_TEMPLATE` 以支持新的语言对
+完整应用会组装到 `dist-go/`，启动入口为：
 
-## 📄 许可证
+```powershell
+./dist-go/PopTrans.exe
+```
 
-本项目采用 MIT 许可证。详见 [LICENSE](LICENSE) 文件。
+也可以只重新构建 AI 引擎：
 
-## 📋 更新日志
+```powershell
+./scripts/build_ai_engine.bat
+```
 
-### v1.2.0 — 2026-07-01
+## 运行要求
 
-#### 🖼️ OCR 截图翻译
+- Windows 10/11 x64
+- WebView2 Runtime
+- 翻译为纯 CPU 推理（llama.cpp），无需独立显卡；建议内存 8GB 及以上
+- 最终用户不需要安装 Python、Go 或 Node.js
+- Go、Python 和 Node.js 仅用于开发与构建
+- 翻译模型 `models/Hy-MT2-1.8B-GGUF/Hy-MT2-1.8B-Q4_K_M.gguf`
+- RapidOCR 模型位于发行目录 `dist-go/models/rapidocr/`
 
-- **新增 OCR 翻译模式**：针对无法选中文本的场景（图片、视频字幕、PDF、UI 界面等），通过鼠标框选截图区域进行 OCR 识别后翻译
-  - 基于 [RapidOCR](https://github.com/RapidAI/RapidOCR) (ONNX Runtime) 离线识别引擎，3 个模型约 15MB，随 pip 包内置无需额外下载
-  - 独立第二热键触发（默认 `Ctrl+Alt+E`，可自定义）
-  - 设置界面新增 OCR 开关，关闭时不加载模型，零内存占用
-  - 懒加载：首次触发时才加载模型（约 2-3s），之后常驻内存
-- **专业截图框选体验**：
-  - 选区外黑色暗化遮罩，选区内原屏清晰可见（"挖洞"效果）
-  - 紫色边框（`#8B5CF6`，与主界面统一）
-  - 实时显示选区尺寸 `宽 × 高`
-  - 支持多显示器（虚拟桌面坐标）
-- **OCR 识别优化**：
-  - 图像预处理：灰度化 + 自适应缩放（1.0x/1.5x/2.0x）+ 暗色模式自动反转
-  - 按需重试：首轮置信度 < 0.72 时自动放大到 2.0x 重跑
-  - 文本框排序：质心聚类分行 → 行间从上到下 → 行内从左到右
-  - 几何去重：丢弃重复检测框（加粗大写字母单独检出场景）
-  - RapidOCR 参数调优：`det_box_thresh=0.4`、`det_unclip_ratio=2.2`、`use_cls=False`
+### 首次运行与模型下载
 
-#### 🐛 修复
+若本地缺少翻译模型，应用**首次运行时会自动联网下载** Hy-MT2 GGUF 模型（约 1.13GB），因此首次启动需要可用的网络连接。下载默认走 HuggingFace 镜像 `https://hf-mirror.com`（国内加速），并绕过系统代理。模型下载完成后保存到 `models/Hy-MT2-1.8B-GGUF/`，后续运行离线即可使用。
 
-- **热键冲突**：两个 `GlobalHotKeys` 监听器共享 `Ctrl+Alt` 前缀导致误触发，合并为单监听器
-- **遮罩重复**：OCR 框选防重入保护，避免重复按热键产生多层遮罩
-- **鼠标事件吞入**：框选窗口创建后延迟 100ms 绑定鼠标事件，避免吞入按键时的残留鼠标状态
+## 本地 HTTP API
 
----
+AI 引擎在 `http://127.0.0.1:<server_port>`（默认 `8989`）上提供翻译与 OCR 的 HTTP 接口，并包含一个 OpenAI 兼容的 `/v1/chat/completions` 端点，可供二次开发或集成调用。完整的端点、入参与返回说明见 [docs/API.md](docs/API.md)。
 
-### v1.1.0 — 2026-06-30
+## 验证
 
-#### 🎨 图标系统重构
+```powershell
+go test ./...
+cd frontend
+npm run build
+```
 
-- **修复 exe 图标白底问题**：手动构造 BMP-32 + AND mask 格式 ICO，绕开 Pillow 默认 ICO 写入器的透明度 bug
-  - 7 个尺寸（16~256px）全部正确保留 alpha 通道
-  - 桌面/资源管理器中 exe 图标透明背景完美渲染
-- **托盘图标改用静态 PNG**：替换原动态生成「译」字图标的方案，直接加载 `icon.png`，更清晰且统一品牌
-- **窗口图标支持**：主窗口标题栏图标优先使用 PNG，回退到 ICO
-- 新增 `icon.png` / `icon.ico` 图标资源文件
+## 日志
 
-#### 🏗️ 构建系统优化
+运行日志默认关闭。需要排查问题时，可从托盘菜单进入“设置”，开启“运行日志”并保存。开启后，Go 主程序、Wails 窗口和 AI 后端会统一写入应用目录中的 `translate.log`。
 
-- **重构打包脚本**：`build.bat` 现调用 `build_release.py`，构建逻辑从批处理迁移到 Python
-  - 自动从 `icon.png` 生成多尺寸 ICO
-  - 路径解析基于 `sys.executable`，不再硬编码 Python 安装路径
-  - UTF-8 编码处理更健壮
+日志内容带有 `[translate-go]`、`[translate-wails]` 或 `[ai-engine]` 标识，便于区分来源。新版本启动时会清理旧的分进程日志文件。关闭日志后，应用会停止写入；已有的 `translate.log` 不会自动删除。日志属于运行时生成文件，不应提交到源码仓库。
 
-#### 🔧 其他改进
+## 许可证
 
-- 主入口增加窗口图标设置逻辑
-- 托盘图标加载失败时回退到纯色占位图
-
----
-
-### v1.0.0 — 初始版本
-
-- 一键选中文本翻译（Ctrl+Alt+Q）
-- 基于腾讯 Hy-MT2-1.8B 离线翻译模型
-- 自定义快捷键、系统托盘常驻
-- 深色毛玻璃风格悬浮窗
-- 单实例保护、日志轮转
-- 高 DPI 显示支持
-
-## 🙏 致谢
-
-- [llama.cpp](https://github.com/ggerganov/llama.cpp) - 高性能 LLM 推理引擎
-- [llama-cpp-python](https://github.com/abetlen/llama-cpp-python) - Python 绑定
-- [腾讯 Hy-MT2](https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF) - 中英文翻译模型
-- [pynput](https://github.com/moses-palmer/pynput) - 跨平台输入监控
-- [pystray](https://github.com/moses-palmer/pystray) - 系统托盘图标库
-
-### 友情链接
-
-[![Linux.do](https://img.shields.io/badge/-Linux.do-1c1c1e?style=flat-square&logo=data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZlcnNpb249IjEuMiIgYmFzZVByb2ZpbGU9InRpbnktcHMiIHdpZHRoPSIxMjgiIGhlaWdodD0iMTI4IiB2aWV3Qm94PSIwIDAgMTIwIDEyMCI+CiAgPGNsaXBQYXRoIGlkPSJhIj4KICAgIDxjaXJjbGUgY3g9IjYwIiBjeT0iNjAiIHI9IjQ3Ii8+CiAgPC9jbGlwUGF0aD4KICA8Y2lyY2xlIGZpbGw9IiNmMGYwZjAiIGN4PSI2MCIgY3k9IjYwIiByPSI1MCIvPgogIDxyZWN0IGZpbGw9IiMxYzFjMWUiIGNsaXAtcGF0aD0idXJsKCNhKSIgeD0iMTAiIHk9IjEwIiB3aWR0aD0iMTAwIiBoZWlnaHQ9IjMwIi8+CiAgPHJlY3QgZmlsbD0iI2YwZjBmMCIgY2xpcC1wYXRoPSJ1cmwoI2EpIiB4PSIxMCIgeT0iNDAiIHdpZHRoPSIxMDAiIGhlaWdodD0iNDAiLz4KICA8cmVjdCBmaWxsPSIjZmZiMDAzIiBjbGlwLXBhdGg9InVybCgjYSkiIHg9IjEwIiB5PSI4MCIgd2lkdGg9IjEwMCIgaGVpZ2h0PSIzMCIvPgo8L3N2Zz4K)](https://linux.do/)
+本项目基于 [MIT 许可证](LICENSE) 开源。
