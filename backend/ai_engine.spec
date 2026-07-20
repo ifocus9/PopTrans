@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from PyInstaller.utils.hooks import (
     collect_data_files,
     collect_dynamic_libs,
@@ -5,6 +7,8 @@ from PyInstaller.utils.hooks import (
     copy_metadata,
 )
 
+
+ROOT = Path(SPECPATH).parent
 
 binaries = collect_dynamic_libs("llama_cpp")
 datas = collect_data_files(
@@ -22,8 +26,8 @@ hiddenimports += [
 ]
 
 a = Analysis(
-    ["backend/api_server.py"],
-    pathex=["."],
+    [str(ROOT / "backend" / "api_server.py")],
+    pathex=[str(ROOT)],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
@@ -60,5 +64,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=["icon.ico"],
+    icon=[str(ROOT / "assets" / "icon.ico")],
 )

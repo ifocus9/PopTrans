@@ -1,7 +1,7 @@
 {
   "$schema": "https://wails.io/schemas/config.v2.json",
   "name": "translate-plugin",
-  "outputfilename": "translate-wails",
+  "outputfilename": "translate-ui",
   "frontend:install": "npm.cmd install",
   "frontend:build": "npm.cmd run build",
   "frontend:dev:watcher": "npm.cmd run dev",

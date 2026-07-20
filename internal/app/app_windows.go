@@ -112,7 +112,7 @@ func (a *App) Run() error {
 	currentApp = a
 	log.Printf("app run start")
 	if a.resolveWailsExe() == "" {
-		return errors.New("required Wails UI translate-wails.exe not found")
+		return errors.New("required Wails UI translate-ui.exe not found")
 	}
 
 	if err := win.RegisterClass(mainWindowClass, mainWndProc); err != nil {
@@ -128,7 +128,12 @@ func (a *App) Run() error {
 	a.hwnd = hwnd
 	log.Printf("app main window created: hwnd=%d", a.hwnd)
 
-	a.icon = win.LoadTrayIcon(filepath.Join(a.baseDir, "icon.ico"))
+	// 打包发行版把 icon.ico 放在 baseDir 根；开发布局图标在 assets/。
+	iconPath := filepath.Join(a.baseDir, "icon.ico")
+	if _, statErr := os.Stat(iconPath); statErr != nil {
+		iconPath = filepath.Join(a.baseDir, "assets", "icon.ico")
+	}
+	a.icon = win.LoadTrayIcon(iconPath)
 	if err := win.AddTrayIcon(a.hwnd, trayIconID, a.icon, a.trayTip(), wmTray); err != nil {
 		log.Printf("app add tray icon failed: %v", err)
 		win.DestroyWindow(a.hwnd)
@@ -518,7 +523,7 @@ func (a *App) showWailsSettings() error {
 
 	exePath := a.resolveWailsExe()
 	if exePath == "" {
-		return fmt.Errorf("translate-wails.exe not found")
+		return fmt.Errorf("translate-ui.exe not found")
 	}
 
 	cmd := exec.Command(exePath, "--settings")
@@ -719,7 +724,7 @@ func (a *App) showLoading() {
 func (a *App) showWailsResult(source, result, errMsg string, loading bool) error {
 	exePath := a.resolveWailsExe()
 	if exePath == "" {
-		return fmt.Errorf("translate-wails.exe not found")
+		return fmt.Errorf("translate-ui.exe not found")
 	}
 
 	payload := wailsResultPayload{
@@ -829,11 +834,11 @@ func (a *App) stopWailsProcesses() {
 
 func (a *App) resolveWailsExe() string {
 	candidates := []string{
-		filepath.Join(a.baseDir, "build", "bin", "translate-wails.exe"),
-		filepath.Join(a.baseDir, "translate-wails.exe"),
+		filepath.Join(a.baseDir, "build", "bin", "translate-ui.exe"),
+		filepath.Join(a.baseDir, "translate-ui.exe"),
 	}
 	if exe, err := os.Executable(); err == nil {
-		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "translate-wails.exe"))
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "translate-ui.exe"))
 	}
 	for _, candidate := range candidates {
 		if _, err := os.Stat(candidate); err == nil {

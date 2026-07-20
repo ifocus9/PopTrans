@@ -160,10 +160,10 @@ func findProjectRoot(start string) string {
 func isProjectRoot(dir string) bool {
 	return isPackagedRoot(dir) ||
 		(exists(filepath.Join(dir, "backend", "api_server.py")) &&
-			exists(filepath.Join(dir, "requirements.txt")))
+			exists(filepath.Join(dir, "backend", "requirements.txt")))
 }
 
 func isPackagedRoot(dir string) bool {
 	return exists(filepath.Join(dir, "ai_engine.exe")) &&
-		exists(filepath.Join(dir, "translate-wails.exe"))
+		exists(filepath.Join(dir, "translate-ui.exe"))
 }

@@ -1,19 +1,20 @@
 @echo off
 chcp 65001 >nul
 setlocal
-pushd "%~dp0"
+pushd "%~dp0.."
+set "ROOT=%CD%"
 
-set GOPATH=%~dp0.gopath
-set GOCACHE=%~dp0.gocache
-set GOBIN=%~dp0.gobin
+set GOPATH=%ROOT%\.gopath
+set GOCACHE=%ROOT%\.gocache
+set GOBIN=%ROOT%\.gobin
 set GOTELEMETRY=off
-set GOTELEMETRYDIR=%~dp0.gotelemetry
+set GOTELEMETRYDIR=%ROOT%\.gotelemetry
 set GOSUMDB=off
-set HOME=%~dp0.npmhome
-set USERPROFILE=%~dp0.npmhome
-set NPM_CONFIG_CACHE=%~dp0.npmcache
+set HOME=%ROOT%\.npmhome
+set USERPROFILE=%ROOT%\.npmhome
+set NPM_CONFIG_CACHE=%ROOT%\.npmcache
 
-set WAILS_EXE=%~dp0.gobin\wails.exe
+set WAILS_EXE=%ROOT%\.gobin\wails.exe
 if exist "%WAILS_EXE%" goto build
 
 echo [1/3] Installing the Wails build tool...
@@ -31,6 +32,14 @@ if errorlevel 1 (
 )
 
 :build
+if not exist "%ROOT%\build\windows" mkdir "%ROOT%\build\windows"
+copy /Y "%ROOT%\assets\icon.ico" "%ROOT%\build\windows\icon.ico" >nul
+if errorlevel 1 (
+  echo Failed to prepare the Wails application icon.
+  popd
+  exit /b 1
+)
+
 echo [2/3] Building Wails UI...
 "%WAILS_EXE%" build -clean
 if errorlevel 1 (
@@ -40,7 +49,9 @@ if errorlevel 1 (
   exit /b 1
 )
 
+if exist "%ROOT%\build\bin\translate-wails.exe" del /Q "%ROOT%\build\bin\translate-wails.exe"
+
 echo [3/3] Build complete:
-echo %~dp0build\bin\translate-wails.exe
+echo %ROOT%\build\bin\translate-ui.exe
 popd
 exit /b 0

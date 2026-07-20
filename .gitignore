@@ -52,7 +52,7 @@ Thumbs.db
 dist/
 build/
 *.spec
-!ai_engine.spec
+!backend/ai_engine.spec
 dist-go/
 .gocache/
 .gopath/
@@ -64,8 +64,10 @@ dist-go/
 .pyinstaller/
 build-ai/
 dist-ai/
+.icon-probe/
 frontend/node_modules/
 translate-go.exe
+PopTrans.exe
 
 # WorkBuddy workspace
 .workbuddy/

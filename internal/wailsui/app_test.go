@@ -15,7 +15,7 @@ func TestResultStateReloadsFromStateFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	app := NewApp(t.TempDir(), []string{"translate-wails.exe", "--result", path})
+	app := NewApp(t.TempDir(), []string{"translate-ui.exe", "--result", path})
 	initial, err := app.State()
 	if err != nil {
 		t.Fatal(err)
@@ -37,7 +37,7 @@ func TestResultStateReloadsFromStateFile(t *testing.T) {
 }
 
 func TestSaveConfigRejectsInvalidServerPort(t *testing.T) {
-	app := NewApp(t.TempDir(), []string{"translate-wails.exe", "--settings"})
+	app := NewApp(t.TempDir(), []string{"translate-ui.exe", "--settings"})
 	cfg := config.Default
 	cfg.ServerPort = 80
 
