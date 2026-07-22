@@ -2,7 +2,7 @@
 translator.py — Hy-MT2-1.8B 翻译引擎模块
 
 使用腾讯 Hy-MT2-1.8B 提供高质量离线翻译。
-支持中英文互译，首次运行需下载模型（约 1.13GB）。
+支持多语言翻译，未指定目标语言时默认进行中英文互译。
 使用 llama-cpp-python 进行推理，支持 CPU 加速。
 """
 
@@ -51,7 +51,198 @@ GENERATION_CONFIG = {
 LANG_NAMES = {
     "zh": "中文",
     "en": "英语",
+    "vi": "越南语",
+    "ja": "日语",
+    "tr": "土耳其语",
+    "ko": "韩语",
+    "th": "泰语",
+    "it": "意大利语",
+    "id": "印度尼西亚语",
+    "ms": "马来语",
+    "tl": "菲律宾语",
+    "hi": "印地语",
+    "zh-hant": "繁体中文",
+    "fr": "法语",
+    "es": "西班牙语",
+    "de": "德语",
+    "pt": "葡萄牙语",
+    "ru": "俄语",
+    "ar": "阿拉伯语",
+    "pl": "波兰语",
+    "cs": "捷克语",
+    "nl": "荷兰语",
+    "km": "高棉语",
+    "my": "缅甸语",
+    "fa": "波斯语",
+    "gu": "古吉拉特语",
+    "ur": "乌尔都语",
+    "te": "泰卢固语",
+    "mr": "马拉地语",
+    "he": "希伯来语",
+    "bn": "孟加拉语",
+    "ta": "泰米尔语",
+    "uk": "乌克兰语",
+    "bo": "藏语",
+    "kk": "哈萨克语",
+    "mn": "蒙古语",
+    "ug": "维吾尔语",
+    "yue": "粤语",
 }
+
+LANG_NAMES_EN = {
+    "zh": "Chinese",
+    "en": "English",
+    "vi": "Vietnamese",
+    "ja": "Japanese",
+    "tr": "Turkish",
+    "ko": "Korean",
+    "th": "Thai",
+    "it": "Italian",
+    "id": "Indonesian",
+    "ms": "Malay",
+    "tl": "Filipino",
+    "hi": "Hindi",
+    "zh-hant": "Traditional Chinese",
+    "fr": "French",
+    "es": "Spanish",
+    "de": "German",
+    "pt": "Portuguese",
+    "ru": "Russian",
+    "ar": "Arabic",
+    "pl": "Polish",
+    "cs": "Czech",
+    "nl": "Dutch",
+    "km": "Khmer",
+    "my": "Burmese",
+    "fa": "Persian",
+    "gu": "Gujarati",
+    "ur": "Urdu",
+    "te": "Telugu",
+    "mr": "Marathi",
+    "he": "Hebrew",
+    "bn": "Bengali",
+    "ta": "Tamil",
+    "uk": "Ukrainian",
+    "bo": "Tibetan",
+    "kk": "Kazakh",
+    "mn": "Mongolian",
+    "ug": "Uyghur",
+    "yue": "Cantonese",
+}
+
+LANG_ALIASES = {
+    "中文": "zh",
+    "汉语": "zh",
+    "普通话": "zh",
+    "chinese": "zh",
+    "英语": "en",
+    "英文": "en",
+    "english": "en",
+    "越南语": "vi",
+    "越南文": "vi",
+    "vietnamese": "vi",
+    "日语": "ja",
+    "日文": "ja",
+    "japanese": "ja",
+    "土耳其语": "tr",
+    "turkish": "tr",
+    "韩语": "ko",
+    "韩文": "ko",
+    "korean": "ko",
+    "泰语": "th",
+    "thai": "th",
+    "意大利语": "it",
+    "italian": "it",
+    "印度尼西亚语": "id",
+    "印尼语": "id",
+    "indonesian": "id",
+    "马来语": "ms",
+    "malay": "ms",
+    "菲律宾语": "tl",
+    "filipino": "tl",
+    "印地语": "hi",
+    "hindi": "hi",
+    "繁体中文": "zh-hant",
+    "traditional chinese": "zh-hant",
+    "法语": "fr",
+    "french": "fr",
+    "西班牙语": "es",
+    "西班牙文": "es",
+    "spanish": "es",
+    "德语": "de",
+    "german": "de",
+    "葡萄牙语": "pt",
+    "portuguese": "pt",
+    "俄语": "ru",
+    "russian": "ru",
+    "阿拉伯语": "ar",
+    "arabic": "ar",
+    "波兰语": "pl",
+    "polish": "pl",
+    "捷克语": "cs",
+    "czech": "cs",
+    "荷兰语": "nl",
+    "dutch": "nl",
+    "高棉语": "km",
+    "khmer": "km",
+    "缅甸语": "my",
+    "burmese": "my",
+    "波斯语": "fa",
+    "persian": "fa",
+    "古吉拉特语": "gu",
+    "gujarati": "gu",
+    "乌尔都语": "ur",
+    "urdu": "ur",
+    "泰卢固语": "te",
+    "telugu": "te",
+    "马拉地语": "mr",
+    "marathi": "mr",
+    "希伯来语": "he",
+    "hebrew": "he",
+    "孟加拉语": "bn",
+    "bengali": "bn",
+    "泰米尔语": "ta",
+    "tamil": "ta",
+    "乌克兰语": "uk",
+    "ukrainian": "uk",
+    "藏语": "bo",
+    "tibetan": "bo",
+    "哈萨克语": "kk",
+    "kazakh": "kk",
+    "蒙古语": "mn",
+    "mongolian": "mn",
+    "维吾尔语": "ug",
+    "uyghur": "ug",
+    "粤语": "yue",
+    "cantonese": "yue",
+}
+
+
+def normalize_target_language(target_lang: Optional[str]) -> Optional[str]:
+    """Return a supported ISO language code, or None for automatic mode."""
+    if target_lang is None:
+        return None
+
+    value = str(target_lang).strip()
+    if not value:
+        return None
+
+    normalized = value.lower().replace("_", "-")
+    if normalized in LANG_NAMES:
+        return normalized
+
+    language_code = normalized.split("-", 1)[0]
+    if language_code in LANG_NAMES:
+        return language_code
+
+    alias = LANG_ALIASES.get(normalized) or LANG_ALIASES.get(value)
+    if alias:
+        return alias
+
+    supported = ", ".join(sorted(LANG_NAMES))
+    raise ValueError(
+        f"不支持的目标语言: {value}，支持的语言代码: {supported}"
+    )
 
 
 def _create_no_proxy_session():
@@ -84,7 +275,19 @@ def _configure_huggingface_http():
 
 
 # 翻译 prompt 模板
-PROMPT_TEMPLATE = "将以下文本翻译为{target_lang}，注意只需要输出翻译后的结果，不要额外解释：\n\n{source_text}"
+PROMPT_TEMPLATE = (
+    "Translate the following text into {target_lang}. Note that you should "
+    "only output the translated result without any additional explanation:\n\n"
+    "{source_text}"
+)
+
+
+def build_translation_prompt(target_lang: str, source_text: str) -> str:
+    """Build the official Hy-MT2 default-translation instruction."""
+    return PROMPT_TEMPLATE.format(
+        target_lang=LANG_NAMES_EN[target_lang],
+        source_text=source_text,
+    )
 
 
 class Translator:
@@ -203,12 +406,17 @@ class Translator:
             model.close()
     # ── 翻译 ──────────────────────────────────────────────
 
-    def translate(self, text: str) -> Tuple[Optional[str], Optional[str]]:
+    def translate(
+        self,
+        text: str,
+        target_lang: Optional[str] = None,
+    ) -> Tuple[Optional[str], Optional[str]]:
         """
-        翻译文本，自动检测翻译方向。
+        翻译文本。未指定目标语言时，自动进行中英文互译。
 
         Args:
             text: 待翻译文本
+            target_lang: 目标语言代码或名称，例如 vi、vi-VN、越南语
 
         Returns:
             (翻译结果, 错误信息) — 成功时错误信息为 None
@@ -220,22 +428,35 @@ class Translator:
         if not text:
             return None, "文本为空"
 
-        cached_result = self._get_cached_translation(text)
+        try:
+            normalized_target = normalize_target_language(target_lang)
+        except ValueError as error:
+            return None, str(error)
+
+        cache_key = (text, normalized_target or "auto")
+        cached_result = self._get_cached_translation(cache_key)
         if cached_result is not None:
             logger.info(f"翻译缓存命中: {text[:30]}...")
             return cached_result, None
 
         try:
-            # 自动检测翻译方向
-            if self._is_chinese(text):
-                tgt_lang = "英语"
-                direction = "中→英"
+            if normalized_target:
+                tgt_lang = LANG_NAMES[normalized_target]
+                direction = f"目标语言={tgt_lang}"
+                target_code = normalized_target
             else:
-                tgt_lang = "中文"
-                direction = "英→中"
+                # 保留现有前端依赖的中英自动互译行为。
+                if self._is_chinese(text):
+                    tgt_lang = LANG_NAMES["en"]
+                    direction = "中→英"
+                    target_code = "en"
+                else:
+                    tgt_lang = LANG_NAMES["zh"]
+                    direction = "英→中"
+                    target_code = "zh"
 
             # 构造翻译 prompt
-            prompt = PROMPT_TEMPLATE.format(target_lang=tgt_lang, source_text=text)
+            prompt = build_translation_prompt(target_code, text)
             messages = [{"role": "user", "content": prompt}]
 
             # 使用 llama.cpp 进行翻译
@@ -248,7 +469,7 @@ class Translator:
             if response and "choices" in response and len(response["choices"]) > 0:
                 result = response["choices"][0]["message"]["content"].strip()
                 if result:
-                    self._store_cached_translation(text, result)
+                    self._store_cached_translation(cache_key, result)
                     logger.info(f"翻译成功 [{direction}]: {text[:30]}...")
                     return result, None
                 else:
@@ -260,7 +481,11 @@ class Translator:
             logger.exception(f"翻译失败: {text[:30]}...")
             return None, f"翻译出错: {e}"
 
-    def chat_completion_stream(self, text: str):
+    def chat_completion_stream(
+        self,
+        text: str,
+        target_lang: Optional[str] = None,
+    ):
         """流式输出翻译结果的生成器"""
         if not self.ready:
             yield "翻译引擎未就绪"
@@ -271,12 +496,13 @@ class Translator:
             return
 
         try:
-            if self._is_chinese(text):
-                tgt_lang = "英语"
+            normalized_target = normalize_target_language(target_lang)
+            if normalized_target:
+                target_code = normalized_target
             else:
-                tgt_lang = "中文"
+                target_code = "en" if self._is_chinese(text) else "zh"
 
-            prompt = PROMPT_TEMPLATE.format(target_lang=tgt_lang, source_text=text)
+            prompt = build_translation_prompt(target_code, text)
             messages = [{"role": "user", "content": prompt}]
 
             response_stream = self._model.create_chat_completion(
@@ -310,21 +536,21 @@ class Translator:
             return False
         return (cjk_chars / total_chars) > 0.3
 
-    def _get_cached_translation(self, text: str) -> Optional[str]:
+    def _get_cached_translation(self, cache_key) -> Optional[str]:
         """返回缓存中的翻译结果，并在命中时刷新 LRU 顺序。"""
         with self._cache_lock:
-            cached_result = self._translation_cache.get(text)
+            cached_result = self._translation_cache.get(cache_key)
             if cached_result is None:
                 return None
 
-            self._translation_cache.move_to_end(text)
+            self._translation_cache.move_to_end(cache_key)
             return cached_result
 
-    def _store_cached_translation(self, text: str, result: str):
+    def _store_cached_translation(self, cache_key, result: str):
         """缓存成功的翻译结果，避免重复文本反复推理。"""
         with self._cache_lock:
-            self._translation_cache[text] = result
-            self._translation_cache.move_to_end(text)
+            self._translation_cache[cache_key] = result
+            self._translation_cache.move_to_end(cache_key)
 
             while len(self._translation_cache) > CACHE_MAX_ENTRIES:
                 self._translation_cache.popitem(last=False)

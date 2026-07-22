@@ -2,15 +2,17 @@ import io
 import json
 import logging
 from contextlib import asynccontextmanager
+from typing import List, Optional
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 from PIL import Image
 
 from backend.ocr_service import OCRService
 from backend.runtime_paths import log_path, settings_path
 from backend.server_config import server_port
-from backend.translator import Translator
+from backend.translator import Translator, normalize_target_language
 
 
 def configure_logging():
@@ -94,10 +96,17 @@ async def recognize_ocr(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/v1/ocr_translate")
-async def recognize_and_translate_ocr(file: UploadFile = File(...)):
+async def recognize_and_translate_ocr(
+    file: UploadFile = File(...),
+    target_lang: Optional[str] = Form(None),
+):
     """接收图片，OCR 识别后直接翻译并返回。"""
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Must be an image file")
+    try:
+        normalize_target_language(target_lang)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
     if not translator_engine.ready:
         raise HTTPException(status_code=503, detail="Translator model is loading or not ready.")
 
@@ -117,7 +126,7 @@ async def recognize_and_translate_ocr(file: UploadFile = File(...)):
                 "scale": ocr_result.get("scale"),
             }
 
-        translation, error = translator_engine.translate(source_text)
+        translation, error = translator_engine.translate(source_text, target_lang)
         if error:
             raise HTTPException(status_code=500, detail=error)
 
@@ -133,9 +142,6 @@ async def recognize_and_translate_ocr(file: UploadFile = File(...)):
         logger.exception("OCR 翻译处理异常")
         raise HTTPException(status_code=500, detail=str(e))
 
-from pydantic import BaseModel
-from typing import List, Optional
-
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -143,6 +149,7 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     messages: List[ChatMessage]
     stream: Optional[bool] = False
+    target_lang: Optional[str] = None
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
@@ -158,10 +165,18 @@ async def chat_completions(req: ChatCompletionRequest):
     if not user_msg:
         raise HTTPException(status_code=400, detail="No user message found")
 
+    try:
+        normalize_target_language(req.target_lang)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
     if req.stream:
         # 如果需要流式输出，调用 translator_engine 新增的流式方法
         if hasattr(translator_engine, "chat_completion_stream"):
-            generator = translator_engine.chat_completion_stream(user_msg)
+            generator = translator_engine.chat_completion_stream(
+                user_msg,
+                req.target_lang,
+            )
             
             def stream_openai_format():
                 for chunk in generator:
@@ -176,7 +191,7 @@ async def chat_completions(req: ChatCompletionRequest):
             raise HTTPException(status_code=501, detail="Streaming not implemented in translator")
     else:
         # 普通翻译
-        result, error = translator_engine.translate(user_msg)
+        result, error = translator_engine.translate(user_msg, req.target_lang)
         if error:
             raise HTTPException(status_code=500, detail=error)
             

@@ -68,6 +68,7 @@ curl http://127.0.0.1:8989/health
 | 参数 | 位置 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- | --- |
 | `file` | form-data | file | 是 | 图片文件，`Content-Type` 必须以 `image/` 开头 |
+| `target_lang` | form-data | string | 否 | 目标语言代码或名称；不传时保持中英文自动互译 |
 
 ### 返回参数
 
@@ -142,6 +143,7 @@ curl -X POST http://127.0.0.1:8989/api/v1/ocr \
 | 状态码 | 触发条件 | `detail` |
 | --- | --- | --- |
 | `400` | 上传文件不是图片 | `Must be an image file` |
+| `400` | `target_lang` 不受支持 | 返回支持的语言代码列表 |
 | `503` | 翻译模型尚未就绪 | `Translator model is loading or not ready.` |
 | `500` | 识别或翻译过程异常 | 具体异常信息 |
 
@@ -149,7 +151,8 @@ curl -X POST http://127.0.0.1:8989/api/v1/ocr \
 
 ```bash
 curl -X POST http://127.0.0.1:8989/api/v1/ocr_translate \
-  -F "file=@screenshot.png"
+  -F "file=@screenshot.png" \
+  -F "target_lang=vi"
 ```
 
 ---
@@ -168,17 +171,21 @@ OpenAI Chat Completions 兼容接口。服务会取消息列表中**最后一条
 | `messages[].role` | string | 是 | — | 消息角色，如 `user` / `assistant` / `system` |
 | `messages[].content` | string | 是 | — | 消息内容 |
 | `stream` | bool | 否 | `false` | 是否使用 SSE 流式返回 |
+| `target_lang` | string | 否 | `null` | 目标语言代码或名称；不传时保持中英文自动互译 |
 
 > 仅最后一条 `user` 消息会被用于翻译；其它消息（含 `system`）当前不参与处理。
+>
+> `target_lang` 支持 ISO 语言代码、区域代码或常用中英文名称，例如 `vi`、`vi-VN`、`越南语`、`Vietnamese`。
 
 ### 请求示例
 
 ```json
 {
   "messages": [
-    { "role": "user", "content": "Hello World" }
+    { "role": "user", "content": "你好，欢迎使用翻译服务。" }
   ],
-  "stream": false
+  "stream": false,
+  "target_lang": "vi"
 }
 ```
 
@@ -229,6 +236,7 @@ data: [DONE]
 | --- | --- | --- |
 | `400` | `messages` 为空 | `Messages cannot be empty` |
 | `400` | 未找到 `user` 消息 | `No user message found` |
+| `400` | `target_lang` 不受支持 | 返回支持的语言代码列表 |
 | `503` | 翻译模型尚未就绪 | `Translator model is loading or not ready.` |
 | `500` | 翻译过程出错 | 具体错误信息 |
 | `501` | 请求流式但引擎不支持 | `Streaming not implemented in translator` |
@@ -238,7 +246,7 @@ data: [DONE]
 ```bash
 curl -X POST http://127.0.0.1:8989/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"Hello World"}]}'
+  -d '{"messages":[{"role":"user","content":"你好，欢迎使用翻译服务。"}],"target_lang":"vi"}'
 ```
 
 流式：
@@ -263,6 +271,7 @@ curl -N -X POST http://127.0.0.1:8989/v1/chat/completions \
 
 ## 备注
 
-- 翻译支持中英文自动互译，方向由输入文本自动判断。
-- 翻译结果带有 LRU 缓存，重复文本会命中缓存直接返回。
+- 不传 `target_lang` 时，翻译方向仍由输入文本自动判断，保持原有中英文互译行为。
+- 显式传入 `target_lang` 时，文本会固定翻译为指定语言。
+- 翻译结果带有 LRU 缓存，缓存按“原文 + 目标语言”隔离。
 - 首次调用翻译前，模型可能仍在加载或下载（约 1.13GB），此时相关接口返回 `503`，可先轮询 `/health` 等待 `translator_ready` 为 `true`。
