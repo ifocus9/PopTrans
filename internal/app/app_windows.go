@@ -43,6 +43,9 @@ const (
 var (
 	currentApp  *App
 	mainWndProc = syscall.NewCallback(mainWindowProc)
+
+	errOCREmptyResult    = errors.New("OCR 未识别到文本")
+	errOCRTranslateEmpty = errors.New("OCR 翻译结果为空")
 )
 
 type App struct {
@@ -64,6 +67,11 @@ type App struct {
 	result   string
 	lastErr  string
 	busy     bool
+
+	backendIdleMu      sync.Mutex
+	backendIdleUsers   int
+	backendIdleTimer   *time.Timer
+	backendIdleTimeout time.Duration
 }
 
 func New() (*App, error) {
@@ -85,11 +93,12 @@ func New() (*App, error) {
 
 	client := backend.NewClient(config.BackendURL(cfg.ServerPort))
 	app := &App{
-		baseDir:    baseDir,
-		cfg:        cfg,
-		client:     client,
-		supervisor: backend.NewSupervisor(baseDir, client),
-		status:     "正在初始化...",
+		baseDir:            baseDir,
+		cfg:                cfg,
+		client:             client,
+		supervisor:         backend.NewSupervisor(baseDir, client),
+		status:             "正在初始化...",
+		backendIdleTimeout: cfg.AIIdleTimeout(),
 	}
 	app.ui = uidaemon.NewManager(baseDir, app.resolveWailsExe, app.handleUIDaemonEvent)
 	return app, nil
@@ -156,6 +165,7 @@ func (a *App) Close() {
 	win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
 	win.UnregisterHotKey(a.hwnd, hotkeyOCR)
 	win.DeleteTrayIcon(a.hwnd, trayIconID)
+	a.cancelBackendIdleStop()
 	a.supervisor.Stop()
 	log.Printf("app close complete")
 }
@@ -222,12 +232,17 @@ func (a *App) ensureBackendReady() {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	err := a.supervisor.EnsureRunning(ctx, func(status string) {
+	var health backend.Health
+	var healthErr error
+	err := a.withBackend(ctx, func(status string) {
 		if status == "" {
 			status = "等待模型加载中..."
 		}
 		log.Printf("app backend status callback: %q", status)
 		a.setStatus(status)
+	}, func(context.Context) error {
+		health, healthErr = a.client.Health(context.Background())
+		return nil
 	})
 	if err != nil {
 		log.Printf("app ensure backend ready failed: %v", err)
@@ -236,9 +251,8 @@ func (a *App) ensureBackendReady() {
 		return
 	}
 
-	health, err := a.client.Health(context.Background())
-	if err != nil {
-		log.Printf("app final backend health failed: %v", err)
+	if healthErr != nil {
+		log.Printf("app final backend health failed: %v", healthErr)
 		a.setStatus("本地 API 已启动")
 		return
 	}
@@ -292,7 +306,17 @@ func (a *App) handleTranslate() {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 
-		result, err := a.client.Translate(ctx, text)
+		var result string
+		err = a.withBackend(ctx, func(status string) {
+			if status == "" {
+				status = "等待模型加载中..."
+			}
+			a.setStatus(status)
+		}, func(reqCtx context.Context) error {
+			var translateErr error
+			result, translateErr = a.client.Translate(reqCtx, text)
+			return translateErr
+		})
 		if err != nil {
 			log.Printf("app translate failed: %v", err)
 			a.setStatus("翻译失败")
@@ -379,39 +403,57 @@ func (a *App) handleOCRSelection(rect win.Rect) {
 		defer cancel()
 
 		a.setStatus("正在识别 OCR 文本...")
-		text, err := a.client.OCRImage(ctx, pngBytes)
+
+		var text string
+		var translation string
+		err = a.withBackend(ctx, func(status string) {
+			if status == "" {
+				status = "等待模型加载中..."
+			}
+			a.setStatus(status)
+		}, func(reqCtx context.Context) error {
+			var ocrErr error
+			text, ocrErr = a.client.OCRImage(reqCtx, pngBytes)
+			if ocrErr != nil {
+				return ocrErr
+			}
+
+			text = strings.TrimSpace(text)
+			if text == "" {
+				return errOCREmptyResult
+			}
+
+			// Update the existing popup as soon as OCR finishes, then keep the
+			// translation section in its loading state while translation runs.
+			a.pushLoading(text)
+			a.setStatus("正在翻译 OCR 文本...")
+
+			translation, ocrErr = a.client.Translate(reqCtx, text)
+			if ocrErr != nil {
+				return ocrErr
+			}
+			translation = strings.TrimSpace(translation)
+			if translation == "" {
+				return errOCRTranslateEmpty
+			}
+			return nil
+		})
 		if err != nil {
+			if errors.Is(err, errOCREmptyResult) {
+				log.Printf("app ocr returned empty text")
+				a.setStatus("OCR 未识别到文本")
+				a.pushError("", err.Error())
+				return
+			}
+			if errors.Is(err, errOCRTranslateEmpty) {
+				log.Printf("app ocr translate returned empty result")
+				a.setStatus("OCR 翻译失败")
+				a.pushError(text, err.Error())
+				return
+			}
 			log.Printf("app ocr request failed: %v", err)
 			a.setStatus("OCR 失败")
 			a.pushError("", err.Error())
-			return
-		}
-
-		text = strings.TrimSpace(text)
-		if text == "" {
-			log.Printf("app ocr returned empty text")
-			a.setStatus("OCR 未识别到文本")
-			a.pushError("", "OCR 未识别到文本")
-			return
-		}
-
-		// Update the existing popup as soon as OCR finishes, then keep the
-		// translation section in its loading state while translation runs.
-		a.pushLoading(text)
-		a.setStatus("正在翻译 OCR 文本...")
-		translation, err := a.client.Translate(ctx, text)
-		if err != nil {
-			log.Printf("app ocr text translate request failed: %v", err)
-			a.setStatus("OCR 翻译失败")
-			a.pushError(text, err.Error())
-			return
-		}
-
-		translation = strings.TrimSpace(translation)
-		if translation == "" {
-			log.Printf("app ocr translate returned empty result")
-			a.setStatus("OCR 翻译失败")
-			a.pushError(text, "OCR 翻译结果为空")
 			return
 		}
 
@@ -577,12 +619,14 @@ func (a *App) applySettings(next config.Config) error {
 		win.UnregisterHotKey(a.hwnd, hotkeyOCR)
 	}
 	_ = applog.Configure(filepath.Join(a.baseDir, "translate.log"), a.cfg.LoggingEnabled)
+	a.setBackendIdleTimeout(a.cfg.AIIdleTimeout())
 	a.setStatus("设置已保存")
 	return nil
 }
 
 func (a *App) restartBackendForConfigChange(portChanged bool) {
 	a.setStatus("正在重启本地服务...")
+	a.cancelBackendIdleStop()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
@@ -607,6 +651,7 @@ func (a *App) restartBackendForConfigChange(portChanged bool) {
 		a.pushError("", err.Error())
 		return
 	}
+	a.setBackendIdleTimeout(a.cfg.AIIdleTimeout())
 	a.setStatus("设置已生效")
 }
 
@@ -640,6 +685,99 @@ func (a *App) toggleOCR() {
 	} else {
 		a.setStatus("OCR 已禁用")
 	}
+}
+
+func (a *App) withBackend(ctx context.Context, onStatus func(string), fn func(context.Context) error) error {
+	a.beginBackendUse()
+	defer a.endBackendUse()
+
+	if err := a.supervisor.EnsureRunning(ctx, onStatus); err != nil {
+		return err
+	}
+	return fn(ctx)
+}
+
+func (a *App) beginBackendUse() {
+	a.backendIdleMu.Lock()
+	defer a.backendIdleMu.Unlock()
+
+	a.backendIdleUsers++
+	if a.backendIdleTimer != nil {
+		a.backendIdleTimer.Stop()
+		a.backendIdleTimer = nil
+	}
+}
+
+func (a *App) endBackendUse() {
+	a.backendIdleMu.Lock()
+	if a.backendIdleUsers > 0 {
+		a.backendIdleUsers--
+	}
+	shouldSchedule := a.backendIdleUsers == 0
+	timeout := a.backendIdleTimeout
+	if !shouldSchedule || timeout <= 0 {
+		a.backendIdleMu.Unlock()
+		if shouldSchedule && timeout <= 0 {
+			log.Printf("backend idle auto-stop disabled")
+		}
+		return
+	}
+	if a.backendIdleTimer != nil {
+		a.backendIdleTimer.Stop()
+	}
+	a.backendIdleTimer = time.AfterFunc(timeout, func() {
+		a.stopBackendForIdleTimeout(timeout)
+	})
+	a.backendIdleMu.Unlock()
+	log.Printf("backend idle auto-stop scheduled in %s", timeout)
+}
+
+func (a *App) cancelBackendIdleStop() {
+	a.backendIdleMu.Lock()
+	defer a.backendIdleMu.Unlock()
+
+	if a.backendIdleTimer != nil {
+		a.backendIdleTimer.Stop()
+		a.backendIdleTimer = nil
+	}
+}
+
+func (a *App) setBackendIdleTimeout(timeout time.Duration) {
+	a.backendIdleMu.Lock()
+	a.backendIdleTimeout = timeout
+	idle := a.backendIdleUsers == 0
+	if a.backendIdleTimer != nil {
+		a.backendIdleTimer.Stop()
+		a.backendIdleTimer = nil
+	}
+	if !idle || timeout <= 0 {
+		a.backendIdleMu.Unlock()
+		if timeout <= 0 {
+			log.Printf("backend idle auto-stop disabled")
+		}
+		return
+	}
+	a.backendIdleTimer = time.AfterFunc(timeout, func() {
+		a.stopBackendForIdleTimeout(timeout)
+	})
+	a.backendIdleMu.Unlock()
+	log.Printf("backend idle auto-stop rescheduled in %s", timeout)
+}
+
+func (a *App) stopBackendForIdleTimeout(timeout time.Duration) {
+	a.backendIdleMu.Lock()
+	if a.backendIdleUsers != 0 {
+		a.backendIdleTimer = nil
+		a.backendIdleMu.Unlock()
+		log.Printf("backend idle stop skipped: backend became busy again")
+		return
+	}
+	a.backendIdleTimer = nil
+	a.backendIdleMu.Unlock()
+
+	log.Printf("backend idle timeout reached (%s), stopping ai engine", timeout)
+	a.supervisor.Stop()
+	a.setStatus("AI 引擎已休眠")
 }
 
 func (a *App) showTranslation() {

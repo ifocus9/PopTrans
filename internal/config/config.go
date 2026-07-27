@@ -10,10 +10,11 @@ import (
 )
 
 const (
-	DefaultServerPort     = 8989
-	MinServerPort         = 1024
-	MaxServerPort         = 65535
-	DefaultUIIdleMinutes  = 5
+	DefaultServerPort    = 8989
+	MinServerPort        = 1024
+	MaxServerPort        = 65535
+	DefaultUIIdleMinutes = 5
+	DefaultAIIdleMinutes = 15
 )
 
 type Config struct {
@@ -28,6 +29,9 @@ type Config struct {
 	// UIIdleMinutes is how long the UI process stays alive after the window is hidden.
 	// 0 means never auto-exit. Missing values fall back to DefaultUIIdleMinutes.
 	UIIdleMinutes int `json:"ui_idle_minutes"`
+	// AIIdleMinutes is how long the AI backend stays alive after its last request.
+	// 0 means never auto-exit. Missing values fall back to DefaultAIIdleMinutes.
+	AIIdleMinutes int `json:"ai_idle_minutes"`
 }
 
 var Default = Config{
@@ -40,6 +44,7 @@ var Default = Config{
 	ServerPort:       DefaultServerPort,
 	Theme:            "system",
 	UIIdleMinutes:    DefaultUIIdleMinutes,
+	AIIdleMinutes:    DefaultAIIdleMinutes,
 }
 
 func ResolveBaseDir() string {
@@ -136,6 +141,12 @@ func mergeDefaults(cfg *Config) {
 	if cfg.Theme != "light" && cfg.Theme != "dark" && cfg.Theme != "system" {
 		cfg.Theme = Default.Theme
 	}
+	if cfg.UIIdleMinutes < 0 {
+		cfg.UIIdleMinutes = Default.UIIdleMinutes
+	}
+	if cfg.AIIdleMinutes < 0 {
+		cfg.AIIdleMinutes = Default.AIIdleMinutes
+	}
 }
 
 func mergeLoadedDefaults(cfg *Config, rawKeys map[string]json.RawMessage) {
@@ -145,8 +156,15 @@ func mergeLoadedDefaults(cfg *Config, rawKeys map[string]json.RawMessage) {
 	}
 	if _, ok := rawKeys["ui_idle_minutes"]; !ok {
 		cfg.UIIdleMinutes = Default.UIIdleMinutes
-	} else if cfg.UIIdleMinutes < 0 {
+	}
+	if _, ok := rawKeys["ai_idle_minutes"]; !ok {
+		cfg.AIIdleMinutes = Default.AIIdleMinutes
+	}
+	if cfg.UIIdleMinutes < 0 {
 		cfg.UIIdleMinutes = Default.UIIdleMinutes
+	}
+	if cfg.AIIdleMinutes < 0 {
+		cfg.AIIdleMinutes = Default.AIIdleMinutes
 	}
 }
 
@@ -160,6 +178,18 @@ func (c Config) UIIdleTimeout() time.Duration {
 		return 0
 	}
 	return time.Duration(c.UIIdleMinutes) * time.Minute
+}
+
+// AIIdleTimeout returns how long the backend should stay alive after its last request.
+// A zero duration means the backend should not auto-exit.
+func (c Config) AIIdleTimeout() time.Duration {
+	if c.AIIdleMinutes < 0 {
+		return time.Duration(DefaultAIIdleMinutes) * time.Minute
+	}
+	if c.AIIdleMinutes == 0 {
+		return 0
+	}
+	return time.Duration(c.AIIdleMinutes) * time.Minute
 }
 
 func exists(path string) bool {

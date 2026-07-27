@@ -33,6 +33,7 @@ export namespace config {
 	    server_port: number;
 	    theme: string;
 	    ui_idle_minutes: number;
+	    ai_idle_minutes: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new Config(source);
@@ -49,6 +50,7 @@ export namespace config {
 	        this.server_port = source["server_port"];
 	        this.theme = source["theme"];
 	        this.ui_idle_minutes = source["ui_idle_minutes"];
+	        this.ai_idle_minutes = source["ai_idle_minutes"];
 	    }
 	}
 

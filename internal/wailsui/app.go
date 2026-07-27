@@ -280,7 +280,6 @@ func (a *App) ShowSettings() error {
 
 	positionSettingsWindow(a.ctx)
 	a.emitState()
-	runtime.WindowShow(a.ctx)
 	return nil
 }
 
@@ -310,8 +309,9 @@ func (a *App) ShowResult(payload uidaemon.ResultPayload) error {
 	if !wasVisibleResult {
 		positionResultWindow(a.ctx)
 		runtime.WindowSetSize(a.ctx, 425, 300)
-		runtime.WindowShow(a.ctx)
 	}
+	// Let the renderer show the window after DOM and icons have been committed;
+	// otherwise the acrylic shell can appear a frame before the actual content.
 	a.emitState()
 	return nil
 }
@@ -425,4 +425,3 @@ func (a *App) cancelIdleExitLocked() {
 		a.idleTimer = nil
 	}
 }
-

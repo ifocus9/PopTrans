@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -25,9 +26,11 @@ const serverPortEnv = "TRANSLATE_SERVER_PORT"
 type Supervisor struct {
 	baseDir string
 	client  *Client
-	cmd     *exec.Cmd
-	owned   bool
-	waitCh  chan error
+
+	ensureMu sync.Mutex
+	cmd      *exec.Cmd
+	owned    bool
+	waitCh   chan error
 }
 
 func NewSupervisor(baseDir string, client *Client) *Supervisor {
@@ -38,6 +41,9 @@ func NewSupervisor(baseDir string, client *Client) *Supervisor {
 }
 
 func (s *Supervisor) EnsureRunning(ctx context.Context, onStatus func(string)) error {
+	s.ensureMu.Lock()
+	defer s.ensureMu.Unlock()
+
 	log.Printf("supervisor ensure running: base_dir=%s", s.baseDir)
 
 	health, err := s.client.Health(ctx)
@@ -229,6 +235,9 @@ func translatorInitializationError(health Health) error {
 }
 
 func (s *Supervisor) Stop() {
+	s.ensureMu.Lock()
+	defer s.ensureMu.Unlock()
+
 	if s.cmd == nil || !s.owned || s.cmd.Process == nil {
 		log.Printf("supervisor stop skipped: no owned backend process")
 		return

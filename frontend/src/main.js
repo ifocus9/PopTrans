@@ -61,6 +61,7 @@ let state = {
     logging_enabled: false,
     server_port: 8989,
     theme: "system",
+    ai_idle_minutes: 15,
   },
   health: {},
 }
@@ -378,6 +379,32 @@ function renderSettings() {
 
         <div class="section-rule"></div>
 
+        <section class="settings-section" aria-labelledby="aiIdleHeading">
+          <div class="section-heading">
+            <div class="section-icon"><i data-lucide="languages"></i></div>
+            <div>
+              <h2 id="aiIdleHeading">AI 空闲回收</h2>
+              <p>空闲一段时间后自动关闭 AI 服务，下次翻译再重新拉起</p>
+            </div>
+          </div>
+          <div class="port-field">
+            <label class="field-label" for="aiIdleMinutes">分钟</label>
+            <input
+              class="number-input"
+              id="aiIdleMinutes"
+              type="number"
+              inputmode="numeric"
+              min="0"
+              step="1"
+              value="${Number.isInteger(Number(state.config.ai_idle_minutes)) ? Number(state.config.ai_idle_minutes) : 15}"
+              aria-describedby="aiIdleHelp"
+            />
+            <p class="field-help" id="aiIdleHelp">0 表示常驻，默认 15 分钟</p>
+          </div>
+        </section>
+
+        <div class="section-rule"></div>
+
         <section class="settings-section" aria-labelledby="serverHeading">
           <div class="section-heading">
             <div class="section-icon"><i data-lucide="network"></i></div>
@@ -516,6 +543,7 @@ async function saveSettings() {
     .querySelector("#ocrHotkeyDisplay")
     .value.trim()
   const serverPort = Number(document.querySelector("#serverPort").value)
+  const aiIdleMinutes = Number(document.querySelector("#aiIdleMinutes").value)
 
   if (!isValidHotkey(hotkeyDisplay) || !isValidHotkey(ocrHotkeyDisplay)) {
     showStatus(status, "快捷键需要包含修饰键和普通按键", "error")
@@ -524,6 +552,11 @@ async function saveSettings() {
   if (!Number.isInteger(serverPort) || serverPort < 1024 || serverPort > 65535) {
     showStatus(status, "端口必须是 1024 到 65535 之间的整数", "error")
     document.querySelector("#serverPort").focus()
+    return
+  }
+  if (!Number.isInteger(aiIdleMinutes) || aiIdleMinutes < 0) {
+    showStatus(status, "AI 空闲时间必须是大于等于 0 的整数", "error")
+    document.querySelector("#aiIdleMinutes").focus()
     return
   }
 
@@ -536,6 +569,7 @@ async function saveSettings() {
     ocr_hotkey_display: normalizeDisplay(ocrHotkeyDisplay),
     logging_enabled: document.querySelector("#loggingEnabled").checked,
     server_port: serverPort,
+    ai_idle_minutes: aiIdleMinutes,
     theme:
       document.querySelector('input[name="theme"]:checked')?.value || "system",
   }

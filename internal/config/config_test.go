@@ -197,3 +197,55 @@ func TestUIIdleMinutesMissingUsesDefault(t *testing.T) {
 		t.Fatalf("ui idle minutes = %d, want %d", loaded.UIIdleMinutes, DefaultUIIdleMinutes)
 	}
 }
+
+func TestAIIdleMinutesDefault(t *testing.T) {
+	cfg, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AIIdleMinutes != DefaultAIIdleMinutes {
+		t.Fatalf("ai idle minutes = %d, want %d", cfg.AIIdleMinutes, DefaultAIIdleMinutes)
+	}
+	if cfg.AIIdleTimeout() != time.Duration(DefaultAIIdleMinutes)*time.Minute {
+		t.Fatalf("timeout = %s", cfg.AIIdleTimeout())
+	}
+}
+
+func TestAIIdleMinutesZeroMeansNever(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(dir, "settings.json"),
+		[]byte(`{"ai_idle_minutes":0}`),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.AIIdleMinutes != 0 {
+		t.Fatalf("ai idle minutes = %d, want 0", loaded.AIIdleMinutes)
+	}
+	if loaded.AIIdleTimeout() != 0 {
+		t.Fatalf("timeout = %s, want 0", loaded.AIIdleTimeout())
+	}
+}
+
+func TestAIIdleMinutesMissingUsesDefault(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(dir, "settings.json"),
+		[]byte(`{"theme":"system"}`),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.AIIdleMinutes != DefaultAIIdleMinutes {
+		t.Fatalf("ai idle minutes = %d, want %d", loaded.AIIdleMinutes, DefaultAIIdleMinutes)
+	}
+}
