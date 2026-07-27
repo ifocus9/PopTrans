@@ -787,9 +787,13 @@ p {
   display: flex;
   align-items: center;
   gap: 10px;
-  min-height: 28px;
+  min-height: 48px;
   color: #d9d6e0;
   font-size: 13px;
+}
+
+.translation-section .translated-text {
+  min-height: 48px;
 }
 
 .loading-spinner {

@@ -14,11 +14,12 @@ import {
   X,
 } from "lucide"
 import {
+  HideWindow,
   SaveConfig,
   State,
 } from "../wailsjs/go/wailsui/App"
 import {
-  Quit,
+  EventsOn,
   WindowSetDarkTheme,
   WindowSetLightTheme,
   WindowSetSize,
@@ -43,8 +44,10 @@ const icons = {
 }
 const systemTheme = window.matchMedia("(prefers-color-scheme: dark)")
 let healthTimer
-let resultTimer
 let resultSignature = ""
+let lastResultHeight = 0
+let windowShown = false
+let unbindStateEvent = null
 let activeTheme = "system"
 let state = {
   mode: "settings",
@@ -60,6 +63,56 @@ let state = {
     theme: "system",
   },
   health: {},
+}
+
+
+function bindStateEvents() {
+  if (unbindStateEvent || !window.runtime?.EventsOn) return
+  unbindStateEvent = EventsOn("ui:state", (next) => {
+    if (!next || typeof next !== "object") return
+    const prevMode = state.mode
+    const prevSignature = resultSignature
+    state = {
+      ...state,
+      ...next,
+      config: next.config || state.config,
+      health: next.health || state.health,
+      result: next.result || {},
+      mode: next.mode || state.mode,
+    }
+    const nextTheme = state.config?.theme
+    if (nextTheme !== activeTheme) {
+      applyTheme(nextTheme)
+    }
+    if (prevMode !== state.mode) {
+      windowShown = false
+      lastResultHeight = 0
+      // Mode switch should rebuild shell (settings <-> result).
+      if (state.mode === "result") {
+        app.innerHTML = ""
+      }
+      render({ forceShow: true })
+      return
+    }
+    if (state.mode === "result") {
+      const nextSignature = JSON.stringify(state.result || {})
+      if (nextSignature === prevSignature) return
+      // Content-only update: patch DOM in place, no window show/reposition.
+      render({ forceShow: false })
+      return
+    }
+    // settings-only updates can refresh engine badge without full rerender
+    const node = document.querySelector("#engineState")
+    const textNode = document.querySelector("#engineText")
+    if (!node || !textNode) {
+      render()
+      return
+    }
+    const ready = Boolean(state.health?.translator_ready)
+    node.classList.toggle("is-ready", ready)
+    node.classList.toggle("is-loading", !ready)
+    textNode.textContent = ready ? "引擎就绪" : "正在启动"
+  })
 }
 
 async function loadState() {
@@ -99,23 +152,33 @@ function previewState() {
   return { ...state, health: { translator_ready: true } }
 }
 
-function render() {
+function render(options = {}) {
+  const forceShow = options.forceShow !== false
   clearInterval(healthTimer)
-  clearTimeout(resultTimer)
   document.documentElement.classList.toggle(
     "result-mode",
     state.mode === "result",
   )
-  state.mode === "result" ? renderResult() : renderSettings()
-  createIcons({ icons, attrs: { "stroke-width": 1.8 } })
-  showWindowAfterRender()
+  if (state.mode === "result") {
+    // Result view patches DOM in place and manages its own icons.
+    renderResult()
+  } else {
+    renderSettings()
+    createIcons({ icons, attrs: { "stroke-width": 1.8 } })
+  }
+  if (forceShow || !windowShown) {
+    showWindowAfterRender()
+  }
 }
 
 function showWindowAfterRender() {
   if (!window.runtime?.WindowShow) return
 
   requestAnimationFrame(() => {
-    requestAnimationFrame(() => WindowShow())
+    requestAnimationFrame(() => {
+      WindowShow()
+      windowShown = true
+    })
   })
 }
 
@@ -128,16 +191,19 @@ function renderResult() {
   const copyText = hasError ? result.error : result.result
   resultSignature = JSON.stringify(result)
 
-  app.innerHTML = `
-    <main class="result-shell ${hasError ? "is-error" : ""}">
+  // Keep the shell mounted across loading -> success updates.
+  // Full innerHTML rebuild retriggers glass-enter and looks like a flash.
+  if (!document.querySelector(".result-shell")) {
+    app.innerHTML = `
+    <main class="result-shell">
       <header class="app-header result-header">
         <div class="brand-mark" aria-hidden="true"><i data-lucide="languages"></i></div>
         <div class="header-copy">
-          <h1>${isRecognizing ? "正在识别" : isLoading ? "翻译中" : hasError ? "翻译失败" : "选中翻译"}</h1>
+          <h1 id="resultTitle">选中翻译</h1>
         </div>
         <div class="result-header-actions">
           <span id="copyStatus" class="result-copy-status" aria-live="polite"></span>
-          <button class="icon-button result-copy-button" id="copyBtn" type="button" title="${hasError ? "复制错误详情" : "复制译文"}" aria-label="${hasError ? "复制错误详情" : "复制译文"}" ${copyText ? "" : "disabled"}>
+          <button class="icon-button result-copy-button" id="copyBtn" type="button" title="复制译文" aria-label="复制译文">
             <i data-lucide="clipboard"></i>
           </button>
           <button class="icon-button close-button" id="closeBtn" type="button" title="关闭窗口" aria-label="关闭窗口">
@@ -145,75 +211,88 @@ function renderResult() {
           </button>
         </div>
       </header>
-
-      <div class="result-content">
-        ${
-          hasError
-            ? `
-          <section class="error-panel" role="alert">
-            <span class="section-label">错误详情</span>
-            <div class="result-text error-text">${escapeHtml(result.error || "")}</div>
-          </section>
-        `
-            : `
-          <section class="text-section translation-section">
-            <span class="section-label accent-label">译文</span>
-            ${
-              isLoading
-                ? `
-              <div class="translation-loading" role="status" aria-live="polite">
-                <span class="loading-spinner" aria-hidden="true"></span>
-                <span>${isRecognizing ? "正在识别图片中的文字..." : "正在翻译..."}</span>
-              </div>
-            `
-                : `
-              <div class="result-text translated-text">${escapeHtml(result.result || "")}</div>
-            `
-            }
-          </section>
-          ${
-            hasSource
-              ? `
-            <div class="section-rule"></div>
-            <section class="text-section">
-              <span class="section-label">原文</span>
-              <div class="result-text source-text">${escapeHtml(result.source || "")}</div>
-            </section>
-          `
-              : ""
-          }
-        `
-        }
-      </div>
+      <div class="result-content" id="resultContent"></div>
     </main>
   `
-
-  document.querySelector("#closeBtn").addEventListener("click", closeWindow)
-  document
-    .querySelector("#copyBtn")
-    .addEventListener("click", () => copyResult(copyText))
-  requestAnimationFrame(fitResultWindow)
-  if (isLoading) scheduleResultRefresh()
-}
-
-function scheduleResultRefresh() {
-  clearTimeout(resultTimer)
-  resultTimer = setTimeout(refreshResultState, 120)
-}
-
-async function refreshResultState() {
-  try {
-    const next = await State()
-    if (JSON.stringify(next.result || {}) !== resultSignature) {
-      state = next
-      render()
-      return
-    }
-  } catch {
-    // A state write may be in progress; the next read will retry.
+    document.querySelector("#closeBtn").addEventListener("click", closeWindow)
+    document.querySelector("#copyBtn").addEventListener("click", () => {
+      const textToCopy = document.querySelector("#copyBtn")?.dataset?.copyText || ""
+      copyResult(textToCopy)
+    })
+    createIcons({ icons, attrs: { "stroke-width": 1.8 } })
   }
 
-  if (state.result?.loading) scheduleResultRefresh()
+  const shell = document.querySelector(".result-shell")
+  const title = document.querySelector("#resultTitle")
+  const content = document.querySelector("#resultContent")
+  const copyBtn = document.querySelector("#copyBtn")
+  if (!shell || !title || !content || !copyBtn) return
+
+  shell.classList.toggle("is-error", hasError)
+  title.textContent = isRecognizing
+    ? "正在识别"
+    : isLoading
+      ? "翻译中"
+      : hasError
+        ? "翻译失败"
+        : "选中翻译"
+
+  copyBtn.dataset.copyText = copyText || ""
+  copyBtn.disabled = !copyText
+  copyBtn.title = hasError ? "复制错误详情" : "复制译文"
+  copyBtn.setAttribute("aria-label", copyBtn.title)
+  if (!copyBtn.classList.contains("is-success")) {
+    // Keep existing clipboard icon node stable to avoid icon flicker.
+  } else {
+    copyBtn.classList.remove("is-success")
+    copyBtn.innerHTML = '<i data-lucide="clipboard"></i>'
+    createIcons({ icons, attrs: { "stroke-width": 1.8 } })
+  }
+  const copyStatus = document.querySelector("#copyStatus")
+  if (copyStatus) {
+    copyStatus.textContent = ""
+    copyStatus.className = "result-copy-status"
+  }
+
+  if (hasError) {
+    content.innerHTML = `
+      <section class="error-panel" role="alert">
+        <span class="section-label">错误详情</span>
+        <div class="result-text error-text">${escapeHtml(result.error || "")}</div>
+      </section>
+    `
+  } else {
+    content.innerHTML = `
+      <section class="text-section translation-section">
+        <span class="section-label accent-label">译文</span>
+        ${
+          isLoading
+            ? `
+          <div class="translation-loading" role="status" aria-live="polite">
+            <span class="loading-spinner" aria-hidden="true"></span>
+            <span>${isRecognizing ? "正在识别图片中的文字..." : "正在翻译..."}</span>
+          </div>
+        `
+            : `
+          <div class="result-text translated-text">${escapeHtml(result.result || "")}</div>
+        `
+        }
+      </section>
+      ${
+        hasSource
+          ? `
+        <div class="section-rule"></div>
+        <section class="text-section">
+          <span class="section-label">原文</span>
+          <div class="result-text source-text">${escapeHtml(result.source || "")}</div>
+        </section>
+      `
+          : ""
+      }
+    `
+  }
+
+  requestAnimationFrame(fitResultWindow)
 }
 
 function renderSettings() {
@@ -511,10 +590,25 @@ async function copyResult(text) {
 }
 
 function closeWindow() {
+  windowShown = false
+  lastResultHeight = 0
+  resultSignature = ""
+  // Drop shell so the next popup can play enter animation once.
+  if (document.querySelector(".result-shell")) {
+    app.innerHTML = ""
+  }
   try {
-    Quit()
+    if (window.go?.wailsui?.App?.HideWindow) {
+      HideWindow()
+      return
+    }
   } catch {
+    // fall through
+  }
+  try {
     window.close()
+  } catch {
+    // ignore
   }
 }
 
@@ -565,6 +659,9 @@ function fitResultWindow() {
     ),
   )
 
+  // Avoid tiny size thrash that looks like a jump when loading -> result.
+  if (Math.abs(contentHeight - lastResultHeight) < 2) return
+  lastResultHeight = contentHeight
   WindowSetSize(425, contentHeight)
 }
 
@@ -642,4 +739,5 @@ window.addEventListener("keydown", handleWindowKeydown)
 systemTheme.addEventListener("change", () => {
   if (activeTheme === "system") applyTheme("system")
 })
+bindStateEvents()
 loadState()

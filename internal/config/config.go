@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 const (
-	DefaultServerPort = 8989
-	MinServerPort     = 1024
-	MaxServerPort     = 65535
+	DefaultServerPort     = 8989
+	MinServerPort         = 1024
+	MaxServerPort         = 65535
+	DefaultUIIdleMinutes  = 5
 )
 
 type Config struct {
@@ -23,6 +25,9 @@ type Config struct {
 	LoggingEnabled   bool   `json:"logging_enabled"`
 	ServerPort       int    `json:"server_port"`
 	Theme            string `json:"theme"`
+	// UIIdleMinutes is how long the UI process stays alive after the window is hidden.
+	// 0 means never auto-exit. Missing values fall back to DefaultUIIdleMinutes.
+	UIIdleMinutes int `json:"ui_idle_minutes"`
 }
 
 var Default = Config{
@@ -34,6 +39,7 @@ var Default = Config{
 	LoggingEnabled:   false,
 	ServerPort:       DefaultServerPort,
 	Theme:            "system",
+	UIIdleMinutes:    DefaultUIIdleMinutes,
 }
 
 func ResolveBaseDir() string {
@@ -74,11 +80,14 @@ func Load(baseDir string) (Config, error) {
 		return cfg, err
 	}
 
+	rawKeys := map[string]json.RawMessage{}
+	_ = json.Unmarshal(data, &rawKeys)
+
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return Default, err
 	}
 
-	mergeLoadedDefaults(&cfg)
+	mergeLoadedDefaults(&cfg, rawKeys)
 	return cfg, nil
 }
 
@@ -129,11 +138,28 @@ func mergeDefaults(cfg *Config) {
 	}
 }
 
-func mergeLoadedDefaults(cfg *Config) {
+func mergeLoadedDefaults(cfg *Config, rawKeys map[string]json.RawMessage) {
 	mergeDefaults(cfg)
 	if ValidateServerPort(cfg.ServerPort) != nil {
 		cfg.ServerPort = Default.ServerPort
 	}
+	if _, ok := rawKeys["ui_idle_minutes"]; !ok {
+		cfg.UIIdleMinutes = Default.UIIdleMinutes
+	} else if cfg.UIIdleMinutes < 0 {
+		cfg.UIIdleMinutes = Default.UIIdleMinutes
+	}
+}
+
+// UIIdleTimeout returns how long the UI should stay alive after hide.
+// A zero duration means the UI should not auto-exit.
+func (c Config) UIIdleTimeout() time.Duration {
+	if c.UIIdleMinutes < 0 {
+		return time.Duration(DefaultUIIdleMinutes) * time.Minute
+	}
+	if c.UIIdleMinutes == 0 {
+		return 0
+	}
+	return time.Duration(c.UIIdleMinutes) * time.Minute
 }
 
 func exists(path string) bool {

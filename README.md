@@ -22,7 +22,8 @@
 - **🌐 智能互译**：基于文本中的中英文字符比例，自动判断并进行中英文双向互译。
 - **⚡ 极速响应**：内置 LRU 结果缓存（256 条），重复文本翻译实现秒级返回。
 - **🎨 现代 UI**：基于 Wails 构建的亚克力毛玻璃界面，完美支持系统深色/浅色主题自适应。
-- **🔧 灵活配置**：系统托盘常驻，支持自定义全局快捷键、OCR 开关、本地端口等，配置热加载即刻生效。
+- **🧩 UI 单实例**：设置页与结果弹窗复用同一个 `translate-ui` 进程，减少重复启动与内存抖动。
+- **🔧 灵活配置**：系统托盘常驻，支持自定义全局快捷键、OCR 开关、本地端口、UI 空闲退出等，配置热加载即刻生效。
 
 ---
 
@@ -60,20 +61,21 @@
 
 ---
 
-## 🏗️ 架构设计 (v2.0 重构优势)
+## 🏗️ 架构设计 (v2.x)
 
-为解决旧版本单进程 Python 带来的系统交互卡顿与不稳定问题，v2.0 采用了全新的 **Go + Wails + Python 三进程架构**：
+为解决旧版本单进程 Python 带来的系统交互卡顿与不稳定问题，v2.x 采用 **Go + Wails + Python 三进程架构**，并在近期进一步收敛了 UI 生命周期：
 
-- **Go 宿主程序 (`PopTrans.exe`)**：专注系统集成，负责系统托盘、全局 Win32 快捷键注册、剪贴板监控以及高性能的原生 DWM 截图框选，提供极度稳定且流畅的系统交互。
-- **Wails UI (`translate-ui.exe`)**：桌面 UI 组件，提供高性能、美观的 Web 前端渲染与毛玻璃窗口。
+- **Go 宿主程序 (`PopTrans.exe`)**：专注系统集成，负责系统托盘、全局 Win32 快捷键注册、剪贴板捕获、原生 DWM 截图框选，以及 UI / AI 子进程的生命周期管理。
+- **Wails UI (`translate-ui.exe`)**：单实例桌面 UI。设置页与翻译结果窗复用同一进程，通过本机 IPC 接收宿主指令；关闭窗口默认隐藏，空闲后可自动退出以释放内存。
 - **Python AI 服务 (`ai_engine.exe`)**：专注后台 AI 计算，内置 FastAPI、llama.cpp、RapidOCR 提供本地 HTTP 服务，被 PyInstaller 独立打包，无需用户电脑安装 Python。
 
-| 对比维度     | v1.x (Python)                            | v2.0 (Go + Wails + Python)                          |
-| ------------ | ---------------------------------------- | --------------------------------------------------- |
-| **稳定性**   | 任意模块崩溃导致应用直接退出             | 进程隔离，AI 引擎崩溃自动重启，托盘/UI 不受影响     |
-| **界面 UI**  | Tkinter 原生窗口，界面简陋               | Wails (WebView2) 亚克力毛玻璃界面，自动适应高度     |
-| **系统交互** | pynput 监听，易冲突，需要管理员权限      | 原生 Win32 API 注册，精确可靠，无需提权             |
-| **OCR 框选** | Python 截屏，高 DPI 下存在坐标偏移与延迟 | Go 原生多显示器虚拟坐标覆盖，无延迟，完美适配高 DPI |
+| 对比维度     | v1.x (Python)                            | v2.x (Go + Wails + Python)                                      |
+| ------------ | ---------------------------------------- | --------------------------------------------------------------- |
+| **稳定性**   | 任意模块崩溃导致应用直接退出             | 进程隔离，AI 引擎崩溃自动重启，托盘/UI 不受影响                 |
+| **界面 UI**  | Tkinter 原生窗口，界面简陋               | Wails (WebView2) 亚克力毛玻璃界面；UI 单实例，结果更新无整窗重绘 |
+| **系统交互** | pynput 监听，易冲突，需要管理员权限      | 原生 Win32 API 注册，精确可靠，无需提权                         |
+| **OCR 框选** | Python 截屏，高 DPI 下存在坐标偏移与延迟 | Go 原生多显示器虚拟坐标覆盖，无延迟，完美适配高 DPI             |
+| **进程模型** | 单进程耦合                               | 宿主 + 单实例 UI + AI；UI 支持空闲自动退出                      |
 
 ---
 
@@ -88,7 +90,13 @@ translate-plugin/
 ├── backend/          # Python AI 服务代码与打包配置 (FastAPI, llama.cpp, RapidOCR)
 ├── cmd/translate-go/ # Go 托盘宿主程序入口
 ├── frontend/         # Wails/Vite 前端界面代码 (HTML/CSS/JS)
-├── internal/         # Go 核心逻辑 (Win32 API, 窗口管理, HTTP 桥接, 生命周期管理)
+├── internal/         # Go 核心逻辑
+│   ├── app/          # 宿主主流程（托盘、热键、翻译/OCR 调度）
+│   ├── backend/      # AI 引擎客户端与进程监管
+│   ├── config/       # 配置读写
+│   ├── platform/     # Windows 原生能力（剪贴板、截图、热键等）
+│   ├── uidaemon/     # UI 单实例进程管理与本机 IPC
+│   └── wailsui/      # Wails UI 后端绑定
 ├── scripts/          # 构建打包脚本
 ├── models/           # 外部 AI 模型存放路径
 └── dist-go/          # 构建产物输出目录
@@ -136,6 +144,7 @@ python -m pip install -r backend/requirements-build.txt
 - `server_port`: AI 引擎内部服务端口，默认为 `8989`。
 - `theme`: 界面主题模式，可选 `system`, `light`, `dark`。
 - `logging_enabled`: 是否开启文件日志。开启后，各进程日志将统一输出至 `translate.log`。
+- `ui_idle_minutes`: UI 进程空闲自动退出时间（分钟）。窗口隐藏后开始计时；默认 `5`，设为 `0` 表示永不自动退出。
 
 ### 环境变量
 
@@ -151,6 +160,63 @@ AI 后台引擎默认在 `http://127.0.0.1:<server_port>` 提供 API 服务，�
 - **`POST /api/v1/ocr`**：RapidOCR 纯离线图像文字识别。
 - **`POST /api/v1/ocr_translate`**：OCR 识别 + 翻译一步集成。
 - **`POST /v1/chat/completions`**：OpenAI 兼容的翻译/对话接口（支持流式响应 SSE）。
+
+---
+
+## 📝 更新记录
+
+### 2026-07-27 — UI 单实例与生命周期优化
+
+本次更新聚焦“进程过多、结果窗体验不稳”的问题，不改变整体 Go + Wails + Python 方向，优先收敛 UI 生命周期。
+
+#### 主要变更
+
+1. **UI 单实例**
+   - 设置页与翻译结果窗复用同一个 `translate-ui.exe` 进程。
+   - 宿主按需拉起 UI daemon（`--daemon`），后续通过本机 IPC 控制显示/隐藏，不再每次翻译都新建 UI 进程。
+2. **本机 IPC 控制面**
+   - 新增 `internal/uidaemon`：宿主与 UI 通过 loopback HTTP + token 通信。
+   - 运行时会生成 `translate-ui-endpoint.json` 用于 UI 发现（本地运行时文件，不随发行包分发）。
+3. **UI 空闲自动退出**
+   - 窗口隐藏后默认 **5 分钟** 自动退出 UI 进程，降低低频使用场景下的内存占用。
+   - 可通过 `settings.json` 的 `ui_idle_minutes` 调整；`0` 表示永不自动退出。
+4. **结果窗体验修复**
+   - 修复翻译完成时结果窗“跳一下”：loading → 结果更新不再重新定位到鼠标位置。
+   - 修复结果窗“闪一下”：结果外壳只创建一次，内容区局部更新，避免重复触发入场动画。
+
+#### 配置示例
+
+```json
+{
+  "hotkey": "<ctrl>+<alt>+q",
+  "hotkey_display": "Ctrl+Alt+Q",
+  "ocr_enabled": true,
+  "ocr_hotkey": "<ctrl>+<alt>+e",
+  "ocr_hotkey_display": "Ctrl+Alt+E",
+  "logging_enabled": false,
+  "server_port": 8989,
+  "theme": "system",
+  "ui_idle_minutes": 5
+}
+```
+
+#### 开发者说明
+
+- 相关目录：`internal/uidaemon/`、`internal/wailsui/`、`internal/app/`、`frontend/src/`
+- 修改 UI 后需重新构建：
+
+```powershell
+./scripts/build_wails.bat
+# 如宿主侧也有改动
+./scripts/build_go.bat
+# 或一键完整构建
+./scripts/build_all.bat
+```
+
+- 验证建议：
+  - 连续翻译多次，任务管理器中 `translate-ui.exe` 应保持为 1 个进程。
+  - 关闭结果窗后等待 `ui_idle_minutes`，UI 进程应自动退出；再次翻译会重新拉起。
+  - loading 到译文完成时，窗口位置应保持稳定，且不应整窗闪烁。
 
 ---
 

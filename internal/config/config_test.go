@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestThemeDefaultsToSystem(t *testing.T) {
@@ -142,5 +143,57 @@ func TestSaveRejectsInvalidServerPort(t *testing.T) {
 	err := Save(t.TempDir(), cfg)
 	if err == nil || !strings.Contains(err.Error(), "1024") {
 		t.Fatalf("expected port validation error, got %v", err)
+	}
+}
+
+func TestUIIdleMinutesDefault(t *testing.T) {
+	cfg, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.UIIdleMinutes != DefaultUIIdleMinutes {
+		t.Fatalf("ui idle minutes = %d, want %d", cfg.UIIdleMinutes, DefaultUIIdleMinutes)
+	}
+	if cfg.UIIdleTimeout() != time.Duration(DefaultUIIdleMinutes)*time.Minute {
+		t.Fatalf("timeout = %s", cfg.UIIdleTimeout())
+	}
+}
+
+func TestUIIdleMinutesZeroMeansNever(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(dir, "settings.json"),
+		[]byte(`{"ui_idle_minutes":0}`),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.UIIdleMinutes != 0 {
+		t.Fatalf("ui idle minutes = %d, want 0", loaded.UIIdleMinutes)
+	}
+	if loaded.UIIdleTimeout() != 0 {
+		t.Fatalf("timeout = %s, want 0", loaded.UIIdleTimeout())
+	}
+}
+
+func TestUIIdleMinutesMissingUsesDefault(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(dir, "settings.json"),
+		[]byte(`{"theme":"system"}`),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.UIIdleMinutes != DefaultUIIdleMinutes {
+		t.Fatalf("ui idle minutes = %d, want %d", loaded.UIIdleMinutes, DefaultUIIdleMinutes)
 	}
 }

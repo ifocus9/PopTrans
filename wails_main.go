@@ -26,8 +26,7 @@ func main() {
 	baseDir := config.ResolveBaseDir()
 	configureWailsLogging(baseDir)
 
-	width, height := windowSize(os.Args)
-	resultMode := isResultMode(os.Args)
+	daemonMode := hasArg(os.Args, "--daemon")
 	background := &options.RGBA{A: 0}
 	windowsOptions := &wailswindows.Options{
 		Theme:                wailswindows.Dark,
@@ -39,12 +38,12 @@ func main() {
 
 	err := wails.Run(&options.App{
 		Title:         "选中翻译",
-		Width:         width,
-		Height:        height,
-		StartHidden:   !resultMode,
+		Width:         458,
+		Height:        640,
+		StartHidden:   true,
 		DisableResize: true,
 		Frameless:     true,
-		AlwaysOnTop:   resultMode,
+		AlwaysOnTop:   false,
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},
@@ -59,20 +58,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("wails run: %v", err)
 	}
-}
-
-func windowSize(args []string) (int, int) {
-	for _, arg := range args {
-		if arg == "--result" {
-			return 425, 300
-		}
+	if daemonMode {
+		log.Printf("translate-ui daemon exited")
 	}
-	return 458, 640
 }
 
-func isResultMode(args []string) bool {
+func hasArg(args []string, name string) bool {
 	for _, arg := range args {
-		if arg == "--result" {
+		if arg == name {
 			return true
 		}
 	}

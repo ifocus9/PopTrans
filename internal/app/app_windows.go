@@ -2,12 +2,10 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -18,6 +16,7 @@ import (
 	"translate-plugin/internal/config"
 	applog "translate-plugin/internal/logging"
 	win "translate-plugin/internal/platform/windows"
+	"translate-plugin/internal/uidaemon"
 )
 
 const (
@@ -47,20 +46,15 @@ var (
 )
 
 type App struct {
-	baseDir              string
-	cfg                  config.Config
-	client               *backend.Client
-	supervisor           *backend.Supervisor
-	hwnd                 win.HWND
-	icon                 win.HWND
-	overlay              *SelectionOverlay
-	settingsMu           sync.Mutex
-	settingsWailsRunning bool
-	hotkeysSuspended     bool
-	wailsMu              sync.Mutex
-	wailsProcesses       map[int]*os.Process
-	resultWailsProcess   *os.Process
-	resultWailsStatePath string
+	baseDir          string
+	cfg              config.Config
+	client           *backend.Client
+	supervisor       *backend.Supervisor
+	hwnd             win.HWND
+	icon             win.HWND
+	overlay          *SelectionOverlay
+	ui               *uidaemon.Manager
+	hotkeysSuspended bool
 
 	statusMu sync.Mutex
 	status   string
@@ -70,13 +64,6 @@ type App struct {
 	result   string
 	lastErr  string
 	busy     bool
-}
-
-type wailsResultPayload struct {
-	Source  string `json:"source"`
-	Result  string `json:"result"`
-	Error   string `json:"error"`
-	Loading bool   `json:"loading"`
 }
 
 func New() (*App, error) {
@@ -97,15 +84,15 @@ func New() (*App, error) {
 	)
 
 	client := backend.NewClient(config.BackendURL(cfg.ServerPort))
-
-	return &App{
-		baseDir:        baseDir,
-		cfg:            cfg,
-		client:         client,
-		supervisor:     backend.NewSupervisor(baseDir, client),
-		status:         "正在初始化...",
-		wailsProcesses: make(map[int]*os.Process),
-	}, nil
+	app := &App{
+		baseDir:    baseDir,
+		cfg:        cfg,
+		client:     client,
+		supervisor: backend.NewSupervisor(baseDir, client),
+		status:     "正在初始化...",
+	}
+	app.ui = uidaemon.NewManager(baseDir, app.resolveWailsExe, app.handleUIDaemonEvent)
+	return app, nil
 }
 
 func (a *App) Run() error {
@@ -163,7 +150,9 @@ func (a *App) Close() {
 	if a.overlay != nil {
 		a.overlay.Close()
 	}
-	a.stopWailsProcesses()
+	if a.ui != nil {
+		a.ui.Stop()
+	}
 	win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
 	win.UnregisterHotKey(a.hwnd, hotkeyOCR)
 	win.DeleteTrayIcon(a.hwnd, trayIconID)
@@ -515,42 +504,15 @@ func (a *App) openSettings() {
 }
 
 func (a *App) showWailsSettings() error {
-	a.settingsMu.Lock()
-	defer a.settingsMu.Unlock()
-	if a.settingsWailsRunning {
-		return nil
-	}
-
-	exePath := a.resolveWailsExe()
-	if exePath == "" {
-		return fmt.Errorf("translate-ui.exe not found")
-	}
-
-	cmd := exec.Command(exePath, "--settings")
-	cmd.Dir = filepath.Dir(exePath)
 	a.suspendHotkeys()
-	if err := cmd.Start(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := a.ui.ShowSettings(ctx); err != nil {
 		if resumeErr := a.resumeHotkeys(); resumeErr != nil {
-			log.Printf("app resume hotkeys after wails settings start failed: %v", resumeErr)
+			log.Printf("app resume hotkeys after settings open failed: %v", resumeErr)
 		}
 		return err
 	}
-	a.settingsWailsRunning = true
-	a.addWailsProcess(cmd.Process)
-
-	go func() {
-		err := cmd.Wait()
-		a.removeWailsProcess(cmd.Process)
-		if err != nil {
-			log.Printf("wails settings process exited with error: %v", err)
-		} else {
-			log.Printf("wails settings process exited")
-		}
-		a.settingsMu.Lock()
-		a.settingsWailsRunning = false
-		a.settingsMu.Unlock()
-		win.PostMessage(a.hwnd, wmSettingsClosed, 0, 0)
-	}()
 	return nil
 }
 
@@ -715,120 +677,33 @@ func (a *App) showLoading() {
 
 	if err := a.showWailsResult(source, "", "", true); err != nil {
 		log.Printf("show loading wails popup failed: %v", err)
-		a.setStatus("翻译窗口启动失败")
+		a.setStatus("加载窗口启动失败")
 		return
 	}
 	log.Printf("show loading wails popup success")
 }
 
 func (a *App) showWailsResult(source, result, errMsg string, loading bool) error {
-	exePath := a.resolveWailsExe()
-	if exePath == "" {
-		return fmt.Errorf("translate-ui.exe not found")
-	}
-
-	payload := wailsResultPayload{
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	return a.ui.ShowResult(ctx, uidaemon.ResultPayload{
 		Source:  source,
 		Result:  result,
 		Error:   errMsg,
 		Loading: loading,
-	}
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-
-	a.wailsMu.Lock()
-	if a.resultWailsProcess != nil && a.resultWailsStatePath != "" {
-		path := a.resultWailsStatePath
-		a.wailsMu.Unlock()
-		if err := os.WriteFile(path, data, 0600); err != nil {
-			return fmt.Errorf("update wails result state: %w", err)
-		}
-		return nil
-	}
-	a.wailsMu.Unlock()
-
-	file, err := os.CreateTemp("", "translate-result-*.json")
-	if err != nil {
-		return err
-	}
-	path := file.Name()
-	if _, err := file.Write(data); err != nil {
-		_ = file.Close()
-		_ = os.Remove(path)
-		return err
-	}
-	if err := file.Close(); err != nil {
-		_ = os.Remove(path)
-		return err
-	}
-
-	cmd := exec.Command(exePath, "--result", path)
-	cmd.Dir = filepath.Dir(exePath)
-	if err := cmd.Start(); err != nil {
-		_ = os.Remove(path)
-		return err
-	}
-	a.wailsMu.Lock()
-	a.wailsProcesses[cmd.Process.Pid] = cmd.Process
-	a.resultWailsProcess = cmd.Process
-	a.resultWailsStatePath = path
-	a.wailsMu.Unlock()
-	go func() {
-		err := cmd.Wait()
-		a.wailsMu.Lock()
-		delete(a.wailsProcesses, cmd.Process.Pid)
-		if a.resultWailsProcess != nil && a.resultWailsProcess.Pid == cmd.Process.Pid {
-			a.resultWailsProcess = nil
-			a.resultWailsStatePath = ""
-		}
-		a.wailsMu.Unlock()
-		_ = os.Remove(path)
-		if err != nil {
-			log.Printf("wails result process exited with error: %v", err)
-		}
-	}()
-	return nil
+	})
 }
 
-func (a *App) addWailsProcess(process *os.Process) {
-	if process == nil {
-		return
-	}
-	a.wailsMu.Lock()
-	a.wailsProcesses[process.Pid] = process
-	a.wailsMu.Unlock()
-}
-
-func (a *App) removeWailsProcess(process *os.Process) {
-	if process == nil {
-		return
-	}
-	a.wailsMu.Lock()
-	delete(a.wailsProcesses, process.Pid)
-	a.wailsMu.Unlock()
-}
-
-func (a *App) stopWailsProcesses() {
-	a.wailsMu.Lock()
-	processes := make([]*os.Process, 0, len(a.wailsProcesses))
-	for _, process := range a.wailsProcesses {
-		processes = append(processes, process)
-	}
-	a.wailsProcesses = make(map[int]*os.Process)
-	statePath := a.resultWailsStatePath
-	a.resultWailsProcess = nil
-	a.resultWailsStatePath = ""
-	a.wailsMu.Unlock()
-
-	for _, process := range processes {
-		if err := process.Kill(); err != nil {
-			log.Printf("stop wails process pid=%d: %v", process.Pid, err)
+func (a *App) handleUIDaemonEvent(event int) {
+	switch event {
+	case uidaemon.EventSettingsHidden:
+		win.PostMessage(a.hwnd, wmSettingsClosed, 0, 0)
+	case uidaemon.EventConfigSaved:
+		win.PostMessage(a.hwnd, wmSettingsClosed, 0, 0)
+	case uidaemon.EventUIExited:
+		if a.hotkeysSuspended {
+			win.PostMessage(a.hwnd, wmSettingsClosed, 0, 0)
 		}
-	}
-	if statePath != "" {
-		_ = os.Remove(statePath)
 	}
 }
 
@@ -882,7 +757,7 @@ func mainWindowProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	case win.WmHotkey:
 		log.Printf("main window proc: hotkey event id=%d", wParam)
 		if currentApp.hotkeysSuspended {
-			log.Printf("main window proc: hotkey ignored while settings are open")
+			log.Printf("main window proc: hotkey ignored while settings ui is open")
 			return 0
 		}
 		switch int32(wParam) {
@@ -913,7 +788,7 @@ func mainWindowProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		log.Printf("tray icon status updated")
 		return 0
 	case wmSettingsClosed:
-		log.Printf("main window proc: wails settings closed")
+		log.Printf("main window proc: ui settings closed")
 		currentApp.reloadSettings()
 		if err := currentApp.resumeHotkeys(); err != nil {
 			log.Printf("resume hotkeys after wails settings closed: %v", err)

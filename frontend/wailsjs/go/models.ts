@@ -32,6 +32,7 @@ export namespace config {
 	    logging_enabled: boolean;
 	    server_port: number;
 	    theme: string;
+	    ui_idle_minutes: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new Config(source);
@@ -47,6 +48,50 @@ export namespace config {
 	        this.logging_enabled = source["logging_enabled"];
 	        this.server_port = source["server_port"];
 	        this.theme = source["theme"];
+	        this.ui_idle_minutes = source["ui_idle_minutes"];
+	    }
+	}
+
+}
+
+export namespace uidaemon {
+	
+	export class ResultPayload {
+	    source: string;
+	    result: string;
+	    error: string;
+	    loading: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new ResultPayload(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.source = source["source"];
+	        this.result = source["result"];
+	        this.error = source["error"];
+	        this.loading = source["loading"];
+	    }
+	}
+	export class Status {
+	    ready: boolean;
+	    mode: string;
+	    visible: boolean;
+	    settings_open: boolean;
+	    hotkeys_paused: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new Status(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.ready = source["ready"];
+	        this.mode = source["mode"];
+	        this.visible = source["visible"];
+	        this.settings_open = source["settings_open"];
+	        this.hotkeys_paused = source["hotkeys_paused"];
 	    }
 	}
 
