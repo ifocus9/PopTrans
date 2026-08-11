@@ -23,6 +23,12 @@ import (
 const createNoWindow = 0x08000000
 const serverPortEnv = "TRANSLATE_SERVER_PORT"
 
+// StartupReadyTimeout 是等待本地后端（含首次模型的下载）就绪的最大等待时长。
+// 首次运行需下载约 1.13GB 的 GGUF 模型，在较慢网络下可能耗时数分钟甚至更久，
+// 因此给足余量；模型下载进度会通过 /health 的 translator_status 实时回传并显示在托盘。
+// 仅当发生真正的初始化错误（如下载彻底失败）或后端进程退出时，才会提前返回错误。
+const StartupReadyTimeout = 30 * time.Minute
+
 type Supervisor struct {
 	baseDir string
 	client  *Client
@@ -141,7 +147,7 @@ func (s *Supervisor) EnsureRunning(ctx context.Context, onStatus func(string)) e
 		}()
 	}
 
-	deadline := time.Now().Add(2 * time.Minute)
+	deadline := time.Now().Add(StartupReadyTimeout)
 	attempt := 0
 	for time.Now().Before(deadline) {
 		attempt++
@@ -238,30 +244,51 @@ func (s *Supervisor) Stop() {
 	s.ensureMu.Lock()
 	defer s.ensureMu.Unlock()
 
-	if s.cmd == nil || !s.owned || s.cmd.Process == nil {
-		log.Printf("supervisor stop skipped: no owned backend process")
+	if s.cmd != nil && s.owned && s.cmd.Process != nil {
+		log.Printf("supervisor stopping owned backend process: pid=%d", s.cmd.Process.Pid)
+		if err := terminateProcessTree(s.cmd.Process); err != nil {
+			log.Printf("supervisor process tree termination failed, using direct kill: pid=%d err=%v", s.cmd.Process.Pid, err)
+			_ = s.cmd.Process.Kill()
+		}
+		s.waitForOwnedExit()
+		s.cmd = nil
+		s.owned = false
+		s.waitCh = nil
+		log.Printf("supervisor owned backend process stopped")
+	}
+
+	// 兜底清理：启动时若发现已有后端在运行（来自上一次未干净退出的遗留进程），
+	// EnsureRunning 会直接复用而不会接管其生命周期，导致本次退出时无法回收。
+	// 这里按可执行文件路径扫一遍 baseDir 下的 ai_engine.exe，确保退出后无残留。
+	s.killEngineByPath()
+}
+
+func (s *Supervisor) waitForOwnedExit() {
+	if s.waitCh == nil {
 		return
 	}
-
-	log.Printf("supervisor stopping backend process: pid=%d", s.cmd.Process.Pid)
-	if err := terminateProcessTree(s.cmd.Process); err != nil {
-		log.Printf("supervisor process tree termination failed, using direct kill: pid=%d err=%v", s.cmd.Process.Pid, err)
-		_ = s.cmd.Process.Kill()
+	select {
+	case waitErr := <-s.waitCh:
+		log.Printf("supervisor backend process wait finished during stop: err=%v", waitErr)
+	case <-time.After(5 * time.Second):
+		log.Printf("supervisor timed out waiting for backend process to exit during stop")
 	}
+}
 
-	if s.waitCh != nil {
-		select {
-		case waitErr := <-s.waitCh:
-			log.Printf("supervisor backend process wait finished during stop: err=%v", waitErr)
-		case <-time.After(5 * time.Second):
-			log.Printf("supervisor timed out waiting for backend process to exit during stop")
-		}
+// killEngineByPath 按可执行文件路径强制结束 baseDir 下残留的 ai_engine.exe，
+// 包括 PyInstaller 解压出的子进程树。仅在路径精确匹配时动手，避免误伤其他安装。
+func (s *Supervisor) killEngineByPath() {
+	target := filepath.Join(s.baseDir, "ai_engine.exe")
+	log.Printf("supervisor sweeping leftover engine at %s", target)
+	ps := fmt.Sprintf(
+		"Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq '%s' } | ForEach-Object { taskkill.exe /PID $_.ProcessId /T /F }",
+		strings.ReplaceAll(target, "'", "''"),
+	)
+	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", ps)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("supervisor engine sweep finished (pids may have already exited): %v | %s", err, strings.TrimSpace(string(out)))
 	}
-
-	s.cmd = nil
-	s.owned = false
-	s.waitCh = nil
-	log.Printf("supervisor backend process stopped")
 }
 
 func (s *Supervisor) Restart(ctx context.Context, onStatus func(string)) error {

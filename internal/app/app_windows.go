@@ -229,7 +229,7 @@ func (a *App) resumeHotkeys() error {
 
 func (a *App) ensureBackendReady() {
 	log.Printf("app ensure backend ready start")
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), backend.StartupReadyTimeout)
 	defer cancel()
 
 	var health backend.Health
@@ -627,7 +627,7 @@ func (a *App) applySettings(next config.Config) error {
 func (a *App) restartBackendForConfigChange(portChanged bool) {
 	a.setStatus("正在重启本地服务...")
 	a.cancelBackendIdleStop()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), backend.StartupReadyTimeout)
 	defer cancel()
 
 	if portChanged {

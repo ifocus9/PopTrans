@@ -9,6 +9,7 @@ translator.py — Hy-MT2-1.8B 翻译引擎模块
 import os
 import sys
 import re
+import time
 import threading
 import logging
 from collections import OrderedDict
@@ -28,11 +29,13 @@ _BASE_DIR = os.fspath(application_dir())
 MODEL_DIR = os.path.join(_BASE_DIR, "models", "Hy-MT2-1.8B-GGUF")
 MODEL_PATH = os.path.join(MODEL_DIR, MODEL_FILENAME)
 
-# HuggingFace 镜像（国内加速）+ 绕过系统代理
-HF_MIRROR = "https://hf-mirror.com"
-os.environ["HF_ENDPOINT"] = HF_MIRROR
-os.environ["NO_PROXY"] = "hf-mirror.com,huggingface.co"
-os.environ["no_proxy"] = "hf-mirror.com,huggingface.co"
+# 直接从 HuggingFace 官网下载模型。
+# 之前使用的 hf-mirror.com 镜像连不上会导致下载失败，故改为官方源。
+HF_ENDPOINT = "https://huggingface.co"
+os.environ["HF_ENDPOINT"] = HF_ENDPOINT
+
+# 离线模式开关：设置环境变量 POPTRANS_OFFLINE=1 时禁止联网下载（其余情况本地缺模型即自动下载）。
+_OFFLINE_MODE = os.environ.get("POPTRANS_OFFLINE", "").strip() == "1"
 
 # Hy-MT2 推荐参数
 MODEL_N_CTX = 1536
@@ -245,35 +248,6 @@ def normalize_target_language(target_lang: Optional[str]) -> Optional[str]:
     )
 
 
-def _create_no_proxy_session():
-    """创建不使用代理的 requests session"""
-    import requests
-    session = requests.Session()
-    session.trust_env = False
-    session.proxies = {"http": "", "https": ""}
-    return session
-
-
-def _configure_huggingface_http():
-    """Configure a direct HTTP client across huggingface_hub versions."""
-    try:
-        from huggingface_hub import configure_http_backend
-    except ImportError:
-        import httpx
-        from huggingface_hub import set_client_factory
-
-        set_client_factory(
-            lambda: httpx.Client(
-                trust_env=False,
-                follow_redirects=True,
-                timeout=None,
-            )
-        )
-        return
-
-    configure_http_backend(backend_factory=_create_no_proxy_session)
-
-
 # 翻译 prompt 模板
 PROMPT_TEMPLATE = (
     "Translate the following text into {target_lang}. Note that you should "
@@ -335,8 +309,14 @@ class Translator:
 
         with self._setup_lock:
             try:
-                # 检查模型是否已下载
+                # 本地缺少模型时，自动从 HuggingFace 官网下载
                 if not os.path.exists(MODEL_PATH):
+                    if _OFFLINE_MODE:
+                        raise FileNotFoundError(
+                            f"模型文件未找到: {MODEL_PATH}\n"
+                            "当前为离线模式（POPTRANS_OFFLINE=1），已禁止联网下载。"
+                            "请将模型文件放置到上述路径，或取消离线模式后重试。"
+                        )
                     update_status("首次使用需下载 Hy-MT2 模型（约 1.13GB）...")
                     self._download_model(update_status)
 
@@ -357,24 +337,129 @@ class Translator:
                     on_ready(False)
 
     def _download_model(self, update_status):
-        """下载 Hy-MT2 GGUF 模型"""
-        from huggingface_hub import hf_hub_download
+        """从 HuggingFace 官网下载 Hy-MT2 GGUF 模型（支持断点续传、重试）"""
+        import requests
+        from huggingface_hub import hf_hub_url
 
-        update_status("正在从 HuggingFace 镜像下载模型...")
+        update_status("正在从 HuggingFace 官网下载模型...")
         os.makedirs(MODEL_DIR, exist_ok=True)
 
-        # 禁用代理，直连镜像
-        _configure_huggingface_http()
+        # 走系统代理访问官网（默认 requests 行为），避免直连被网络阻断
+        session = requests.Session()
+        url = hf_hub_url(MODEL_ID, MODEL_FILENAME, repo_type="model")
 
-        # 下载模型到本地目录
-        hf_hub_download(
-            repo_id=MODEL_ID,
-            filename=MODEL_FILENAME,
-            local_dir=MODEL_DIR,
-            cache_dir=os.path.join(os.path.dirname(MODEL_DIR), "cache"),
-        )
+        # 探测文件大小（最多重试 5 次）
+        total_size = 1133080448
+        for attempt in range(1, 6):
+            try:
+                resp = session.head(url, verify=False, timeout=(15, 30), allow_redirects=True)
+                resp.raise_for_status()
+                try:
+                    size = int(resp.headers.get("Content-Length", total_size))
+                except (ValueError, TypeError):
+                    size = total_size
+                if size >= 1024 * 1024:
+                    total_size = size
+                break
+            except Exception as e:
+                logger.warning("探测模型大小第 %d/5 次失败: %s", attempt, e)
+                if attempt == 5:
+                    update_status("无法获取模型大小，使用默认 1.13GB 继续下载")
+                else:
+                    update_status(f"连接官网失败，正在重试（{attempt}/5）...")
+                    time.sleep(1)
 
-        update_status("模型下载完成")
+        part_path = MODEL_PATH + ".part"
+        max_retries = 10
+        chunk_size = 1024 * 1024  # 1 MB
+
+        for attempt in range(1, max_retries + 1):
+            existing = 0
+            if os.path.exists(part_path):
+                existing = os.path.getsize(part_path)
+                if existing >= total_size:
+                    os.replace(part_path, MODEL_PATH)
+                    update_status("模型下载完成")
+                    return
+
+            headers = {}
+            mode = "wb"
+            if existing > 0:
+                headers["Range"] = f"bytes={existing}-"
+                mode = "ab"
+
+            try:
+                response = session.get(
+                    url,
+                    stream=True,
+                    headers=headers,
+                    verify=False,
+                    timeout=(15, 300),
+                    allow_redirects=True,
+                )
+
+                # 200 表示服务器忽略 Range 要求从头传；206 才是断点续传
+                if response.status_code == 206:
+                    content_range = response.headers.get("Content-Range", "")
+                    # bytes 402536757-1133080447/1133080448
+                    if content_range and "/" in content_range:
+                        try:
+                            total_size = int(content_range.split("/")[-1])
+                        except (ValueError, IndexError):
+                            pass
+                elif response.status_code == 200:
+                    # 不支持 Range，只能从头再来
+                    existing = 0
+                    mode = "wb"
+                    update_status("服务器不支持断点续传，从头开始下载...")
+                else:
+                    response.raise_for_status()
+
+                downloaded = existing
+                last_reported_mb = existing // (1024 * 1024)
+                fsync_counter = 0
+                with open(part_path, mode) as f:
+                    for chunk in response.iter_content(chunk_size=chunk_size):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        fsync_counter += len(chunk)
+                        # 每写入约 10 MB 做一次 fsync，确保断点可靠
+                        if fsync_counter >= 10 * 1024 * 1024:
+                            f.flush()
+                            os.fsync(f.fileno())
+                            fsync_counter = 0
+                        current_mb = downloaded // (1024 * 1024)
+                        if current_mb > last_reported_mb:
+                            last_reported_mb = current_mb
+                            percent = min(int(downloaded / total_size * 100), 100)
+                            update_status(
+                                f"正在下载模型... {downloaded / (1024*1024):.1f}/{total_size / (1024*1024):.1f} MB ({percent}%)"
+                            )
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                if downloaded >= total_size:
+                    os.replace(part_path, MODEL_PATH)
+                    update_status("模型下载完成")
+                    return
+
+                # 走到这里说明连接被提前关闭，但已有数据已落盘，可续传
+                raise IOError(f"连接提前关闭：已下载 {downloaded} / {total_size} 字节")
+
+            except Exception as e:
+                logger.warning("模型下载第 %d/%d 次失败: %s", attempt, max_retries, e)
+                if attempt < max_retries:
+                    wait = min(2 ** (attempt - 1), 30)  # 1, 2, 4, 8, 16, 30...
+                    update_status(
+                        f"下载中断，已保存 {existing / (1024*1024):.1f} MB，"
+                        f"{wait} 秒后断点续传（{attempt}/{max_retries}）..."
+                    )
+                    time.sleep(wait)
+                else:
+                    update_status(f"模型下载失败（已重试 {max_retries} 次）: {e}")
+                    raise RuntimeError(f"模型下载失败（已重试 {max_retries} 次）: {e}") from e
 
     def _load_model(self):
         """加载 llama-cpp-python 模型"""

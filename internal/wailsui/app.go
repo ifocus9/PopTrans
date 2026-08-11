@@ -149,7 +149,7 @@ func (a *App) Startup(ctx context.Context) {
 	}
 	a.mu.Unlock()
 	go func() {
-		startCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		startCtx, cancel := context.WithTimeout(context.Background(), backend.StartupReadyTimeout)
 		defer cancel()
 		_ = a.supervisor.EnsureRunning(startCtx, func(string) {})
 	}()
