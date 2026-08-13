@@ -7,6 +7,7 @@
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-blue)]()
+[![Download](https://img.shields.io/github/v/release/ifocus9/PopTrans?label=Download&color=success)](https://github.com/ifocus9/PopTrans/releases/latest)
 
 </div>
 
@@ -43,6 +44,10 @@
 - **操作系统**：Windows 10 / 11 (x64)
 - **依赖运行库**：需系统已安装 [WebView2 Runtime](https://developer.microsoft.com/zh-cn/microsoft-edge/webview2/) (Windows 11 通常自带)
 - **硬件要求**：纯 CPU 推理，无需独立显卡，建议 8GB 及以上内存。
+
+### 下载与安装
+
+[⬇️ 下载最新版本](https://github.com/ifocus9/PopTrans/releases/latest) — 解压后即可使用。
 
 ### 首次运行与自动下载
 
