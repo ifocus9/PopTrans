@@ -52,7 +52,7 @@
 ### 首次运行与自动下载
 
 1. 双击运行发行版中的 `PopTrans.exe`。
-2. **下载模型**：若本地无翻译模型，首次启动时会**自动联网下载** 腾讯 Hy-MT2-1.8B GGUF 模型 (约 1.13GB)。默认通过 HuggingFace 国内加速镜像 (`https://hf-mirror.com`) 下载并绕过系统代理。
+2. **下载模型**：若本地无翻译模型，首次启动时会**自动联网下载** 腾讯 Hy-MT2-1.8B GGUF 模型 (约 1.13GB)。默认从 HuggingFace 官网 (`huggingface.co`) 下载，请确保网络可正常访问。
 3. 下载完成后，模型将保存在 `models/Hy-MT2-1.8B-GGUF/` 目录下，后续运行即为完全离线状态。
 
 ### 默认快捷键
@@ -156,8 +156,7 @@ python -m pip install -r backend/requirements-build.txt
 ### 环境变量
 
 - `TRANSLATE_SERVER_PORT`：强制覆盖配置文件中的 AI 服务端口。
-- `HF_ENDPOINT`：自定义 HuggingFace 镜像下载地址（默认为 `https://hf-mirror.com`）。
-- `NO_PROXY`：下载模型时绕过代理的域名列表。
+- `POPTRANS_OFFLINE`：设为 `1` 时禁止 AI 引擎联网下载模型（本地缺模型则报错退出）。
 
 ### 本地 HTTP API (二次开发)
 
