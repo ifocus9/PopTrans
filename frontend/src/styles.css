@@ -36,6 +36,68 @@ body {
   background: transparent;
 }
 
+.startup-shell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  padding: 36px;
+  color: #f4f1f8;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background:
+    radial-gradient(circle at 50% 15%, rgba(112, 174, 255, 0.18), transparent 42%),
+    linear-gradient(145deg, rgba(27, 29, 42, 0.96), rgba(12, 13, 21, 0.98));
+  text-align: center;
+}
+
+.startup-shell h1 {
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+}
+
+.startup-status {
+  max-width: 360px;
+  margin-top: 12px;
+  color: #d9d6e0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.startup-error {
+  max-width: 360px;
+  margin-top: 8px;
+  color: #ef8585;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.startup-progress {
+  width: min(260px, 100%);
+  height: 3px;
+  margin-top: 22px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.startup-progress span {
+  display: block;
+  width: 42%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #77e2ff, #9b8cff);
+  animation: startup-progress 1.35s ease-in-out infinite;
+}
+
+.startup-hint {
+  margin-top: 14px;
+  color: #8f8a9b;
+  font-size: 10px;
+}
+
 .result-mode,
 .result-mode body,
 .result-mode #app {
@@ -1144,6 +1206,11 @@ p {
   to {
     transform: rotate(360deg);
   }
+}
+
+@keyframes startup-progress {
+  0% { transform: translateX(-140%); }
+  55%, 100% { transform: translateX(340%); }
 }
 
 @keyframes glass-enter {

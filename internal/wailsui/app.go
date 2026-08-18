@@ -32,21 +32,28 @@ type App struct {
 	notify        *uidaemon.NotifyClient
 	server        *uidaemon.Server
 
-	mu           sync.Mutex
-	mode         string
-	visible      bool
-	settingsOpen bool
-	result       ResultView
-	ready        bool
-	idleTimer    *time.Timer
-	idleTimeout  time.Duration
+	mu             sync.Mutex
+	mode           string
+	visible        bool
+	settingsOpen   bool
+	result         ResultView
+	ready          bool
+	startupLoading bool
+	startupStatus  string
+	startupError   string
+	startupStarted time.Time
+	idleTimer      *time.Timer
+	idleTimeout    time.Duration
 }
 
 type UIState struct {
-	Config config.Config  `json:"config"`
-	Health backend.Health `json:"health"`
-	Mode   string         `json:"mode"`
-	Result ResultView     `json:"result"`
+	Config         config.Config  `json:"config"`
+	Health         backend.Health `json:"health"`
+	Mode           string         `json:"mode"`
+	Result         ResultView     `json:"result"`
+	StartupLoading bool           `json:"startup_loading"`
+	StartupStatus  string         `json:"startup_status"`
+	StartupError   string         `json:"startup_error"`
 }
 
 type TranslateResult struct {
@@ -68,12 +75,13 @@ func NewApp(baseDir string, args []string) *App {
 	}
 	client := backend.NewClient(config.BackendURL(cfg.ServerPort))
 	app := &App{
-		baseDir:     baseDir,
-		client:      client,
-		supervisor:  backend.NewSupervisor(baseDir, client),
-		mode:        "settings",
-		visible:     false,
-		idleTimeout: cfg.UIIdleTimeout(),
+		baseDir:       baseDir,
+		client:        client,
+		supervisor:    backend.NewSupervisor(baseDir, client),
+		mode:          "settings",
+		visible:       false,
+		idleTimeout:   cfg.UIIdleTimeout(),
+		startupStatus: "正在启动本地服务...",
 	}
 
 	for i := 0; i < len(args); i++ {
@@ -123,11 +131,14 @@ func (a *App) Startup(ctx context.Context) {
 		a.mu.Lock()
 		a.ready = true
 		a.mode = "settings"
-		a.visible = false
+		a.visible = true
 		a.settingsOpen = false
+		a.startupLoading = true
+		a.startupStarted = time.Now()
 		a.mu.Unlock()
-		runtime.WindowHide(ctx)
-		a.scheduleIdleExit()
+		// The host process starts the backend. Poll its health here so the UI can
+		// show download/load progress without racing a second backend process.
+		go a.monitorStartup()
 		return
 	}
 
@@ -153,6 +164,56 @@ func (a *App) Startup(ctx context.Context) {
 		defer cancel()
 		_ = a.supervisor.EnsureRunning(startCtx, func(string) {})
 	}()
+}
+
+func (a *App) monitorStartup() {
+	ctx := a.ctx
+	if ctx == nil {
+		return
+	}
+	ticker := time.NewTicker(750 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.NewTimer(backend.StartupReadyTimeout)
+	defer deadline.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			health, err := a.client.Health(ctx)
+			a.mu.Lock()
+			if err != nil {
+				a.startupStatus = "正在连接本地服务..."
+			} else if health.TranslatorStatus != "" {
+				a.startupStatus = health.TranslatorStatus
+			} else if !health.TranslatorReady {
+				a.startupStatus = "正在加载翻译模型..."
+			}
+			ready := err == nil && health.TranslatorReady && time.Since(a.startupStarted) >= 1200*time.Millisecond
+			if ready {
+				a.startupLoading = false
+				a.startupStatus = "模型加载完成"
+				a.visible = false
+			}
+			a.mu.Unlock()
+			a.emitState()
+			if ready {
+				runtime.WindowHide(ctx)
+				a.scheduleIdleExit()
+				return
+			}
+		case <-deadline.C:
+			a.mu.Lock()
+			// Keep the startup page visible on timeout so the user can see why the
+			// app did not move to the tray.
+			a.startupLoading = true
+			a.startupError = "等待模型加载超时，请检查网络或模型文件"
+			a.startupStatus = "模型加载超时"
+			a.mu.Unlock()
+			a.emitState()
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func positionResultWindow(ctx context.Context) {
@@ -216,8 +277,15 @@ func (a *App) State() (UIState, error) {
 		Mode:   mode,
 		Result: result,
 	}
-	if mode == "settings" {
-		health, _ := a.client.Health(context.Background())
+	a.mu.Lock()
+	state.StartupLoading = a.startupLoading
+	state.StartupStatus = a.startupStatus
+	state.StartupError = a.startupError
+	a.mu.Unlock()
+	if mode == "settings" || state.StartupLoading {
+		healthCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		health, _ := a.client.Health(healthCtx)
+		cancel()
 		state.Health = health
 	}
 	return state, nil

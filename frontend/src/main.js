@@ -20,6 +20,7 @@ import {
 } from "../wailsjs/go/wailsui/App"
 import {
   EventsOn,
+  WindowCenter,
   WindowSetDarkTheme,
   WindowSetLightTheme,
   WindowSetSize,
@@ -49,8 +50,12 @@ let lastResultHeight = 0
 let windowShown = false
 let unbindStateEvent = null
 let activeTheme = "system"
+let startupWindowSized = false
 let state = {
   mode: "settings",
+  startup_loading: false,
+  startup_status: "正在启动本地服务...",
+  startup_error: "",
   result: {},
   config: {
     hotkey: "<ctrl>+<alt>+q",
@@ -73,6 +78,8 @@ function bindStateEvents() {
     if (!next || typeof next !== "object") return
     const prevMode = state.mode
     const prevSignature = resultSignature
+    const prevStartupLoading = Boolean(state.startup_loading)
+    const prevStartupStatus = state.startup_status
     state = {
       ...state,
       ...next,
@@ -80,6 +87,9 @@ function bindStateEvents() {
       health: next.health || state.health,
       result: next.result || {},
       mode: next.mode || state.mode,
+      startup_loading: Boolean(next.startup_loading),
+      startup_status: next.startup_status || state.startup_status,
+      startup_error: next.startup_error || "",
     }
     const nextTheme = state.config?.theme
     if (nextTheme !== activeTheme) {
@@ -93,6 +103,13 @@ function bindStateEvents() {
         app.innerHTML = ""
       }
       render({ forceShow: true })
+      return
+    }
+    if (
+      prevStartupLoading !== state.startup_loading ||
+      prevStartupStatus !== state.startup_status
+    ) {
+      render({ forceShow: false })
       return
     }
     if (state.mode === "result") {
@@ -160,7 +177,9 @@ function render(options = {}) {
     "result-mode",
     state.mode === "result",
   )
-  if (state.mode === "result") {
+  if (state.startup_loading) {
+    renderStartup()
+  } else if (state.mode === "result") {
     // Result view patches DOM in place and manages its own icons.
     renderResult()
   } else {
@@ -586,6 +605,25 @@ async function saveSettings() {
   } finally {
     button.disabled = false
   }
+}
+
+function renderStartup() {
+  if (!startupWindowSized && window.runtime?.WindowSetSize) {
+    WindowSetSize(360, 220)
+    if (window.runtime?.WindowCenter) WindowCenter()
+    startupWindowSized = true
+  }
+  const status = state.startup_status || "正在加载翻译模型..."
+  const error = state.startup_error
+  app.innerHTML = `
+    <main class="startup-shell" role="status" aria-live="polite">
+      <h1>选中翻译</h1>
+      <p class="startup-status">${escapeHtml(status)}</p>
+      ${error ? `<p class="startup-error">${escapeHtml(error)}</p>` : ""}
+      <div class="startup-progress" aria-hidden="true"><span></span></div>
+      <p class="startup-hint">首次启动可能需要下载模型，请稍候</p>
+    </main>
+  `
 }
 
 async function refreshHealth() {

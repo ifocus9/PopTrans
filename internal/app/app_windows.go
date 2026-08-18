@@ -147,11 +147,23 @@ func (a *App) Run() error {
 	}
 	log.Printf("app hotkeys registered")
 
+	// Start the Wails UI immediately so the user sees model download/load
+	// progress during application startup. The UI daemon owns only the loading
+	// window here; it hides itself once the backend reports translator_ready.
+	go a.ensureStartupUI()
 	go a.ensureBackendReady()
 
 	_, err = win.MessageLoop()
 	log.Printf("app message loop exited: %v", err)
 	return err
+}
+
+func (a *App) ensureStartupUI() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := a.ui.EnsureReady(ctx); err != nil {
+		log.Printf("app startup loading UI failed: %v", err)
+	}
 }
 
 func (a *App) Close() {
