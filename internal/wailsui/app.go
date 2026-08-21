@@ -242,7 +242,16 @@ func positionResultWindow(ctx context.Context) {
 		y = workArea.Top + screenMargin
 	}
 
-	runtime.WindowSetPosition(ctx, int(x), int(y))
+	// Wails 的 WindowSetPosition 把 (x,y) 当作相对窗口当前所在显示器工作区
+	// 左上角的偏移(内部 workRect.Left + x),不是绝对屏幕坐标。直接传绝对
+	// 坐标,在多显示器且窗口所在屏 workRect.Left != 0 时(如休眠唤醒后显示
+	// 布局变化或窗口停在副屏)会叠加偏移把弹窗推到屏外;设置弹窗用
+	// WindowCenter(绝对坐标)所以不受影响,这也解释了打开一次设置弹窗后
+	// 翻译弹窗恢复正常。这里用窗口所在屏的 workArea.Left 补偿,使最终落点
+	// 为绝对坐标 (x,y),并能跟随光标跨屏。
+	winX, winY := runtime.WindowGetPosition(ctx)
+	winArea := win.WorkAreaForPoint(win.Point{X: int32(winX), Y: int32(winY)})
+	runtime.WindowSetPosition(ctx, int(x-winArea.Left), int(y-winArea.Top))
 	runtime.WindowSetAlwaysOnTop(ctx, true)
 }
 
