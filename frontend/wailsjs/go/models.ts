@@ -141,6 +141,7 @@ export namespace wailsui {
 	    startup_loading: boolean;
 	    startup_status: string;
 	    startup_error: string;
+	    settings_open: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new UIState(source);
@@ -155,6 +156,7 @@ export namespace wailsui {
 	        this.startup_loading = source["startup_loading"];
 	        this.startup_status = source["startup_status"];
 	        this.startup_error = source["startup_error"];
+	        this.settings_open = source["settings_open"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {

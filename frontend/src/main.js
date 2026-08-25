@@ -51,8 +51,10 @@ let windowShown = false
 let unbindStateEvent = null
 let activeTheme = "system"
 let startupWindowSized = false
+let settingsWindowSized = false
 let state = {
   mode: "settings",
+  settings_open: false,
   startup_loading: false,
   startup_status: "正在启动本地服务...",
   startup_error: "",
@@ -87,6 +89,7 @@ function bindStateEvents() {
       health: next.health || state.health,
       result: next.result || {},
       mode: next.mode || state.mode,
+      settings_open: Boolean(next.settings_open),
       startup_loading: Boolean(next.startup_loading),
       startup_status: next.startup_status || state.startup_status,
       startup_error: next.startup_error || "",
@@ -98,6 +101,8 @@ function bindStateEvents() {
     if (prevMode !== state.mode) {
       windowShown = false
       lastResultHeight = 0
+      startupWindowSized = false
+      settingsWindowSized = false
       // Mode switch should rebuild shell (settings <-> result).
       if (state.mode === "result") {
         app.innerHTML = ""
@@ -612,10 +617,21 @@ async function saveSettings() {
 }
 
 function renderStartup() {
-  if (!startupWindowSized && window.runtime?.WindowSetSize) {
-    WindowSetSize(360, 220)
-    if (window.runtime?.WindowCenter) WindowCenter()
-    startupWindowSized = true
+  const forSettings = state.mode === "settings" && state.settings_open
+  if (window.runtime?.WindowSetSize) {
+    if (forSettings) {
+      // 设置弹窗在等待 AI 引擎唤醒时保持设置窗口尺寸，
+      // 不要缩成冷启动的小 loading 窗体。
+      if (!settingsWindowSized) {
+        WindowSetSize(458, 640)
+        if (window.runtime?.WindowCenter) WindowCenter()
+        settingsWindowSized = true
+      }
+    } else if (!startupWindowSized) {
+      WindowSetSize(360, 220)
+      if (window.runtime?.WindowCenter) WindowCenter()
+      startupWindowSized = true
+    }
   }
   const status = state.startup_status || "正在加载翻译模型..."
   const error = state.startup_error

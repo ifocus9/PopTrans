@@ -54,6 +54,7 @@ type UIState struct {
 	StartupLoading bool           `json:"startup_loading"`
 	StartupStatus  string         `json:"startup_status"`
 	StartupError   string         `json:"startup_error"`
+	SettingsOpen   bool           `json:"settings_open"`
 }
 
 type TranslateResult struct {
@@ -302,6 +303,7 @@ func (a *App) State() (UIState, error) {
 	state.StartupLoading = a.startupLoading
 	state.StartupStatus = a.startupStatus
 	state.StartupError = a.startupError
+	state.SettingsOpen = a.settingsOpen
 	a.mu.Unlock()
 	if mode == "settings" || state.StartupLoading {
 		healthCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

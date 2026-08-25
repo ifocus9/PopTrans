@@ -567,6 +567,11 @@ func (a *App) showWailsSettings() error {
 		}
 		return err
 	}
+	// 设置弹窗会展示引擎状态徽标。若 AI 引擎正处于休眠（空闲自动回收），
+	// 这里必须像翻译/OCR 一样主动拉起，否则徽标会一直停在“正在启动”的
+	// 加载动画上，因为没有任何路径去唤醒引擎。
+	log.Printf("app wake ai engine after settings opened")
+	go a.ensureBackendReady()
 	return nil
 }
 
