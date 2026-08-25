@@ -315,7 +315,7 @@ func (a *App) handleTranslate() {
 		a.setStatus("正在翻译...")
 		a.pushLoading(text)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 		defer cancel()
 
 		var result string

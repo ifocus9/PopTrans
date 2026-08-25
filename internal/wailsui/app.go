@@ -188,15 +188,27 @@ func (a *App) monitorStartup() {
 				a.startupStatus = "正在加载翻译模型..."
 			}
 			ready := err == nil && health.TranslatorReady && time.Since(a.startupStarted) >= 1200*time.Millisecond
+			// 冷启动由本函数收尾：模型就绪后隐藏启动窗口。但 daemon 可能因
+			// UI 空闲退出后被宿主首个快捷键/设置请求重新拉起，此时宿主已把
+			// 视图切到 result 弹窗(ShowResult)或打开设置(ShowSettings)。
+			// 若这里无条件 WindowHide，会藏掉正在显示的翻译/加载弹窗，且 Go
+			// 侧 visible=true 与真实窗口不可见不一致——这就是"AI 引擎休眠后
+			// 首个翻译弹窗看不到"的根因。仅纯冷启动(settings 未打开)才收尾。
+			mode := a.mode
+			settingsOpen := a.settingsOpen
 			if ready {
 				a.startupLoading = false
 				a.startupStatus = "模型加载完成"
+			}
+			if ready && mode == "settings" && !settingsOpen {
 				a.visible = false
 			}
 			a.mu.Unlock()
 			a.emitState()
 			if ready {
-				runtime.WindowHide(ctx)
+				if mode == "settings" && !settingsOpen {
+					runtime.WindowHide(ctx)
+				}
 				a.scheduleIdleExit()
 				return
 			}

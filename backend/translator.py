@@ -41,13 +41,24 @@ _OFFLINE_MODE = os.environ.get("POPTRANS_OFFLINE", "").strip() == "1"
 MODEL_N_CTX = 1536
 TRANSLATION_MAX_TOKENS = 384
 CACHE_MAX_ENTRIES = 256
+# 长文翻译：上下文窗口有限（n_ctx=1536）。单次请求必须同时容纳
+# prompt 模板、源文与译文，源文过长时要么触发 "requested tokens exceed
+# context window" 报错，要么输出被 max_tokens 截断。因此：
+#   - 源文按句子边界分块，每块输入估算不超过 SOURCE_MAX_TOKENS；
+#   - 每块按剩余上下文动态分配输出上限（最高 OUTPUT_MAX_TOKENS）。
+OUTPUT_MAX_TOKENS = 768
+TEMPLATE_OVERHEAD_TOKENS = 64
+SAFETY_MARGIN_TOKENS = 32
+SOURCE_MAX_TOKENS = (
+    MODEL_N_CTX - TEMPLATE_OVERHEAD_TOKENS - OUTPUT_MAX_TOKENS - SAFETY_MARGIN_TOKENS
+)
 
 GENERATION_CONFIG = {
     "temperature": 0.7,
     "top_p": 0.6,
     "top_k": 20,
     "repeat_penalty": 1.05,
-    "max_tokens": TRANSLATION_MAX_TOKENS,
+    # max_tokens 由 _complete 按剩余上下文动态计算，这里不写死。
 }
 
 # 语言名称映射
@@ -262,6 +273,85 @@ def build_translation_prompt(target_lang: str, source_text: str) -> str:
         target_lang=LANG_NAMES_EN[target_lang],
         source_text=source_text,
     )
+
+
+# ── 长文分块 ──────────────────────────────────────────────
+
+# 中文/日文等 CJK 二元码约 1 token/字，其余按 ~0.35 token/字符估算。
+# 估算刻意偏保守，宁可多切一刀也绝不让单块溢出上下文。
+_CJK_TOKEN_CHARS_RE = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]')
+_NON_CJK_TOKEN_CHARS_RE = re.compile(r'[^\s\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]')
+# 博客/文档常见断点：中文句末标点、英文句号后空白、以及换行/空行。
+_SENTENCE_SPLIT_RE = re.compile(r'[\u3002\uff01\uff1f!?.…;;\n]+|(?<=[a-zA-Z0-9\u4e00-\u9fff])\.\s+')
+
+
+def estimate_tokens(text: str) -> int:
+    """估算 llama.cpp BPE 的 token 数（保守加权 + 少量固定开销）。"""
+    if not text:
+        return 0
+    cjk = len(_CJK_TOKEN_CHARS_RE.findall(text))
+    other = len(_NON_CJK_TOKEN_CHARS_RE.findall(text))
+    return int(cjk * 1.0 + other * 0.35) + 8
+
+
+def _hard_split_by_tokens(text: str, max_tokens: int) -> list[str]:
+    """按 token 估算将一段超长文本硬切为多块（逐字符累积）。"""
+    pieces = []
+    current = []
+    current_tokens = 0
+    for char in text:
+        if _CJK_TOKEN_CHARS_RE.match(char):
+            tok = 1.0
+        elif not char.isspace():
+            tok = 0.35
+        else:
+            tok = 0.0
+        if current and current_tokens + tok > max_tokens:
+            pieces.append("".join(current))
+            current = []
+            current_tokens = 0
+        current.append(char)
+        current_tokens += tok
+    if current:
+        pieces.append("".join(current))
+    return pieces
+
+
+def _split_long_text(text: str):
+    """把超长源文按句子边界拆成可放入单次上下文的块。
+
+    Returns:
+        (chunks, split): split 为 True 表示发生了分块。
+        未超限时直接返回 [text], False，保持原有单次推理路径。
+    """
+    if estimate_tokens(text) <= SOURCE_MAX_TOKENS:
+        return [text], False
+
+    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(text) if p and p.strip()]
+    if not parts:
+        parts = [text]
+
+    chunks = []
+    current = []
+    current_tokens = 0
+    for part in parts:
+        part_tokens = estimate_tokens(part)
+        if part_tokens > SOURCE_MAX_TOKENS:
+            if current:
+                chunks.append("\n".join(current))
+                current = []
+                current_tokens = 0
+            chunks.extend(_hard_split_by_tokens(part, SOURCE_MAX_TOKENS))
+            continue
+        if current and current_tokens + part_tokens > SOURCE_MAX_TOKENS:
+            chunks.append("\n".join(current))
+            current = []
+            current_tokens = 0
+        current.append(part)
+        current_tokens += part_tokens
+    if current:
+        chunks.append("\n".join(current))
+    return chunks, True
 
 
 class Translator:
@@ -491,6 +581,34 @@ class Translator:
             model.close()
     # ── 翻译 ──────────────────────────────────────────────
 
+    def _complete(self, source_text: str, target_code: str) -> Optional[str]:
+        """单次调用模型完成一段文本的翻译，按剩余上下文动态分配输出上限。
+
+        max_tokens 不再写死：短文本沿用接近 384 的默认，长文分块可获得更大
+        输出空间，同时不会超过 n_ctx 导致上下文溢出。
+        """
+        prompt = build_translation_prompt(target_code, source_text)
+        prompt_tokens = estimate_tokens(prompt)
+        max_tokens = max(
+            64,
+            min(OUTPUT_MAX_TOKENS, MODEL_N_CTX - prompt_tokens - SAFETY_MARGIN_TOKENS),
+        )
+
+        response = self._model.create_chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            **GENERATION_CONFIG,
+        )
+        if (
+            response
+            and "choices" in response
+            and len(response["choices"]) > 0
+        ):
+            content = response["choices"][0]["message"]["content"]
+            if content and content.strip():
+                return content.strip()
+        return None
+
     def translate(
         self,
         text: str,
@@ -540,27 +658,26 @@ class Translator:
                     direction = "英→中"
                     target_code = "zh"
 
-            # 构造翻译 prompt
-            prompt = build_translation_prompt(target_code, text)
-            messages = [{"role": "user", "content": prompt}]
-
-            # 使用 llama.cpp 进行翻译
-            response = self._model.create_chat_completion(
-                messages=messages,
-                **GENERATION_CONFIG,
-            )
-
-            # 提取翻译结果
-            if response and "choices" in response and len(response["choices"]) > 0:
-                result = response["choices"][0]["message"]["content"].strip()
-                if result:
-                    self._store_cached_translation(cache_key, result)
-                    logger.info(f"翻译成功 [{direction}]: {text[:30]}...")
-                    return result, None
-                else:
-                    return None, "翻译返回空结果"
+            # 构造翻译 prompt。长文先分块，避免上下文溢出报错与输出截断。
+            chunks, split = _split_long_text(text)
+            if split:
+                logger.info(f"翻译长文分块: chunks={len(chunks)}")
+                results = []
+                for chunk in chunks:
+                    part = self._complete(chunk, target_code)
+                    if part is None:
+                        return None, "翻译分块失败（模型返回空结果）"
+                    results.append(part)
+                result = "\n".join(results)
             else:
-                return None, "翻译返回无效响应"
+                result = self._complete(text, target_code)
+
+            if result:
+                self._store_cached_translation(cache_key, result)
+                logger.info(f"翻译成功 [{direction}]{'（分块 %d）' % len(chunks) if split else ''}: {text[:30]}...")
+                return result, None
+            else:
+                return None, "翻译返回空结果"
 
         except Exception as e:
             logger.exception(f"翻译失败: {text[:30]}...")
@@ -587,14 +704,22 @@ class Translator:
             else:
                 target_code = "en" if self._is_chinese(text) else "zh"
 
-            prompt = build_translation_prompt(target_code, text)
-            messages = [{"role": "user", "content": prompt}]
-
-            response_stream = self._model.create_chat_completion(
-                messages=messages,
-                stream=True,
-                **GENERATION_CONFIG,
-            )
+            chunks, split = _split_long_text(text)
+            for index, chunk in enumerate(chunks):
+                if split and index > 0:
+                    yield "\n"
+                prompt = build_translation_prompt(target_code, chunk)
+                prompt_tokens = estimate_tokens(prompt)
+                max_tokens = max(
+                    64,
+                    min(OUTPUT_MAX_TOKENS, MODEL_N_CTX - prompt_tokens - SAFETY_MARGIN_TOKENS),
+                )
+                response_stream = self._model.create_chat_completion(
+                    messages=[{"role": "user", "content": prompt}],
+                    stream=True,
+                    max_tokens=max_tokens,
+                    **GENERATION_CONFIG,
+                )
 
             for chunk in response_stream:
                 if "choices" in chunk and len(chunk["choices"]) > 0:

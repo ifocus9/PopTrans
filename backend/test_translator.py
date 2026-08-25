@@ -74,6 +74,25 @@ class TranslatorLanguageTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertIn("into English", self.translator._model.prompts[0])
 
+    def test_long_text_is_chunked_and_joined(self):
+        long_text = "这是一段用于验证长文分块翻译的中文文本。" * 200
+
+        result, error = self.translator.translate(long_text, "vi")
+
+        self.assertIsNone(error)
+        self.assertGreater(len(self.translator._model.prompts), 1)
+        expected = "\n".join(
+            f"result-{i + 1}" for i in range(len(self.translator._model.prompts))
+        )
+        self.assertEqual(result, expected)
+
+    def test_short_text_stays_single_inference(self):
+        result, error = self.translator.translate("你好世界", "vi")
+
+        self.assertIsNone(error)
+        self.assertEqual(len(self.translator._model.prompts), 1)
+        self.assertEqual(result, "result-1")
+
 
 if __name__ == "__main__":
     unittest.main()

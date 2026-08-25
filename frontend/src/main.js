@@ -115,7 +115,11 @@ function bindStateEvents() {
     if (state.mode === "result") {
       const nextSignature = JSON.stringify(state.result || {})
       if (nextSignature === prevSignature) return
-      // Content-only update: patch DOM in place, no window show/reposition.
+      // Content-only update: patch DOM in place, no move/resize. Reset the
+      // shown flag so the window is re-shown even if the daemon hid it (e.g.
+      // startup hide racing a freshly restarted daemon). WindowShow is a no-op
+      // for an already-visible window, so this causes no visible jump.
+      windowShown = false
       render({ forceShow: false })
       return
     }
