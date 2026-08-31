@@ -1438,10 +1438,13 @@ p {
   display: none;
 }
 
-:root[data-theme="light"] .brand-mark,
 :root[data-theme="light"] .main-header .brand-mark,
 :root[data-theme="light"] .settings-header .brand-mark {
   color: var(--accent);
+}
+
+:root[data-theme="light"] .result-shell .brand-mark {
+  color: #ffffff;
 }
 
 :root[data-theme="light"] .header-copy h1,
