@@ -20,6 +20,8 @@ export function ShowResult(arg1:uidaemon.ResultPayload):Promise<void>;
 
 export function ShowSettings():Promise<void>;
 
+export function ShowTranslate():Promise<void>;
+
 export function State():Promise<wailsui.UIState>;
 
 export function Status():Promise<uidaemon.Status>;

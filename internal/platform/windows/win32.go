@@ -144,19 +144,24 @@ const (
 	LrLoadFromFile = 0x00000010
 	LrDefaultSize  = 0x00000040
 
-	WmApp         = 0x8000
-	WmCommand     = 0x0111
-	WmDestroy     = 0x0002
-	WmClose       = 0x0010
-	WmEraseBkgnd  = 0x0014
-	WmPaint       = 0x000F
-	WmKeydown     = 0x0100
-	WmMouseMove   = 0x0200
-	WmLButtonDown = 0x0201
-	WmLButtonUp   = 0x0202
-	WmSize        = 0x0005
-	WmRButtonUp   = 0x0205
-	WmHotkey      = 0x0312
+	CSDblClks     = 0x0008
+
+	WmApp           = 0x8000
+	WmCommand       = 0x0111
+	WmDestroy       = 0x0002
+	WmClose         = 0x0010
+	WmEraseBkgnd    = 0x0014
+	WmPaint         = 0x000F
+	WmKeydown       = 0x0100
+	WmMouseMove     = 0x0200
+	WmLButtonDown   = 0x0201
+	WmLButtonUp     = 0x0202
+	WmLButtonDblClk = 0x0203
+	WmRButtonDown   = 0x0204
+	WmRButtonUp     = 0x0205
+	WmRButtonDblClk = 0x0206
+	WmSize          = 0x0005
+	WmHotkey        = 0x0312
 
 	SMCxScreen        = 0
 	SMCyScreen        = 1
@@ -285,6 +290,7 @@ func RegisterClass(className string, wndProc uintptr) error {
 
 	wc := WndClassEx{
 		Size:      uint32(unsafe.Sizeof(WndClassEx{})),
+		Style:     CSDblClks,
 		WndProc:   wndProc,
 		Instance:  instance,
 		Cursor:    HWND(cursor),

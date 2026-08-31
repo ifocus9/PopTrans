@@ -39,6 +39,10 @@ func (c *Client) ShowSettings(ctx context.Context) error {
 	return c.do(ctx, http.MethodPost, EndpointShowSettings, map[string]any{}, nil)
 }
 
+func (c *Client) ShowTranslate(ctx context.Context) error {
+	return c.do(ctx, http.MethodPost, EndpointShowTranslate, map[string]any{}, nil)
+}
+
 func (c *Client) ShowResult(ctx context.Context, payload ResultPayload) error {
 	return c.do(ctx, http.MethodPost, EndpointShowResult, payload, nil)
 }

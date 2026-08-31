@@ -55,6 +55,7 @@ type UIState struct {
 	StartupStatus  string         `json:"startup_status"`
 	StartupError   string         `json:"startup_error"`
 	SettingsOpen   bool           `json:"settings_open"`
+	Visible        bool           `json:"visible"`
 }
 
 type TranslateResult struct {
@@ -102,6 +103,10 @@ func NewApp(baseDir string, args []string) *App {
 		case "--settings":
 			// Backward-compatible launch mode: open settings once.
 			app.mode = "settings"
+			app.visible = true
+			app.settingsOpen = true
+		case "--translate":
+			app.mode = "translate"
 			app.visible = true
 			app.settingsOpen = true
 		case "--result":
@@ -201,13 +206,13 @@ func (a *App) monitorStartup() {
 				a.startupLoading = false
 				a.startupStatus = "模型加载完成"
 			}
-			if ready && mode == "settings" && !settingsOpen {
+			if ready && (mode == "settings" || mode == "translate") && !settingsOpen {
 				a.visible = false
 			}
 			a.mu.Unlock()
 			a.emitState()
 			if ready {
-				if mode == "settings" && !settingsOpen {
+				if (mode == "settings" || mode == "translate") && !settingsOpen {
 					runtime.WindowHide(ctx)
 				}
 				a.scheduleIdleExit()
@@ -304,8 +309,9 @@ func (a *App) State() (UIState, error) {
 	state.StartupStatus = a.startupStatus
 	state.StartupError = a.startupError
 	state.SettingsOpen = a.settingsOpen
+	state.Visible = a.visible
 	a.mu.Unlock()
-	if mode == "settings" || state.StartupLoading {
+	if mode == "settings" || mode == "translate" || state.StartupLoading {
 		healthCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		health, _ := a.client.Health(healthCtx)
 		cancel()
@@ -318,8 +324,11 @@ func (a *App) SaveConfig(cfg config.Config) error {
 	if err := config.ValidateServerPort(cfg.ServerPort); err != nil {
 		return err
 	}
-	// Host reloads settings when the settings window is hidden.
-	return config.Save(a.baseDir, cfg)
+	if err := config.Save(a.baseDir, cfg); err != nil {
+		return err
+	}
+	a.notifyConfigSaved()
+	return nil
 }
 
 func (a *App) Translate(text string) (TranslateResult, error) {
@@ -335,7 +344,7 @@ func (a *App) Translate(text string) (TranslateResult, error) {
 	if err != nil {
 		return TranslateResult{}, err
 	}
-	return TranslateResult{Source: text, Result: result}, nil
+	return TranslateResult{Source: text, Result: strings.TrimSpace(result)}, nil
 }
 
 // HideWindow is called by the frontend close button in daemon mode.
@@ -370,6 +379,28 @@ func (a *App) ShowSettings() error {
 	a.mu.Unlock()
 
 	positionSettingsWindow(a.ctx)
+	runtime.WindowUnminimise(a.ctx)
+	runtime.WindowShow(a.ctx)
+	a.emitState()
+	return nil
+}
+
+// ShowTranslate implements uidaemon.Handler.
+func (a *App) ShowTranslate() error {
+	if a.ctx == nil {
+		return context.Canceled
+	}
+
+	a.mu.Lock()
+	a.mode = "translate"
+	a.visible = true
+	a.settingsOpen = true
+	a.cancelIdleExitLocked()
+	a.mu.Unlock()
+
+	positionSettingsWindow(a.ctx)
+	runtime.WindowUnminimise(a.ctx)
+	runtime.WindowShow(a.ctx)
 	a.emitState()
 	return nil
 }
@@ -415,7 +446,7 @@ func (a *App) Hide() error {
 
 	wasSettings := false
 	a.mu.Lock()
-	wasSettings = a.settingsOpen || a.mode == "settings"
+	wasSettings = a.settingsOpen || a.mode == "settings" || a.mode == "translate"
 	a.visible = false
 	a.settingsOpen = false
 	if a.mode == "result" {
@@ -474,6 +505,17 @@ func (a *App) notifyHidden() {
 	defer cancel()
 	if err := a.notify.Hidden(ctx); err != nil {
 		log.Printf("notify hidden failed: %v", err)
+	}
+}
+
+func (a *App) notifyConfigSaved() {
+	if a.notify == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := a.notify.ConfigSaved(ctx); err != nil {
+		log.Printf("notify config saved failed: %v", err)
 	}
 }
 

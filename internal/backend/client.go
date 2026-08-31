@@ -11,6 +11,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
+	"strings"
 	"time"
 )
 
@@ -154,7 +155,7 @@ func (c *Client) Translate(ctx context.Context, text string) (string, error) {
 		return "", errors.New("translate response missing choices")
 	}
 
-	result := decoded.Choices[0].Message.Content
+	result := strings.TrimSpace(decoded.Choices[0].Message.Content)
 	log.Printf("backend translate success after %s: result_chars=%d preview=%q", time.Since(startedAt), len(result), previewText(result, 120))
 	return result, nil
 }

@@ -30,6 +30,7 @@ type Server struct {
 type Handler interface {
 	Status() Status
 	ShowSettings() error
+	ShowTranslate() error
 	ShowResult(payload ResultPayload) error
 	Hide() error
 	Quit() error
@@ -66,6 +67,7 @@ func (s *Server) Start() (Endpoint, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc(EndpointHealth, s.withAuth(s.handleHealth))
 	mux.HandleFunc(EndpointShowSettings, s.withAuth(s.handleShowSettings))
+	mux.HandleFunc(EndpointShowTranslate, s.withAuth(s.handleShowTranslate))
 	mux.HandleFunc(EndpointShowResult, s.withAuth(s.handleShowResult))
 	mux.HandleFunc(EndpointHide, s.withAuth(s.handleHide))
 	mux.HandleFunc(EndpointShutdown, s.withAuth(s.handleShutdown))
@@ -149,6 +151,18 @@ func (s *Server) handleShowSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.handler.ShowSettings(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s *Server) handleShowTranslate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.handler.ShowTranslate(); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

@@ -100,3 +100,13 @@ func TestIdleTimeoutUsesConfig(t *testing.T) {
 		t.Fatalf("idleTimeout = %s, want 1m", app.idleTimeout)
 	}
 }
+
+func TestTranslateModeFlag(t *testing.T) {
+	app := NewApp(t.TempDir(), []string{"translate-ui.exe", "--translate"})
+	if app.mode != "translate" {
+		t.Fatalf("expected translate mode, got %q", app.mode)
+	}
+	if !app.visible || !app.settingsOpen {
+		t.Fatal("expected visible and settingsOpen to be true")
+	}
+}

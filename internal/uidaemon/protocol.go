@@ -11,13 +11,14 @@ import (
 )
 
 const (
-	EndpointHealth       = "/health"
-	EndpointShowSettings = "/show/settings"
-	EndpointShowResult   = "/show/result"
-	EndpointHide         = "/hide"
-	EndpointShutdown     = "/shutdown"
-	EndpointNotifyHidden = "/notify/hidden"
-	EndpointNotifyConfig = "/notify/config-saved"
+	EndpointHealth        = "/health"
+	EndpointShowSettings  = "/show/settings"
+	EndpointShowTranslate = "/show/translate"
+	EndpointShowResult    = "/show/result"
+	EndpointHide          = "/hide"
+	EndpointShutdown      = "/shutdown"
+	EndpointNotifyHidden  = "/notify/hidden"
+	EndpointNotifyConfig  = "/notify/config-saved"
 
 	headerToken = "X-PopTrans-Token"
 )

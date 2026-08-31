@@ -31,6 +31,7 @@ const (
 	menuIDExit      = 3004
 	menuIDToggleOCR = 3005
 	menuIDSettings  = 3006
+	menuIDTranslate = 3007
 
 	wmTray           = win.WmApp + 1
 	wmTranslateDone  = win.WmApp + 2
@@ -540,12 +541,37 @@ func (a *App) showTrayMenu() {
 		{ID: menuIDStatus, Text: "状态: " + a.status, Disabled: true},
 		{ID: menuIDHotkey, Text: "翻译快捷键: " + a.cfg.HotkeyDisplay, Disabled: true},
 		{ID: menuIDOCR, Text: "OCR 快捷键: " + a.cfg.OcrHotkeyDisplay, Disabled: true},
+		{Separator: true},
+		{ID: menuIDTranslate, Text: "文本翻译"},
 		{ID: menuIDToggleOCR, Text: ocrToggleText},
-		{ID: menuIDSettings, Text: "设置"},
 		{Separator: true},
 		{ID: menuIDExit, Text: "退出"},
 	}
 	win.ShowTrayMenu(a.hwnd, items)
+}
+
+func (a *App) openTranslate() {
+	if err := a.showWailsTranslate(); err != nil {
+		log.Printf("app show wails translate failed: %v", err)
+		a.setStatus("翻译窗口启动失败")
+		return
+	}
+	log.Printf("app show wails translate success")
+}
+
+func (a *App) showWailsTranslate() error {
+	a.suspendHotkeys()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := a.ui.ShowTranslate(ctx); err != nil {
+		if resumeErr := a.resumeHotkeys(); resumeErr != nil {
+			log.Printf("app resume hotkeys after translate open failed: %v", resumeErr)
+		}
+		return err
+	}
+	log.Printf("app wake ai engine after translate opened")
+	go a.ensureBackendReady()
+	return nil
 }
 
 func (a *App) openSettings() {
@@ -891,13 +917,20 @@ func mainWindowProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 
 	switch msg {
 	case wmTray:
-		if uint32(lParam) == win.WmRButtonUp || uint32(lParam) == win.WmLButtonUp {
-			log.Printf("main window proc: tray click event lParam=%d", lParam)
+		switch uint32(lParam) {
+		case win.WmLButtonDblClk:
+			log.Printf("main window proc: tray double click, open translate")
+			currentApp.openTranslate()
+		case win.WmRButtonUp:
+			log.Printf("main window proc: tray right click, show tray menu")
 			currentApp.showTrayMenu()
 		}
 		return 0
 	case win.WmCommand:
 		switch uint16(wParam & 0xFFFF) {
+		case menuIDTranslate:
+			currentApp.openTranslate()
+			return 0
 		case menuIDToggleOCR:
 			currentApp.toggleOCR()
 			return 0

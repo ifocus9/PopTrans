@@ -34,6 +34,10 @@ export function ShowSettings() {
   return window['go']['wailsui']['App']['ShowSettings']();
 }
 
+export function ShowTranslate() {
+  return window['go']['wailsui']['App']['ShowTranslate']();
+}
+
 export function State() {
   return window['go']['wailsui']['App']['State']();
 }

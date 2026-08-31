@@ -98,6 +98,17 @@ func (m *Manager) ShowSettings(ctx context.Context) error {
 	return client.ShowSettings(ctx)
 }
 
+func (m *Manager) ShowTranslate(ctx context.Context) error {
+	if err := m.EnsureReady(ctx); err != nil {
+		return err
+	}
+	client, err := m.currentClient()
+	if err != nil {
+		return err
+	}
+	return client.ShowTranslate(ctx)
+}
+
 func (m *Manager) ShowResult(ctx context.Context, payload ResultPayload) error {
 	if err := m.EnsureReady(ctx); err != nil {
 		return err

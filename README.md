@@ -6,6 +6,7 @@
 [![Wails](https://img.shields.io/badge/Wails-v2.13-DF0000?logo=wails&logoColor=white)](https://wails.io/)
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+[![Changelog](https://img.shields.io/badge/Changelog-更新日志-orange)](CHANGELOG.md)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-blue)]()
 [![Download](https://img.shields.io/github/v/release/ifocus9/PopTrans?label=Download&color=success)](https://github.com/ifocus9/PopTrans/releases/latest)
 
@@ -19,13 +20,14 @@
 ## 🌟 核心特性
 
 - **🔒 完全离线 · 隐私优先**：后端基于 llama.cpp 在本地 CPU 上运行腾讯 Hy-MT2-1.8B 大模型，**无需 GPU、无需联网**（模型下载一次后即纯离线），文本不出本机，杜绝隐私泄露。
-- **🚀 快捷翻译**：一键捕获选中文本（模拟 Ctrl+C，内置多次智能重试），并即刻显示翻译结果。
-- **📷 离线 OCR**：原生 Go 实现的屏幕框选与截图，内置 1.0× / 1.5× / 2.0× 多倍率自动缩放与识别质量回退重试，小字、低分辨率截图也能精准识别。
+- **✍️ 文本翻译工作台**：双击托盘图标或托盘菜单一键打开双卡片工作台，手动输入长文本即刻离线翻译，支持 `Ctrl+Enter` 快速翻译、实时字符统计、一键复制译文、关闭窗口自动清空重置。
+- **🚀 划词快捷翻译**：一键捕获选中文本（模拟 Ctrl+C，内置多次智能重试），并即刻在光标旁显示浮动翻译结果。
+- **📷 离线 OCR 截图翻译**：原生 Go 实现的屏幕框选与截图，内置 1.0× / 1.5× / 2.0× 多倍率自动缩放与识别质量回退重试，小字、低分辨率截图也能精准识别。
 - **🌐 智能互译**：基于文本中的中英文字符比例自动判断语种，进行中英文双向互译。
 - **⚡ 极速响应**：内置 LRU 结果缓存（256 条），重复文本翻译秒级返回。
 - **📦 内嵌引擎 · 零环境配置**：AI 引擎通过 PyInstaller 打包为独立 `ai_engine.exe`，**用户无需安装 Python 或任何依赖**，下载解压即用。
-- **🎨 现代 UI**：基于 Wails 构建的亚克力毛玻璃（`backdrop-filter` 模糊）界面，完美支持系统深色/浅色主题自适应。
-- **🧩 UI 单实例**：设置页与结果弹窗复用同一个 `translate-ui` 进程，减少重复启动与内存抖动。
+- **🎨 现代 UI & 双主题**：基于 Wails 构建的亚克力毛玻璃界面，支持暗黑/明亮主题自适应；工作台与设置页平滑切换，设置保存实时生效不关闭窗口。
+- **🧩 UI 单实例**：工作台、设置页与划词结果弹窗复用同一个 `translate-ui` 进程，极速唤起，减少内存抖动。
 - **🔧 灵活配置**：系统托盘常驻，支持自定义全局快捷键（Ctrl/Alt/Shift/Win）、OCR 开关、本地端口、UI/AI 空闲退出等，配置热加载即刻生效。
 - **🛌 AI 空闲回收**：AI 引擎支持按空闲时间自动退出，降低长时间待机内存占用；下次翻译会自动重新拉起。
 - **🔌 开放本地 API**：AI 引擎在 `127.0.0.1:<port>` 提供 OpenAI 兼容的 `/v1/chat/completions` 与 OCR 接口，便于外部工具或脚本二次开发（详见 [本地 API 文档](docs/API.md)）。
@@ -58,15 +60,17 @@
 2. **下载模型**：若本地无翻译模型，首次启动时会**自动联网下载** 腾讯 Hy-MT2-1.8B GGUF 模型 (约 1.13GB)。默认从 HuggingFace 官网 (`huggingface.co`) 下载，请确保网络可正常访问。
 3. 下载完成后，模型将保存在 `models/Hy-MT2-1.8B-GGUF/` 目录下，后续运行即为完全离线状态。
 
-### 默认快捷键
+### 快捷操作
 
-| 操作                    | 默认快捷键   |
-| ----------------------- | ------------ |
-| **翻译选中文本**        | `Ctrl+Alt+Q` |
-| **OCR 截图翻译**        | `Ctrl+Alt+E` |
-| **关闭窗口 / 取消框选** | `Esc`        |
+| 操作                    | 快捷方式 / 操作 | 说明 |
+| ----------------------- | ------------ | ---- |
+| **打开文本翻译工作台**  | `双击托盘图标` | 唤起主窗口手动输入文本进行翻译，右上角可直达设置 |
+| **翻译选中文本**        | `Ctrl+Alt+Q` | 划选任意软件中的文字后直接按下触发划词弹窗 |
+| **OCR 截图翻译**        | `Ctrl+Alt+E` | 屏幕划框截图，自动识别图中文字并翻译 |
+| **立即翻译 (工作台内)** | `Ctrl+Enter` | 在文本翻译界面的原文输入框中直接提交翻译 |
+| **关闭窗口 / 取消框选** | `Esc`        | 关闭当前结果弹窗或退出截图框选 |
 
-> _提示：快捷键可在托盘菜单的“设置”中随时自定义修改（支持 `Ctrl`/`Alt`/`Shift`/`Win` 等组合修饰键）。_
+> _提示：快捷键可在托盘菜单或工作台右上角的“设置”中随时自定义修改（支持 `Ctrl`/`Alt`/`Shift`/`Win` 等组合修饰键）。_
 
 ---
 
@@ -258,6 +262,12 @@ AI 后台引擎默认在 `http://127.0.0.1:<server_port>` 提供 API 服务，�
 - **`POST /api/v1/ocr`**：RapidOCR 纯离线图像文字识别。
 - **`POST /api/v1/ocr_translate`**：OCR 识别 + 翻译一步集成。
 - **`POST /v1/chat/completions`**：OpenAI 兼容的翻译/对话接口（支持流式响应 SSE）。
+
+---
+
+## 📝 更新日志
+
+完整历史版本迭代与详细变更记录请参阅 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
