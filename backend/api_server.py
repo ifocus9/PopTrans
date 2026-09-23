@@ -73,7 +73,8 @@ def health_check():
         "status": "ok",
         "translator_ready": translator_engine.ready,
         "translator_status": translator_engine.status,
-        "ocr_loaded": ocr_engine.is_loaded()
+        "device_info": translator_engine.device_info,
+        "ocr_loaded": ocr_engine.is_loaded(),
     }
 
 @app.post("/api/v1/ocr")

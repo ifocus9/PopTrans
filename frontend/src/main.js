@@ -6,6 +6,7 @@ import {
   Check,
   CheckCheck,
   Clipboard,
+  Cpu,
   FileText,
   Keyboard,
   Languages,
@@ -19,6 +20,7 @@ import {
   Sun,
   Trash2,
   X,
+  Zap,
 } from "lucide"
 import {
   HideWindow,
@@ -44,6 +46,7 @@ const icons = {
   Check,
   CheckCheck,
   Clipboard,
+  Cpu,
   FileText,
   Keyboard,
   Languages,
@@ -57,6 +60,7 @@ const icons = {
   Sun,
   Trash2,
   X,
+  Zap,
 }
 const systemTheme = window.matchMedia("(prefers-color-scheme: dark)")
 let healthTimer
@@ -67,6 +71,8 @@ let unbindStateEvent = null
 let activeTheme = "system"
 let startupWindowSized = false
 let mainWindowSized = false
+let startupDismissed = false
+let resultShowTimestamp = 0
 
 let state = {
   mode: "translate", // "translate" | "settings" | "result"
@@ -85,6 +91,7 @@ let state = {
     logging_enabled: false,
     server_port: 8989,
     theme: "system",
+    acceleration_device: "auto",
     ai_idle_minutes: 15,
   },
   health: {},
@@ -106,6 +113,11 @@ function bindStateEvents() {
     const prevStartupStatus = state.startup_status
     const nextMode = next.mode || state.mode
 
+    // When startup finishes or user manually opens settings/translate tab, clear dismissed status
+    if (!next.startup_loading || next.settings_open) {
+      startupDismissed = false
+    }
+
     state = {
       ...state,
       ...next,
@@ -126,6 +138,10 @@ function bindStateEvents() {
     const nextTheme = state.config?.theme
     if (nextTheme !== activeTheme) {
       applyTheme(nextTheme)
+    }
+
+    if (startupDismissed && state.startup_loading) {
+      return
     }
 
     if (!windowShown || prevMode !== state.mode) {
@@ -168,7 +184,7 @@ function bindStateEvents() {
     const node = document.querySelector("#engineState")
     const textNode = document.querySelector("#engineText")
     if (!node || !textNode) {
-      render()
+      render({ forceShow: false })
       return
     }
     const ready = Boolean(state.health?.translator_ready)
@@ -248,7 +264,13 @@ function previewState() {
 }
 
 function render(options = {}) {
-  const forceShow = options.forceShow !== false
+  if (startupDismissed && state.startup_loading) {
+    return
+  }
+  const shouldShow =
+    options.forceShow === true ||
+    (options.forceShow !== false && !windowShown)
+
   clearInterval(healthTimer)
   document.documentElement.classList.toggle(
     "result-mode",
@@ -262,18 +284,28 @@ function render(options = {}) {
     renderMainWindow()
     createIcons({ icons, attrs: { "stroke-width": 1.8 } })
   }
-  if (forceShow || !windowShown) {
+  if (shouldShow) {
     showWindowAfterRender()
   }
 }
 
 function showWindowAfterRender() {
+  if (startupDismissed && state.startup_loading) return
   if (!window.runtime?.WindowShow) return
 
   requestAnimationFrame(() => {
     requestAnimationFrame(() => {
+      if (startupDismissed && state.startup_loading) return
       WindowShow()
       windowShown = true
+      if (state.mode === "result") {
+        resultShowTimestamp = Date.now()
+        try {
+          window.focus()
+        } catch {
+          // ignore
+        }
+      }
     })
   })
 }
@@ -732,6 +764,24 @@ function renderSettingsViewHTML() {
 
       <div class="section-rule"></div>
 
+      <section class="settings-section" aria-labelledby="deviceHeading">
+        <div class="section-heading">
+          <div class="section-icon"><i data-lucide="zap"></i></div>
+          <div>
+            <h2 id="deviceHeading">推理硬件加速</h2>
+            <p>选择翻译模型运行设备（保存后自动重启 AI 服务生效）</p>
+          </div>
+        </div>
+        <div class="theme-options" role="radiogroup" aria-labelledby="deviceHeading">
+          ${deviceOption("auto", "sparkles", "自动检测")}
+          ${deviceOption("gpu", "zap", "GPU 显卡加速")}
+          ${deviceOption("cpu", "cpu", "仅使用 CPU")}
+        </div>
+        ${renderCurrentDeviceBadge()}
+      </section>
+
+      <div class="section-rule"></div>
+
       <section class="settings-section" aria-labelledby="keyboardHeading">
         <div class="section-heading">
           <div class="section-icon"><i data-lucide="keyboard"></i></div>
@@ -884,6 +934,33 @@ function themeOption(value, icon, label) {
   `
 }
 
+function deviceOption(value, icon, label) {
+  const selected = (state.config.acceleration_device || "auto") === value
+  return `
+    <label class="theme-option">
+      <input type="radio" name="acceleration_device" value="${value}" ${selected ? "checked" : ""} />
+      <span class="theme-option-content">
+        <i data-lucide="${icon}"></i>
+        <span>${label}</span>
+      </span>
+    </label>
+  `
+}
+
+function renderCurrentDeviceBadge() {
+  const info = state.health?.device_info
+  if (!info) return ""
+  const actual = String(info.actual || "cpu")
+  const isGpu = actual.toLowerCase().includes("gpu")
+  const label = isGpu ? "当前已生效：显卡 (GPU) 加速" : "当前运行模式：纯 CPU 推理"
+  return `
+    <div class="device-status-badge ${isGpu ? "is-gpu" : "is-cpu"}">
+      <i data-lucide="${isGpu ? "zap" : "cpu"}"></i>
+      <span>${label}</span>
+    </div>
+  `
+}
+
 function previewTheme(event) {
   applyTheme(event.currentTarget.value)
 }
@@ -995,6 +1072,8 @@ async function saveSettings() {
     ),
     server_port: serverPort,
     ai_idle_minutes: aiIdleMinutes,
+    acceleration_device:
+      document.querySelector('input[name="acceleration_device"]:checked')?.value || "auto",
     theme:
       document.querySelector('input[name="theme"]:checked')?.value || "system",
   }
@@ -1019,6 +1098,16 @@ async function saveSettings() {
   }
 }
 
+function parseProgress(status) {
+  if (!status) return null
+  const match = status.match(/(\d+(?:\.\d+)?)%/)
+  if (match) {
+    const val = parseFloat(match[1])
+    if (!isNaN(val) && val >= 0 && val <= 100) return val
+  }
+  return null
+}
+
 function renderStartup() {
   const isMain =
     (state.mode === "settings" || state.mode === "translate") &&
@@ -1038,15 +1127,61 @@ function renderStartup() {
   }
   const status = state.startup_status || "正在加载翻译模型..."
   const error = state.startup_error
+  const progress = parseProgress(status)
+
   app.innerHTML = `
     <main class="startup-shell" role="status" aria-live="polite">
-      <h1>选中翻译</h1>
-      <p class="startup-status">${escapeHtml(status)}</p>
-      ${error ? `<p class="startup-error">${escapeHtml(error)}</p>` : ""}
-      <div class="startup-progress" aria-hidden="true"><span></span></div>
-      <p class="startup-hint">首次启动可能需要下载模型，请稍候</p>
+      <header class="startup-header" style="--wails-draggable: drag;">
+        <div class="startup-brand">
+          <div class="brand-mark" aria-hidden="true"><i data-lucide="languages"></i></div>
+          <span class="startup-title">PopTrans · 模型准备</span>
+        </div>
+        <button class="startup-close-btn" id="startupDismissBtn" type="button" title="最小化到托盘后台下载" aria-label="最小化到托盘后台下载">
+          <i data-lucide="x"></i>
+        </button>
+      </header>
+      <div class="startup-body">
+        <p class="startup-status">${escapeHtml(status)}</p>
+        ${error ? `<p class="startup-error">${escapeHtml(error)}</p>` : ""}
+        <div class="startup-progress" aria-hidden="true">
+          <span ${progress !== null ? `style="width: ${progress}%; animation: none;"` : ""}></span>
+        </div>
+        <div class="startup-actions">
+          <button class="startup-bg-btn" id="startupBgBtn" type="button" title="转入后台静默下载">
+            <i data-lucide="sparkles"></i>
+            <span>转入后台静默下载</span>
+          </button>
+          <p class="startup-hint">首次启动需下载模型，可隐藏窗口后台运行</p>
+        </div>
+      </div>
     </main>
   `
+
+  document
+    .querySelector("#startupDismissBtn")
+    ?.addEventListener("click", dismissStartup)
+  document
+    .querySelector("#startupBgBtn")
+    ?.addEventListener("click", dismissStartup)
+  createIcons({ icons, attrs: { "stroke-width": 1.8 } })
+}
+
+function dismissStartup() {
+  startupDismissed = true
+  windowShown = false
+  try {
+    if (window.go?.wailsui?.App?.HideWindow) {
+      HideWindow()
+      return
+    }
+  } catch {
+    // fall through
+  }
+  try {
+    window.close()
+  } catch {
+    // ignore
+  }
 }
 
 async function refreshHealth() {
@@ -1107,6 +1242,10 @@ async function copyResult(
 }
 
 function closeWindow() {
+  if (state.startup_loading) {
+    startupDismissed = true
+  }
+  resultShowTimestamp = 0
   windowShown = false
   lastResultHeight = 0
   resultSignature = ""
@@ -1135,10 +1274,18 @@ function closeWindow() {
 }
 
 function handleWindowKeydown(event) {
-  if (state.mode !== "result" || event.key !== "Escape" || event.repeat) return
-
-  event.preventDefault()
-  closeWindow()
+  if (event.key === "Escape" && !event.repeat) {
+    if (state.startup_loading) {
+      event.preventDefault()
+      dismissStartup()
+      return
+    }
+    if (state.mode === "result") {
+      event.preventDefault()
+      closeWindow()
+      return
+    }
+  }
 }
 
 function fitResultWindow() {

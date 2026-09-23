@@ -26,6 +26,8 @@ type Config struct {
 	LoggingEnabled   bool   `json:"logging_enabled"`
 	ServerPort       int    `json:"server_port"`
 	Theme            string `json:"theme"`
+	// AccelerationDevice: "auto" | "gpu" | "cpu"
+	AccelerationDevice string `json:"acceleration_device"`
 	// UIIdleMinutes is how long the UI process stays alive after the window is hidden.
 	// 0 means never auto-exit. Missing values fall back to DefaultUIIdleMinutes.
 	UIIdleMinutes int `json:"ui_idle_minutes"`
@@ -35,16 +37,17 @@ type Config struct {
 }
 
 var Default = Config{
-	Hotkey:           "<ctrl>+<alt>+q",
-	HotkeyDisplay:    "Ctrl+Alt+Q",
-	OcrEnabled:       false,
-	OcrHotkey:        "<ctrl>+<alt>+e",
-	OcrHotkeyDisplay: "Ctrl+Alt+E",
-	LoggingEnabled:   false,
-	ServerPort:       DefaultServerPort,
-	Theme:            "system",
-	UIIdleMinutes:    DefaultUIIdleMinutes,
-	AIIdleMinutes:    DefaultAIIdleMinutes,
+	Hotkey:             "<ctrl>+<alt>+q",
+	HotkeyDisplay:      "Ctrl+Alt+Q",
+	OcrEnabled:         false,
+	OcrHotkey:          "<ctrl>+<alt>+e",
+	OcrHotkeyDisplay:   "Ctrl+Alt+E",
+	LoggingEnabled:     false,
+	ServerPort:         DefaultServerPort,
+	Theme:              "system",
+	AccelerationDevice: "auto",
+	UIIdleMinutes:      DefaultUIIdleMinutes,
+	AIIdleMinutes:      DefaultAIIdleMinutes,
 }
 
 func ResolveBaseDir() string {
@@ -141,6 +144,9 @@ func mergeDefaults(cfg *Config) {
 	if cfg.Theme != "light" && cfg.Theme != "dark" && cfg.Theme != "system" {
 		cfg.Theme = Default.Theme
 	}
+	if cfg.AccelerationDevice != "auto" && cfg.AccelerationDevice != "gpu" && cfg.AccelerationDevice != "cpu" {
+		cfg.AccelerationDevice = Default.AccelerationDevice
+	}
 	if cfg.UIIdleMinutes < 0 {
 		cfg.UIIdleMinutes = Default.UIIdleMinutes
 	}
@@ -153,6 +159,9 @@ func mergeLoadedDefaults(cfg *Config, rawKeys map[string]json.RawMessage) {
 	mergeDefaults(cfg)
 	if ValidateServerPort(cfg.ServerPort) != nil {
 		cfg.ServerPort = Default.ServerPort
+	}
+	if _, ok := rawKeys["acceleration_device"]; !ok {
+		cfg.AccelerationDevice = Default.AccelerationDevice
 	}
 	if _, ok := rawKeys["ui_idle_minutes"]; !ok {
 		cfg.UIIdleMinutes = Default.UIIdleMinutes

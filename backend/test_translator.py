@@ -93,6 +93,13 @@ class TranslatorLanguageTests(unittest.TestCase):
         self.assertEqual(len(self.translator._model.prompts), 1)
         self.assertEqual(result, "result-1")
 
+    def test_device_info_structure(self):
+        info = self.translator.device_info
+        self.assertIn("configured", info)
+        self.assertIn("actual", info)
+        self.assertIn("gpu_layers", info)
+
 
 if __name__ == "__main__":
     unittest.main()
+

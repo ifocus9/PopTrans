@@ -13,13 +13,14 @@
 </div>
 
 **PopTrans** 是一款专为 Windows 打造的本地离线翻译与 OCR 工具。支持选中文本或屏幕截图后一键翻译。
-基于 Go + Wails 构建流畅的原生交互与现代界面，后端采用 Python 与 llama.cpp 实现纯 CPU 离线大模型推理，**无需 GPU 加速，彻底告别隐私泄露与网络依赖**。
+基于 Go + Wails 构建流畅的原生交互与现代界面，后端采用 Python 与 llama.cpp 实现离线大模型推理，**支持纯 CPU 普适运行与显卡 (GPU) 硬件加速，彻底告别隐私泄露与网络依赖**。
 
 ---
 
 ## 🌟 核心特性
 
-- **🔒 完全离线 · 隐私优先**：后端基于 llama.cpp 在本地 CPU 上运行腾讯 Hy-MT2-1.8B 大模型，**无需 GPU、无需联网**（模型下载一次后即纯离线），文本不出本机，杜绝隐私泄露。
+- **🔒 完全离线 · 隐私优先**：后端基于 llama.cpp 在本地运行腾讯 Hy-MT2-1.8B 大模型，**无需联网**（模型下载一次后即纯离线），文本不出本机，杜绝隐私泄露。
+- **⚡ 纯 CPU + 显卡 (GPU) 双加速**：既保证无独显电脑上的纯 CPU 稳定推理，亦支持 NVIDIA、AMD 及 Intel 核显/独显的 GPU 硬件加速；模型层全量卸载至显存后翻译提速 3~5 倍以上，且内置驱动/显存异常自动平滑降级至 CPU 的安全机制。
 - **✍️ 文本翻译工作台**：双击托盘图标或托盘菜单一键打开双卡片工作台，手动输入长文本即刻离线翻译，支持 `Ctrl+Enter` 快速翻译、实时字符统计、一键复制译文、关闭窗口自动清空重置。
 - **🚀 划词快捷翻译**：一键捕获选中文本（模拟 Ctrl+C，内置多次智能重试），并即刻在光标旁显示浮动翻译结果。
 - **📷 离线 OCR 截图翻译**：原生 Go 实现的屏幕框选与截图，内置 1.0× / 1.5× / 2.0× 多倍率自动缩放与识别质量回退重试，小字、低分辨率截图也能精准识别。
@@ -48,7 +49,9 @@
 
 - **操作系统**：Windows 10 / 11 (x64)
 - **依赖运行库**：需系统已安装 [WebView2 Runtime](https://developer.microsoft.com/zh-cn/microsoft-edge/webview2/) (Windows 11 通常自带)
-- **硬件要求**：纯 CPU 推理，无需独立显卡，建议 8GB 及以上内存。
+- **硬件要求**：
+  - **基础模式 (CPU)**：纯 CPU 推理，无需独立显卡，建议 8GB 及以上内存。
+  - **显卡加速 (GPU)**：支持 NVIDIA 显卡 (CUDA)、AMD 显卡及 Intel 核显/独显 (Vulkan)。建议显存或共享显存 ≥ 2GB。
 
 ### 下载与安装
 
@@ -199,11 +202,13 @@ python -m pip install -r backend/requirements-build.txt
 
 只想重打单个部分时，可直接调用对应脚本：
 
-| 脚本                          | 作用           | 主要产物                                              |
-| ----------------------------- | -------------- | ----------------------------------------------------- |
-| `scripts/build_wails.bat`     | 构建前端 UI    | `build/bin/translate-ui.exe`                          |
-| `scripts/build_ai_engine.bat` | 打包 AI 引擎   | `dist-go/ai_engine.exe` + `dist-go/models/rapidocr/*` |
-| `scripts/build_go.bat`        | 编译 Go 主程序 | `dist-go/PopTrans.exe`                                |
+| 脚本                          | 作用               | 主要产物                                              |
+| ----------------------------- | ------------------ | ----------------------------------------------------- |
+| `scripts/build_wails.bat`     | 构建前端 UI        | `build/bin/translate-ui.exe`                          |
+| `scripts/build_ai_engine.bat` | 打包 AI 引擎 (CPU) | `dist-go/ai_engine.exe` + `dist-go/models/rapidocr/*` |
+| `scripts/build_ai_engine_gpu.bat` | 打包 AI 引擎 (GPU) | `dist-go/ai_engine.exe`（支持显卡硬件加速） |
+| `scripts/build_go.bat`        | 编译 Go 主程序     | `dist-go/PopTrans.exe`                                |
+| `scripts/package_zip.bat`     | 打包为 Release ZIP | `PopTrans-vX.Y.Z.zip`（自动按 CHANGELOG 最新版本命名）|
 
 > 单独构建 AI 引擎前，请先确保已安装 `requirements-build.txt`，否则脚本会检测到缺少 `PyInstaller` 等依赖并中止。
 
@@ -224,6 +229,8 @@ python -m pip install -r backend/requirements-build.txt
 - `models/` — AI 模型目录（翻译模型 + RapidOCR 模型）
 - `icon.ico` — 应用图标
 
+您也可以直接运行 `.\scripts\package_zip.bat`，脚本会自动读取 `CHANGELOG.md` 中最新的版本号，默认**排除 1.13GB 本地翻译大模型**，将核心程序（Go 宿主、UI 进程、AI 引擎及 RapidOCR）快速打包为仅约 120MB 的轻量发布包 `PopTrans-vX.Y.Z.zip`（若需带大模型的完整离线包，可执行 `.\scripts\package_zip.bat -IncludeModel`）。用户下载轻量包解压后首次运行会自动下载模型，非常适合极速分发与发布到 GitHub Releases。
+
 运行只需双击 `dist-go/PopTrans.exe`；系统需已安装 WebView2 Runtime。
 
 ---
@@ -243,6 +250,7 @@ python -m pip install -r backend/requirements-build.txt
 | `ocr_hotkey_display` | string | `Ctrl+Alt+E`     | OCR 快捷键展示文本，由 `ocr_hotkey` 自动派生，**请勿手动修改**。                                                                                                        |
 | `server_port`        | int    | `8989`           | AI 引擎内部 HTTP 服务端口，取值范围 `1024`–`65535`。                                                                                                                    |
 | `theme`              | string | `system`         | 界面主题：`system`（跟随系统）/ `light` / `dark`。                                                                                                                      |
+| `acceleration_device`| string | `auto`           | 推理加速硬件设备：`auto`（自动检测，优先使用 GPU 且支持异常自动降级）、`gpu`（显卡加速优先）、`cpu`（仅使用 CPU 推理）。修改后自动重启本地 AI 引擎生效。 |
 | `logging_enabled`    | bool   | `false`          | 是否将各进程日志统一输出至 `translate.log`。                                                                                                                            |
 | `ui_idle_minutes`    | int    | `5`              | 窗口隐藏后 UI 进程空闲多久自动退出（分钟）。`0` 表示永不退出。                                                                                                          |
 | `ai_idle_minutes`    | int    | `15`             | 最后一次请求完成后 AI 引擎空闲多久自动退出（分钟）。`0` 表示永不退出，再次触发翻译/OCR 时会自动重新拉起。                                                               |
@@ -258,7 +266,7 @@ python -m pip install -r backend/requirements-build.txt
 
 AI 后台引擎默认在 `http://127.0.0.1:<server_port>` 提供 API 服务，支持外部工具或脚本直接调用，详情请参阅 [本地 API 文档](docs/API.md)：
 
-- **`GET /health`**：服务与模型健康状态检查。
+- **`GET /health`**：服务与模型健康状态检查（包含准备状态、就绪文本与当前硬件 `device_info`）。
 - **`POST /api/v1/ocr`**：RapidOCR 纯离线图像文字识别。
 - **`POST /api/v1/ocr_translate`**：OCR 识别 + 翻译一步集成。
 - **`POST /v1/chat/completions`**：OpenAI 兼容的翻译/对话接口（支持流式响应 SSE）。

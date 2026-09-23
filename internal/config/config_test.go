@@ -249,3 +249,48 @@ func TestAIIdleMinutesMissingUsesDefault(t *testing.T) {
 		t.Fatalf("ai idle minutes = %d, want %d", loaded.AIIdleMinutes, DefaultAIIdleMinutes)
 	}
 }
+
+func TestAccelerationDeviceDefaultsToAuto(t *testing.T) {
+	cfg, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AccelerationDevice != "auto" {
+		t.Fatalf("acceleration device = %q, want auto", cfg.AccelerationDevice)
+	}
+}
+
+func TestAccelerationDeviceRoundTrip(t *testing.T) {
+	for _, dev := range []string{"auto", "gpu", "cpu"} {
+		dir := t.TempDir()
+		cfg := Default
+		cfg.AccelerationDevice = dev
+		if err := Save(dir, cfg); err != nil {
+			t.Fatal(err)
+		}
+		loaded, err := Load(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if loaded.AccelerationDevice != dev {
+			t.Fatalf("acceleration device = %q, want %q", loaded.AccelerationDevice, dev)
+		}
+	}
+}
+
+func TestInvalidAccelerationDeviceFallsBackToAuto(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Default
+	cfg.AccelerationDevice = "invalid_gpu"
+	if err := Save(dir, cfg); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.AccelerationDevice != "auto" {
+		t.Fatalf("acceleration device = %q, want auto", loaded.AccelerationDevice)
+	}
+}
+

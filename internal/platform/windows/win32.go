@@ -784,3 +784,54 @@ func sendKeyboardInputs(inputs []Input) error {
 	}
 	return nil
 }
+
+// FindWindowByTitle 按标题查找窗口句柄
+func FindWindowByTitle(title string) HWND {
+	titlePtr, _ := xwindows.UTF16PtrFromString(title)
+	ret, _, _ := procFindWindowW.Call(0, uintptr(unsafe.Pointer(titlePtr)))
+	return HWND(ret)
+}
+
+// GetWindowRect 返回窗口屏幕坐标矩形
+func GetWindowRect(hwnd HWND) (Rect, error) {
+	var rect Rect
+	ret, _, err := procGetWindowRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&rect)))
+	if ret == 0 {
+		return rect, err
+	}
+	return rect, nil
+}
+
+// Contains 判断点是否在矩形内
+func (r Rect) Contains(pt Point) bool {
+	return pt.X >= r.Left && pt.X <= r.Right && pt.Y >= r.Top && pt.Y <= r.Bottom
+}
+
+// IsMouseButtonDown 检测鼠标左键、右键或中键是否处于按下状态
+func IsMouseButtonDown() bool {
+	return keyDown(0x01) || keyDown(0x02) || keyDown(0x04)
+}
+
+// ForceForegroundWindow 强制将指定窗口置于前台并激活
+func ForceForegroundWindow(hwnd HWND) {
+	if hwnd == 0 {
+		return
+	}
+	foreWnd, _, _ := procGetForegroundWindow.Call()
+	if HWND(foreWnd) == hwnd {
+		return
+	}
+	curThreadID := xwindows.GetCurrentThreadId()
+	var foreThreadID uint32
+	procGetWindowThreadProcessId.Call(foreWnd, uintptr(unsafe.Pointer(&foreThreadID)))
+
+	if foreThreadID != 0 && foreThreadID != curThreadID {
+		procAttachThreadInput.Call(uintptr(curThreadID), uintptr(foreThreadID), 1)
+		procSetForegroundWindow.Call(uintptr(hwnd))
+		procSetFocus.Call(uintptr(hwnd))
+		procAttachThreadInput.Call(uintptr(curThreadID), uintptr(foreThreadID), 0)
+	} else {
+		procSetForegroundWindow.Call(uintptr(hwnd))
+		procSetFocus.Call(uintptr(hwnd))
+	}
+}

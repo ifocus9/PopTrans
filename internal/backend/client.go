@@ -21,10 +21,11 @@ type Client struct {
 }
 
 type Health struct {
-	Status           string `json:"status"`
-	TranslatorReady  bool   `json:"translator_ready"`
-	TranslatorStatus string `json:"translator_status"`
-	OCRLoaded        bool   `json:"ocr_loaded"`
+	Status           string         `json:"status"`
+	TranslatorReady  bool           `json:"translator_ready"`
+	TranslatorStatus string         `json:"translator_status"`
+	OCRLoaded        bool           `json:"ocr_loaded"`
+	DeviceInfo       map[string]any `json:"device_info,omitempty"`
 }
 
 type chatRequest struct {

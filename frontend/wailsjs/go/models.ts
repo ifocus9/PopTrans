@@ -5,6 +5,7 @@ export namespace backend {
 	    translator_ready: boolean;
 	    translator_status: string;
 	    ocr_loaded: boolean;
+	    device_info?: Record<string, any>;
 	
 	    static createFrom(source: any = {}) {
 	        return new Health(source);
@@ -16,6 +17,7 @@ export namespace backend {
 	        this.translator_ready = source["translator_ready"];
 	        this.translator_status = source["translator_status"];
 	        this.ocr_loaded = source["ocr_loaded"];
+	        this.device_info = source["device_info"];
 	    }
 	}
 
@@ -32,6 +34,7 @@ export namespace config {
 	    logging_enabled: boolean;
 	    server_port: number;
 	    theme: string;
+	    acceleration_device: string;
 	    ui_idle_minutes: number;
 	    ai_idle_minutes: number;
 	
@@ -49,6 +52,7 @@ export namespace config {
 	        this.logging_enabled = source["logging_enabled"];
 	        this.server_port = source["server_port"];
 	        this.theme = source["theme"];
+	        this.acceleration_device = source["acceleration_device"];
 	        this.ui_idle_minutes = source["ui_idle_minutes"];
 	        this.ai_idle_minutes = source["ai_idle_minutes"];
 	    }

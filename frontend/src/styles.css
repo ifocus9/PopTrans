@@ -39,13 +39,12 @@ body {
 .startup-shell {
   display: flex;
   flex-direction: column;
-  align-items: center;
-  justify-content: center;
   width: 100%;
   height: 100%;
-  padding: 36px;
+  padding: 0;
   color: #f4f1f8;
   border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 10px;
   background:
     radial-gradient(
       circle at 50% 15%,
@@ -53,35 +52,119 @@ body {
       transparent 42%
     ),
     linear-gradient(145deg, rgba(27, 29, 42, 0.96), rgba(12, 13, 21, 0.98));
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+  user-select: none;
+}
+
+.startup-header,
+.startup-titlebar {
+  --wails-draggable: drag;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 42px;
+  min-height: 42px;
+  padding: 0 12px 0 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.02);
+  cursor: move;
+  user-select: none;
+}
+
+.startup-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.startup-brand .brand-mark {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin-right: 0;
+  color: #77e2ff;
+}
+
+.startup-brand .brand-mark svg {
+  width: 15px;
+  height: 15px;
+}
+
+.startup-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #e5e2ee;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.startup-close-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  margin: 0 0 0 auto;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: #9f9aa9;
+  cursor: pointer;
+  transition: all 120ms ease;
+  --wails-draggable: no-drag;
+}
+
+.startup-close-btn:hover {
+  color: #ffffff;
+  border-color: rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.startup-close-btn:active {
+  transform: scale(0.95);
+}
+
+.startup-close-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.startup-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  padding: 14px 20px 18px;
   text-align: center;
 }
 
-.startup-shell h1 {
-  font-size: 17px;
-  font-weight: 650;
-  letter-spacing: 0.04em;
-}
-
 .startup-status {
-  max-width: 360px;
-  margin-top: 12px;
+  max-width: 340px;
   color: #d9d6e0;
   font-size: 12px;
   line-height: 1.5;
+  font-weight: 500;
 }
 
 .startup-error {
-  max-width: 360px;
-  margin-top: 8px;
+  max-width: 340px;
+  margin-top: 6px;
   color: #ef8585;
   font-size: 11px;
   line-height: 1.45;
 }
 
 .startup-progress {
-  width: min(260px, 100%);
-  height: 3px;
-  margin-top: 22px;
+  width: 100%;
+  max-width: 310px;
+  height: 4px;
+  margin-top: 14px;
   overflow: hidden;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.12);
@@ -94,12 +177,49 @@ body {
   border-radius: inherit;
   background: linear-gradient(90deg, #77e2ff, #9b8cff);
   animation: startup-progress 1.35s ease-in-out infinite;
+  transition: width 200ms ease;
+}
+
+.startup-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.startup-bg-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 14px;
+  color: #ffffff;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.08);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 120ms ease;
+  --wails-draggable: no-drag;
+}
+
+.startup-bg-btn svg {
+  width: 13px;
+  height: 13px;
+  color: #77e2ff;
+}
+
+.startup-bg-btn:hover {
+  background: rgba(255, 255, 255, 0.15);
+  border-color: rgba(255, 255, 255, 0.25);
 }
 
 .startup-hint {
-  margin-top: 14px;
-  color: #8f8a9b;
+  color: #888394;
   font-size: 10px;
+  line-height: 1.3;
 }
 
 .result-mode,
@@ -116,6 +236,22 @@ textarea {
 
 button {
   letter-spacing: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+}
+
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid transparent;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  --wails-draggable: no-drag;
 }
 
 button:focus-visible,
@@ -1847,6 +1983,46 @@ p {
     transform: translateY(0) scale(1);
     filter: blur(0);
   }
+}
+
+.device-status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.device-status-badge svg {
+  width: 13px;
+  height: 13px;
+}
+
+.device-status-badge.is-gpu {
+  color: #7ef5a7;
+  background: rgba(46, 160, 67, 0.15);
+  border: 1px solid rgba(46, 160, 67, 0.3);
+}
+
+.device-status-badge.is-cpu {
+  color: #9cb3ff;
+  background: rgba(82, 151, 225, 0.15);
+  border: 1px solid rgba(82, 151, 225, 0.3);
+}
+
+:root[data-theme="light"] .device-status-badge.is-gpu {
+  color: #1a7f37;
+  background: #dafbe1;
+  border-color: #aceebb;
+}
+
+:root[data-theme="light"] .device-status-badge.is-cpu {
+  color: #0969da;
+  background: #ddf4ff;
+  border-color: #b6e3ff;
 }
 
 @media (max-width: 480px) {

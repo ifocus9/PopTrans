@@ -33,22 +33,38 @@ type Supervisor struct {
 	baseDir string
 	client  *Client
 
-	ensureMu sync.Mutex
-	cmd      *exec.Cmd
-	owned    bool
-	waitCh   chan error
+	mu         sync.Mutex
+	cmd        *exec.Cmd
+	owned      bool
+	waitCh     chan error
+	stopCtx    context.Context
+	stopCancel context.CancelFunc
 }
 
 func NewSupervisor(baseDir string, client *Client) *Supervisor {
+	stopCtx, stopCancel := context.WithCancel(context.Background())
 	return &Supervisor{
-		baseDir: baseDir,
-		client:  client,
+		baseDir:    baseDir,
+		client:     client,
+		stopCtx:    stopCtx,
+		stopCancel: stopCancel,
 	}
 }
 
 func (s *Supervisor) EnsureRunning(ctx context.Context, onStatus func(string)) error {
-	s.ensureMu.Lock()
-	defer s.ensureMu.Unlock()
+	s.mu.Lock()
+	stopCtx := s.stopCtx
+	if stopCtx.Err() != nil {
+		s.mu.Unlock()
+		return errors.New("backend supervisor is stopped")
+	}
+
+	// 若已有由 supervisor 管理且活着的进程，直接等待就绪
+	if s.cmd != nil && s.owned && s.cmd.Process != nil {
+		s.mu.Unlock()
+		return s.waitForReady(ctx, stopCtx, onStatus)
+	}
+	s.mu.Unlock()
 
 	log.Printf("supervisor ensure running: base_dir=%s", s.baseDir)
 
@@ -77,10 +93,21 @@ func (s *Supervisor) EnsureRunning(ctx context.Context, onStatus func(string)) e
 	}
 
 	if shouldStart {
+		s.mu.Lock()
+		if s.stopCtx.Err() != nil {
+			s.mu.Unlock()
+			return errors.New("backend supervisor is stopped")
+		}
+		if s.cmd != nil && s.owned && s.cmd.Process != nil {
+			s.mu.Unlock()
+			return s.waitForReady(ctx, s.stopCtx, onStatus)
+		}
+
 		onStatus("starting local api service...")
 
 		cmd, backendName, err := s.backendCommand()
 		if err != nil {
+			s.mu.Unlock()
 			return err
 		}
 		cmd.Dir = s.baseDir
@@ -120,6 +147,7 @@ func (s *Supervisor) EnsureRunning(ctx context.Context, onStatus func(string)) e
 		}
 
 		if err := cmd.Start(); err != nil {
+			s.mu.Unlock()
 			if backendLogFile != nil {
 				_ = backendLogFile.Close()
 			}
@@ -129,7 +157,8 @@ func (s *Supervisor) EnsureRunning(ctx context.Context, onStatus func(string)) e
 
 		s.cmd = cmd
 		s.owned = true
-		s.waitCh = make(chan error, 1)
+		waitCh := make(chan error, 1)
+		s.waitCh = waitCh
 		log.Printf("supervisor started backend process: pid=%d", cmd.Process.Pid)
 
 		go func() {
@@ -142,22 +171,43 @@ func (s *Supervisor) EnsureRunning(ctx context.Context, onStatus func(string)) e
 			} else {
 				log.Printf("supervisor backend process exited cleanly: pid=%d", cmd.Process.Pid)
 			}
-			s.waitCh <- waitErr
-			close(s.waitCh)
+			waitCh <- waitErr
+			close(waitCh)
 		}()
+		s.mu.Unlock()
 	}
 
+	return s.waitForReady(ctx, stopCtx, onStatus)
+}
+
+func (s *Supervisor) waitForReady(ctx, stopCtx context.Context, onStatus func(string)) error {
 	deadline := time.Now().Add(StartupReadyTimeout)
 	attempt := 0
 	for time.Now().Before(deadline) {
 		attempt++
 
-		if s.waitCh != nil {
+		select {
+		case <-stopCtx.Done():
+			log.Printf("supervisor stopped while waiting for backend ready")
+			return errors.New("backend supervisor stopped")
+		case <-ctx.Done():
+			log.Printf("supervisor context done while waiting for backend: %v", ctx.Err())
+			return ctx.Err()
+		default:
+		}
+
+		s.mu.Lock()
+		waitCh := s.waitCh
+		s.mu.Unlock()
+
+		if waitCh != nil {
 			select {
-			case waitErr, ok := <-s.waitCh:
+			case waitErr, ok := <-waitCh:
+				s.mu.Lock()
 				s.waitCh = nil
 				s.cmd = nil
 				s.owned = false
+				s.mu.Unlock()
 				if ok && waitErr != nil {
 					log.Printf("supervisor detected backend exit before ready on attempt %d: %v", attempt, waitErr)
 					return fmt.Errorf("api server exited before ready: %w", waitErr)
@@ -168,7 +218,7 @@ func (s *Supervisor) EnsureRunning(ctx context.Context, onStatus func(string)) e
 			}
 		}
 
-		health, err = s.client.Health(ctx)
+		health, err := s.client.Health(ctx)
 		if err == nil && health.Status == "ok" {
 			log.Printf(
 				"supervisor health check success on attempt %d: translator_ready=%t translator_status=%q ocr_loaded=%t",
@@ -181,9 +231,7 @@ func (s *Supervisor) EnsureRunning(ctx context.Context, onStatus func(string)) e
 				onStatus(health.TranslatorStatus)
 			}
 			if initErr := translatorInitializationError(health); initErr != nil {
-				if s.owned {
-					s.Stop()
-				}
+				s.Stop()
 				return initErr
 			}
 			if health.TranslatorReady {
@@ -196,6 +244,9 @@ func (s *Supervisor) EnsureRunning(ctx context.Context, onStatus func(string)) e
 		}
 
 		select {
+		case <-stopCtx.Done():
+			log.Printf("supervisor stopped while waiting for backend: stopped")
+			return errors.New("backend supervisor stopped")
 		case <-ctx.Done():
 			log.Printf("supervisor context done while waiting for backend: %v", ctx.Err())
 			return ctx.Err()
@@ -241,19 +292,33 @@ func translatorInitializationError(health Health) error {
 }
 
 func (s *Supervisor) Stop() {
-	s.ensureMu.Lock()
-	defer s.ensureMu.Unlock()
+	s.mu.Lock()
+	if s.stopCancel != nil {
+		s.stopCancel()
+	}
+	cmd := s.cmd
+	owned := s.owned
+	waitCh := s.waitCh
+	s.cmd = nil
+	s.owned = false
+	s.waitCh = nil
+	s.stopCtx, s.stopCancel = context.WithCancel(context.Background())
+	s.mu.Unlock()
 
-	if s.cmd != nil && s.owned && s.cmd.Process != nil {
-		log.Printf("supervisor stopping owned backend process: pid=%d", s.cmd.Process.Pid)
-		if err := terminateProcessTree(s.cmd.Process); err != nil {
-			log.Printf("supervisor process tree termination failed, using direct kill: pid=%d err=%v", s.cmd.Process.Pid, err)
-			_ = s.cmd.Process.Kill()
+	if cmd != nil && owned && cmd.Process != nil {
+		log.Printf("supervisor stopping owned backend process: pid=%d", cmd.Process.Pid)
+		if err := terminateProcessTree(cmd.Process); err != nil {
+			log.Printf("supervisor process tree termination failed, using direct kill: pid=%d err=%v", cmd.Process.Pid, err)
+			_ = cmd.Process.Kill()
 		}
-		s.waitForOwnedExit()
-		s.cmd = nil
-		s.owned = false
-		s.waitCh = nil
+		if waitCh != nil {
+			select {
+			case waitErr := <-waitCh:
+				log.Printf("supervisor backend process wait finished during stop: err=%v", waitErr)
+			case <-time.After(3 * time.Second):
+				log.Printf("supervisor timed out waiting for backend process to exit during stop")
+			}
+		}
 		log.Printf("supervisor owned backend process stopped")
 	}
 
@@ -264,11 +329,15 @@ func (s *Supervisor) Stop() {
 }
 
 func (s *Supervisor) waitForOwnedExit() {
-	if s.waitCh == nil {
+	s.mu.Lock()
+	waitCh := s.waitCh
+	s.mu.Unlock()
+
+	if waitCh == nil {
 		return
 	}
 	select {
-	case waitErr := <-s.waitCh:
+	case waitErr := <-waitCh:
 		log.Printf("supervisor backend process wait finished during stop: err=%v", waitErr)
 	case <-time.After(5 * time.Second):
 		log.Printf("supervisor timed out waiting for backend process to exit during stop")

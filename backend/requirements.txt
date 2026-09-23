@@ -1,3 +1,8 @@
+# 默认 CPU 安装: pip install llama-cpp-python>=0.3.0
+# Vulkan 显卡加速 (推荐，兼容 N卡/A卡/Intel核显):
+#   set CMAKE_ARGS="-DGGML_VULKAN=on" && pip install llama-cpp-python --force-reinstall --no-cache-dir
+# CUDA 显卡加速 (NVIDIA 专享):
+#   pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
 llama-cpp-python>=0.3.0
 huggingface_hub>=0.20.0
 Pillow>=10.0.0

@@ -75,3 +75,5 @@ PopTrans.exe
 # UI daemon runtime discovery
 translate-ui-endpoint.json
 
+# Archives
+*.zip

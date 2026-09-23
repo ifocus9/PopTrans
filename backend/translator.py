@@ -9,13 +9,14 @@ translator.py — Hy-MT2-1.8B 翻译引擎模块
 import os
 import sys
 import re
+import json
 import time
 import threading
 import logging
 from collections import OrderedDict
 from typing import Optional, Tuple
 
-from backend.runtime_paths import application_dir
+from backend.runtime_paths import application_dir, settings_path
 
 logger = logging.getLogger(__name__)
 
@@ -354,6 +355,20 @@ def _split_long_text(text: str):
     return chunks, True
 
 
+def _read_acceleration_preference() -> str:
+    """读取用户配置的推理硬件偏好（auto / gpu / cpu）"""
+    try:
+        cfg_file = settings_path()
+        if cfg_file.is_file():
+            data = json.loads(cfg_file.read_text(encoding="utf-8"))
+            dev = str(data.get("acceleration_device", "auto")).strip().lower()
+            if dev in ("auto", "gpu", "cpu"):
+                return dev
+    except Exception as e:
+        logger.warning("读取加速配置失败，使用默认 auto: %s", e)
+    return "auto"
+
+
 class Translator:
     """Hy-MT2-1.8B 翻译引擎封装（使用 llama-cpp-python）"""
 
@@ -367,10 +382,21 @@ class Translator:
         self._cache_lock = threading.Lock()
         self._translation_cache = OrderedDict()
         self._status_message = "翻译引擎未初始化"
+        self._configured_device = "auto"
+        self._actual_device = "cpu"
+        self._gpu_layers = 0
 
     @property
     def status(self) -> str:
         return self._status_message
+
+    @property
+    def device_info(self) -> dict:
+        return {
+            "configured": self._configured_device,
+            "actual": self._actual_device,
+            "gpu_layers": self._gpu_layers,
+        }
 
     # ── 初始化 ──────────────────────────────────────────────
 
@@ -414,7 +440,7 @@ class Translator:
                 self._load_model()
 
                 self.ready = True
-                update_status("翻译引擎就绪")
+                update_status(self._status_message)
 
                 if on_ready:
                     on_ready(True)
@@ -552,7 +578,7 @@ class Translator:
                     raise RuntimeError(f"模型下载失败（已重试 {max_retries} 次）: {e}") from e
 
     def _load_model(self):
-        """加载 llama-cpp-python 模型"""
+        """加载 llama-cpp-python 模型，支持根据配置启用显卡加速并在异常时自动回退 CPU"""
         # PyInstaller 打包后，需要手动设置 DLL 路径
         if getattr(sys, 'frozen', False):
             import ctypes
@@ -562,14 +588,80 @@ class Translator:
                 os.add_dll_directory(_lib_dir)
                 os.environ["PATH"] = _lib_dir + os.pathsep + os.environ.get("PATH", "")
 
-        from llama_cpp import Llama
+        from llama_cpp import Llama, llama_supports_gpu_offload
 
-        self._model = Llama(
-            model_path=MODEL_PATH,
-            n_ctx=MODEL_N_CTX,  # 划词翻译以短文本为主，收紧上下文可减少推理开销
-            n_threads=os.cpu_count(),  # 使用所有 CPU 核心
-            verbose=False,  # 关闭详细日志
+        preference = _read_acceleration_preference()
+        self._configured_device = preference
+
+        can_gpu = False
+        try:
+            can_gpu = bool(llama_supports_gpu_offload())
+        except Exception:
+            can_gpu = False
+
+        logger.info(
+            "加载翻译模型: 配置偏好=%s, 环境支持GPU卸载=%s",
+            preference,
+            can_gpu,
         )
+
+        if preference == "cpu":
+            logger.info("用户配置使用 CPU 推理")
+            self._model = Llama(
+                model_path=MODEL_PATH,
+                n_ctx=MODEL_N_CTX,
+                n_gpu_layers=0,
+                n_threads=os.cpu_count(),
+                verbose=False,
+            )
+            self._actual_device = "cpu"
+            self._gpu_layers = 0
+            self._status_message = "翻译引擎就绪 (CPU)"
+            return
+
+        if not can_gpu:
+            if preference == "gpu":
+                logger.warning("用户配置为 GPU 模式，但当前 llama-cpp 运行库未启用 GPU 支持，降级使用 CPU")
+            else:
+                logger.info("当前环境未检测到 GPU 卸载支持，使用 CPU 推理")
+            self._model = Llama(
+                model_path=MODEL_PATH,
+                n_ctx=MODEL_N_CTX,
+                n_gpu_layers=0,
+                n_threads=os.cpu_count(),
+                verbose=False,
+            )
+            self._actual_device = "cpu"
+            self._gpu_layers = 0
+            self._status_message = "翻译引擎就绪 (CPU)"
+            return
+
+        # 尝试使用 GPU 加载
+        try:
+            logger.info("尝试启用显卡 (GPU) 加速加载模型 (n_gpu_layers=-1)...")
+            self._model = Llama(
+                model_path=MODEL_PATH,
+                n_ctx=MODEL_N_CTX,
+                n_gpu_layers=-1,
+                n_threads=os.cpu_count(),
+                verbose=False,
+            )
+            self._actual_device = "gpu"
+            self._gpu_layers = -1
+            self._status_message = "翻译引擎就绪 (GPU 加速)"
+            logger.info("模型成功加载至 GPU")
+        except Exception as gpu_err:
+            logger.warning("显卡 (GPU) 加载失败 (%s)，安全降级至纯 CPU 模式...", gpu_err)
+            self._model = Llama(
+                model_path=MODEL_PATH,
+                n_ctx=MODEL_N_CTX,
+                n_gpu_layers=0,
+                n_threads=os.cpu_count(),
+                verbose=False,
+            )
+            self._actual_device = "cpu"
+            self._gpu_layers = 0
+            self._status_message = "翻译引擎就绪 (CPU 降级)"
 
 
     def close(self):

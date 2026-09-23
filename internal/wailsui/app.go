@@ -44,6 +44,9 @@ type App struct {
 	startupStarted time.Time
 	idleTimer      *time.Timer
 	idleTimeout    time.Duration
+
+	clickOutsideMu     sync.Mutex
+	clickOutsideCancel context.CancelFunc
 }
 
 type UIState struct {
@@ -348,8 +351,104 @@ func (a *App) Translate(text string) (TranslateResult, error) {
 }
 
 // HideWindow is called by the frontend close button in daemon mode.
-func (a *App) HideWindow() {
-	_ = a.Hide()
+func (a *App) HideWindow() error {
+	return a.Hide()
+}
+
+func (a *App) startClickOutsideMonitor() {
+	a.clickOutsideMu.Lock()
+	if a.clickOutsideCancel != nil {
+		a.clickOutsideCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	a.clickOutsideCancel = cancel
+	a.clickOutsideMu.Unlock()
+
+	go a.monitorClickOutside(ctx)
+}
+
+func (a *App) stopClickOutsideMonitor() {
+	a.clickOutsideMu.Lock()
+	if a.clickOutsideCancel != nil {
+		a.clickOutsideCancel()
+		a.clickOutsideCancel = nil
+	}
+	a.clickOutsideMu.Unlock()
+}
+
+func (a *App) monitorClickOutside(ctx context.Context) {
+	// 初始等待 250ms 防抖，过滤快捷键触发与初始挂载
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	hwnd := win.FindWindowByTitle("选中翻译")
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+
+	buttonWasUp := !win.IsMouseButtonDown()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.mu.Lock()
+			visible := a.visible
+			isResult := a.mode == "result"
+			a.mu.Unlock()
+
+			if !visible || !isResult {
+				return
+			}
+
+			mouseDown := win.IsMouseButtonDown()
+			if !mouseDown {
+				buttonWasUp = true
+				continue
+			}
+
+			// 如果不是新的一次按下（即用户还在持续按住拖拽/选择），直接跳过
+			if !buttonWasUp {
+				continue
+			}
+
+			// 消费本次按下事件（避免在按住拖拽过程中重复触发）
+			buttonWasUp = false
+
+			cursor := win.GetCursorPos()
+			var inRect bool
+			if hwnd != 0 {
+				if rect, err := win.GetWindowRect(hwnd); err == nil {
+					// 给予 10px 容差边缘，避免用户点击滚动条、阴影或拖拽边框时误判
+					rect.Left -= 10
+					rect.Top -= 10
+					rect.Right += 10
+					rect.Bottom += 10
+					inRect = rect.Contains(cursor)
+				}
+			}
+			if !inRect {
+				winX, winY := runtime.WindowGetPosition(a.ctx)
+				winW, winH := runtime.WindowGetSize(a.ctx)
+				rect := win.Rect{
+					Left:   int32(winX - 10),
+					Top:    int32(winY - 10),
+					Right:  int32(winX + winW + 10),
+					Bottom: int32(winY + winH + 10),
+				}
+				inRect = rect.Contains(cursor)
+			}
+
+			if !inRect {
+				log.Printf("monitorClickOutside: click outside detected at (%d, %d), closing result window", cursor.X, cursor.Y)
+				_ = a.Hide()
+				return
+			}
+		}
+	}
 }
 
 // Status implements uidaemon.Handler.
@@ -431,15 +530,23 @@ func (a *App) ShowResult(payload uidaemon.ResultPayload) error {
 	if !wasVisibleResult {
 		positionResultWindow(a.ctx)
 		runtime.WindowSetSize(a.ctx, 425, 300)
+		runtime.WindowUnminimise(a.ctx)
+		hwnd := win.FindWindowByTitle("选中翻译")
+		if hwnd != 0 {
+			win.ForceForegroundWindow(hwnd)
+		}
 	}
 	// Let the renderer show the window after DOM and icons have been committed;
 	// otherwise the acrylic shell can appear a frame before the actual content.
 	a.emitState()
+	a.startClickOutsideMonitor()
 	return nil
 }
 
 // Hide implements uidaemon.Handler.
 func (a *App) Hide() error {
+	a.stopClickOutsideMonitor()
+
 	if a.ctx == nil {
 		return nil
 	}
@@ -541,9 +648,10 @@ func (a *App) scheduleIdleExit() {
 	a.idleTimer = time.AfterFunc(idleFor, func() {
 		a.mu.Lock()
 		visible := a.visible
+		startupLoading := a.startupLoading
 		a.mu.Unlock()
-		if visible {
-			log.Printf("ui idle exit skipped: window visible again")
+		if visible || startupLoading {
+			log.Printf("ui idle exit skipped: window visible or startup loading in progress")
 			return
 		}
 		log.Printf("ui idle timeout reached (%s), exiting daemon", idleFor)

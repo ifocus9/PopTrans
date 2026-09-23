@@ -73,6 +73,9 @@ type App struct {
 	backendIdleUsers   int
 	backendIdleTimer   *time.Timer
 	backendIdleTimeout time.Duration
+
+	startupCancelMu sync.Mutex
+	startupCancel   context.CancelFunc
 }
 
 func New() (*App, error) {
@@ -169,6 +172,12 @@ func (a *App) ensureStartupUI() {
 
 func (a *App) Close() {
 	log.Printf("app close start")
+	a.startupCancelMu.Lock()
+	if a.startupCancel != nil {
+		a.startupCancel()
+	}
+	a.startupCancelMu.Unlock()
+
 	if a.overlay != nil {
 		a.overlay.Close()
 	}
@@ -244,6 +253,15 @@ func (a *App) ensureBackendReady() {
 	log.Printf("app ensure backend ready start")
 	ctx, cancel := context.WithTimeout(context.Background(), backend.StartupReadyTimeout)
 	defer cancel()
+
+	a.startupCancelMu.Lock()
+	a.startupCancel = cancel
+	a.startupCancelMu.Unlock()
+	defer func() {
+		a.startupCancelMu.Lock()
+		a.startupCancel = nil
+		a.startupCancelMu.Unlock()
+	}()
 
 	var health backend.Health
 	var healthErr error
@@ -613,12 +631,13 @@ func (a *App) reloadSettings() {
 	}
 	loggingChanged := next.LoggingEnabled != a.cfg.LoggingEnabled
 	portChanged := next.ServerPort != a.cfg.ServerPort
+	deviceChanged := next.AccelerationDevice != a.cfg.AccelerationDevice
 	if err := a.applySettings(next); err != nil {
 		log.Printf("app apply reloaded settings failed: %v", err)
 		a.pushError("", err.Error())
 		return
 	}
-	if loggingChanged || portChanged {
+	if loggingChanged || portChanged || deviceChanged {
 		go a.restartBackendForConfigChange(portChanged)
 	}
 }
