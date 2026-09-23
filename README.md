@@ -51,7 +51,7 @@
 - **依赖运行库**：需系统已安装 [WebView2 Runtime](https://developer.microsoft.com/zh-cn/microsoft-edge/webview2/) (Windows 11 通常自带)
 - **硬件要求**：
   - **基础模式 (CPU)**：纯 CPU 推理，无需独立显卡，建议 8GB 及以上内存。
-  - **显卡加速 (GPU)**：支持 NVIDIA 显卡 (CUDA)、AMD 显卡及 Intel 核显/独显 (Vulkan)。建议显存或共享显存 ≥ 2GB。
+  - **显卡加速 (GPU)**：支持 NVIDIA 独立显卡 (CUDA / Vulkan)、AMD 独显与核显 (Vulkan) 以及 Intel 核显与 Arc 独显 (Vulkan)。显存或共享显存只需 **≥ 2GB** 即可实现全量层卸载，速度提升 3~5 倍。详细说明请参阅 [显卡硬件加速 (GPU) 全面指南](#4-显卡硬件加速-gpu-全面指南与构建)。
 
 ### 下载与安装
 
@@ -232,6 +232,104 @@ python -m pip install -r backend/requirements-build.txt
 您也可以直接运行 `.\scripts\package_zip.bat`，脚本会自动读取 `CHANGELOG.md` 中最新的版本号，默认**排除 1.13GB 本地翻译大模型**，将核心程序（Go 宿主、UI 进程、AI 引擎及 RapidOCR）快速打包为仅约 120MB 的轻量发布包 `PopTrans-vX.Y.Z.zip`（若需带大模型的完整离线包，可执行 `.\scripts\package_zip.bat -IncludeModel`）。用户下载轻量包解压后首次运行会自动下载模型，非常适合极速分发与发布到 GitHub Releases。
 
 运行只需双击 `dist-go/PopTrans.exe`；系统需已安装 WebView2 Runtime。
+
+### 4. 显卡硬件加速 (GPU) 全面指南与构建
+
+PopTrans 基于 `llama.cpp` 底层推理引擎，支持利用显卡将整个大模型完整卸载（Offload）至显存进行推理，从而带来极低的延迟与 3~5 倍的速度飞跃。
+
+#### 4.1 支持哪些显卡
+
+系统支持 **Vulkan** 与 **CUDA** 两种显卡加速后端，覆盖市面上绝大部分消费级显卡、核显以及专业计算卡：
+
+| 加速后端 | 适用显卡品牌 / 架构 | 典型显卡型号示例 | 特性与优势 |
+| :--- | :--- | :--- | :--- |
+| **Vulkan 后端**<br>*(推荐通用版)* | **NVIDIA / AMD / Intel 全兼容** | • **NVIDIA**: GTX 900/10/16 系列、RTX 20/30/40/50 系列<br>• **AMD**: Radeon RX 400~8000 系列、各代 Ryzen APU 核显<br>• **Intel**: UHD 600+、Iris Xe 核显、Arc A/B 系列独显 | **跨厂商全兼容**，几乎所有现代 Windows 显卡驱动均自带 Vulkan 运行时，终端用户无需安装庞大的 CUDA Toolkit，最适合作为通用发布版本。 |
+| **CUDA 后端**<br>*(N卡高性能版)* | **NVIDIA 独立显卡专享**<br>(Maxwell / Pascal / Turing / Ampere / Ada Lovelace / Blackwell) | • **消费级**: GTX 10/16 系列、RTX 2060/3060/4060/4090/5090 等<br>• **专业/数据中心**: Tesla / Quadro / RTX A系列 / A100 / H100 等 | 针对 NVIDIA 架构深度优化，支持 Flash-Attention，在处理长文本或大批量连续翻译时具有更高的吞吐量与极低延迟。 |
+
+> **显存与硬件要求**：
+> - 本地大模型采用 4-bit 量化的腾讯 Hy-MT2-1.8B（`Hy-MT2-1.8B-Q4_K_M.gguf`），模型本体体积仅约 **1.13GB**。
+> - **显存或共享显存 ≥ 2GB** 即可实现模型全部网络层（`n_gpu_layers=-1`）完整卸载至 GPU。
+
+---
+
+#### 4.2 如何打包显卡支持版本
+
+打包显卡加速版本的关键在于：**在构建环境中安装支持 GPU 后端的 `llama-cpp-python` 运行库**。PyInstaller 打包配置（`ai_engine.spec`）会自动通过 `collect_dynamic_libs` 将对应的 GPU 加速动态链接库（`ggml-vulkan.dll`、`ggml-cuda.dll` 等）打包进独立的 `ai_engine.exe` 中，打包生成的发布包给最终用户使用时，**用户电脑无需安装 Python 或任何编译工具**。
+
+##### 方案 A：打包通用 Vulkan 显卡加速版（推荐首选，兼顾 N卡 / A卡 / Intel）
+
+1. **安装 Vulkan 版 llama-cpp-python**（需本地已配置 CMake 及 C++ 编译环境，如 Visual Studio Build Tools）：
+   ```powershell
+   # 启用 Vulkan 编译参数
+   set CMAKE_ARGS="-DGGML_VULKAN=on"
+   python -m pip install llama-cpp-python --force-reinstall --no-cache-dir
+   ```
+2. **验证 GPU 支持状态**：
+   ```powershell
+   python -c "import llama_cpp; print('GPU 卸载支持:', llama_cpp.llama_supports_gpu_offload())"
+   ```
+   > 若输出 `GPU 卸载支持: True`，即代表环境已就绪。
+3. **打包 GPU AI 引擎**：
+   ```powershell
+   .\scripts\build_ai_engine_gpu.bat
+   ```
+4. **组装并生成分发包**：
+   ```powershell
+   # 编译前端与 Go 主程序，组装至 dist-go/
+   .\scripts\build_wails.bat
+   .\scripts\build_go.bat
+   # 快速生成仅约 120MB 的免模型轻量发布 ZIP
+   .\scripts\package_zip.bat
+   ```
+
+##### 方案 B：打包 NVIDIA CUDA 专属高性能版
+
+若专门为使用 NVIDIA 独立显卡的用户制作极致性能发布包，可直接通过预编译 Wheel 安装（无需本地编译）：
+
+1. **从预编译源直接安装 CUDA 版 llama-cpp-python**（以 CUDA 12.4 为例，支持 RTX 20/30/40 及更新显卡）：
+   ```powershell
+   python -m pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 --force-reinstall --no-cache-dir
+   ```
+2. **执行打包**：
+   ```powershell
+   .\scripts\build_ai_engine_gpu.bat
+   .\scripts\package_zip.bat
+   ```
+   PyInstaller 会自动将 `llama_cpp` 内嵌的 CUDA 运行时依赖全量打包至 `ai_engine.exe`。
+
+---
+
+#### 4.3 如何支持更高级别的显卡与深度性能调优
+
+针对配备更高算力、更大显存的高端显卡（如 RTX 4080 / 4090 / 50 系列、专业工作站卡），可通过以下方式进一步提升性能与翻译质量：
+
+1. **启用 Flash-Attention (全量注意力计算加速)**
+   高端显卡（计算能力 Compute Capability ≥ 8.0，如 RTX 30/40/50 系列）原生支持 Flash-Attention 特性，可大幅削减长文本注意力矩阵计算耗时与显存带宽压力。编译时指定：
+   ```powershell
+   set CMAKE_ARGS="-DGGML_CUDA=on -DGGML_CUDA_FA_ALL=on"
+   python -m pip install llama-cpp-python --force-reinstall --no-cache-dir
+   ```
+2. **显式指定最新微架构的 CUDA 算力 (Compute Capability)**
+   针对最新发布的新架构显卡（例如 Ada Lovelace 架构对应 `89`，Blackwell 架构对应 `100/120`），若通用预编译 wheel 未覆盖该算力代码，可通过显式指定算力编译，让底层二进制指令与 GPU 硬件微架构完美契合：
+   ```powershell
+   set CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=89;90"
+   python -m pip install llama-cpp-python --force-reinstall --no-cache-dir
+   ```
+3. **更换更高精度的翻译大模型**
+   对于拥有 8GB / 16GB / 24GB 及以上显存的高端显卡，可在保证毫秒级推理速度的同时进一步追求顶级的翻译质量：
+   - 将默认的 4-bit 量化模型替换为 **Q8_0 (8-bit)** 或 **FP16 (半精度浮点)** 的 GGUF 模型文件。
+   - 放置于 `models/Hy-MT2-1.8B-GGUF/` 目录，引擎会自动加载并全量放入高端显存中运算。
+
+---
+
+#### 4.4 硬件调度策略与自动降级保障
+
+PopTrans 内置了高度鲁棒的硬件调度策略：
+- **用户硬件偏好设置**：在 [应用配置 (`settings.json`)](#应用配置-settingsjson) 或图形化设置界面中，可通过 `acceleration_device` 选项自由切换推理设备：
+  - `auto`（默认推荐）：启动时自动探测，如果检测到 GPU 卸载支持则优先启用显卡加速；
+  - `gpu`：强制优先走显卡加速；
+  - `cpu`：强制仅使用纯 CPU 推理，不占用任何显存与显卡算力。
+- **自动安全降级保障**：在尝试使用显卡加速加载模型时，若由于显存不足、驱动异常或 Vulkan/CUDA 运行库缺失导致加载失败，后台引擎会自动捕获异常并平滑降级至纯 CPU 模式（`n_gpu_layers=0`），并输出警告日志，**绝不会导致软件崩溃或无法启动**。
 
 ---
 
