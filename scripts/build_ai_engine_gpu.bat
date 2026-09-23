@@ -20,6 +20,8 @@ if errorlevel 1 (
     echo 若需启用 Vulkan GPU 加速，请先重新安装 GPU 版本的 llama-cpp-python:
     echo   set CMAKE_ARGS="-DGGML_VULKAN=on"
     echo   pip install llama-cpp-python --force-reinstall --no-cache-dir
+    echo.
+    pause
     popd
     exit /b 1
   )
@@ -29,11 +31,20 @@ if errorlevel 1 (
 )
 
 %PY_CMD% -c "import llama_cpp; print('[信息] llama_cpp 版本:', llama_cpp.__version__, '| GPU 卸载支持:', getattr(llama_cpp, 'llama_supports_gpu_offload', lambda: False)())"
+if errorlevel 1 (
+  echo 使用 %PY_CMD% 导入 llama_cpp 失败。
+  echo.
+  pause
+  popd
+  exit /b 1
+)
 
 echo [2/4] 打包 ai_engine.exe...
 %PY_CMD% -m PyInstaller --noconfirm --clean --distpath "%ROOT%\dist-ai" --workpath "%ROOT%\build-ai" "%ROOT%\backend\ai_engine.spec"
 if errorlevel 1 (
   echo AI 引擎打包失败。
+  echo.
+  pause
   popd
   exit /b 1
 )
@@ -42,6 +53,8 @@ echo [3/4] 复制外部 RapidOCR 模型...
 %PY_CMD% -c "from pathlib import Path; import shutil, rapidocr_onnxruntime; src=Path(rapidocr_onnxruntime.__file__).resolve().parent/'models'; dst=Path(r'%ROOT%\dist-go')/'models'/'rapidocr'; dst.mkdir(parents=True, exist_ok=True); [shutil.copy2(src/name, dst/name) for name in ('ch_PP-OCRv4_det_infer.onnx','ch_PP-OCRv4_rec_infer.onnx','ch_ppocr_mobile_v2.0_cls_infer.onnx')]"
 if errorlevel 1 (
   echo 复制 RapidOCR 模型失败。
+  echo.
+  pause
   popd
   exit /b 1
 )
@@ -51,6 +64,8 @@ if not exist "%ROOT%\dist-go" mkdir "%ROOT%\dist-go"
 copy /Y "%ROOT%\dist-ai\ai_engine.exe" "%ROOT%\dist-go\ai_engine.exe" >nul
 if errorlevel 1 (
   echo 复制 ai_engine.exe 失败。
+  echo.
+  pause
   popd
   exit /b 1
 )

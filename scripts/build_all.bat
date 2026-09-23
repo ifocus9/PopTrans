@@ -6,18 +6,24 @@ set "ROOT=%CD%"
 
 call "%~dp0build_wails.bat"
 if errorlevel 1 (
+  echo.
+  echo [build_all] Step 1/3 build_wails.bat failed - aborting.
   popd
   exit /b 1
 )
 
 call "%~dp0build_ai_engine.bat"
 if errorlevel 1 (
+  echo.
+  echo [build_all] Step 2/3 build_ai_engine.bat failed - aborting.
   popd
   exit /b 1
 )
 
 call "%~dp0build_go.bat"
 if errorlevel 1 (
+  echo.
+  echo [build_all] Step 3/3 build_go.bat failed - aborting.
   popd
   exit /b 1
 )
@@ -35,6 +41,8 @@ if exist "%ROOT%\dist-go\translate-wails.exe" del /Q "%ROOT%\dist-go\translate-w
 copy /Y "%ROOT%\build\bin\translate-ui.exe" "%ROOT%\dist-go\translate-ui.exe" >nul
 if errorlevel 1 (
   echo Failed to assemble Wails UI in dist-go.
+  echo.
+  pause
   popd
   exit /b 1
 )
@@ -45,6 +53,8 @@ for %%F in (
   copy /Y "%ROOT%\assets\%%F" "%ROOT%\dist-go\%%F" >nul
   if errorlevel 1 (
     echo Failed to copy %%F to dist-go.
+    echo.
+    pause
     popd
     exit /b 1
   )
@@ -57,6 +67,8 @@ if exist "%ROOT%\%MODEL_REL%" if not exist "%ROOT%\dist-go\%MODEL_REL%" (
   if errorlevel 1 copy /Y "%ROOT%\%MODEL_REL%" "%ROOT%\dist-go\%MODEL_REL%" >nul
   if errorlevel 1 (
     echo Failed to include the existing translation model.
+    echo.
+    pause
     popd
     exit /b 1
   )

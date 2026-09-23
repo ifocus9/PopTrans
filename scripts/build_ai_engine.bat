@@ -13,6 +13,8 @@ if errorlevel 1 (
   if errorlevel 1 (
     echo Missing AI engine build dependencies.
     echo Install them with: python -m pip install -r backend\requirements-build.txt
+    echo.
+    pause
     popd
     exit /b 1
   )
@@ -22,11 +24,20 @@ if errorlevel 1 (
 )
 
 %PY_CMD% -c "import llama_cpp; print('[Info] llama_cpp version:', llama_cpp.__version__, '| GPU offload supported:', getattr(llama_cpp, 'llama_supports_gpu_offload', lambda: False)())"
+if errorlevel 1 (
+  echo Failed to import llama_cpp with %PY_CMD%.
+  echo.
+  pause
+  popd
+  exit /b 1
+)
 
 echo [2/4] Building ai_engine.exe...
 %PY_CMD% -m PyInstaller --noconfirm --clean --distpath "%ROOT%\dist-ai" --workpath "%ROOT%\build-ai" "%ROOT%\backend\ai_engine.spec"
 if errorlevel 1 (
   echo AI engine build failed.
+  echo.
+  pause
   popd
   exit /b 1
 )
@@ -35,6 +46,8 @@ echo [3/4] Copying external RapidOCR models...
 %PY_CMD% -c "from pathlib import Path; import shutil, rapidocr_onnxruntime; src=Path(rapidocr_onnxruntime.__file__).resolve().parent/'models'; dst=Path(r'%ROOT%\dist-go')/'models'/'rapidocr'; dst.mkdir(parents=True, exist_ok=True); [shutil.copy2(src/name, dst/name) for name in ('ch_PP-OCRv4_det_infer.onnx','ch_PP-OCRv4_rec_infer.onnx','ch_ppocr_mobile_v2.0_cls_infer.onnx')]"
 if errorlevel 1 (
   echo Failed to copy RapidOCR models.
+  echo.
+  pause
   popd
   exit /b 1
 )
@@ -44,6 +57,8 @@ if not exist "%ROOT%\dist-go" mkdir "%ROOT%\dist-go"
 copy /Y "%ROOT%\dist-ai\ai_engine.exe" "%ROOT%\dist-go\ai_engine.exe" >nul
 if errorlevel 1 (
   echo Failed to copy ai_engine.exe to dist-go.
+  echo.
+  pause
   popd
   exit /b 1
 )

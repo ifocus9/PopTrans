@@ -21,12 +21,17 @@ echo [1/3] Installing the Wails build tool...
 for /f "usebackq delims=" %%V in (`go list -m -f "{{.Version}}" github.com/wailsapp/wails/v2`) do set WAILS_VERSION=%%V
 if not defined WAILS_VERSION (
   echo Unable to determine the Wails version from go.mod.
+  echo Make sure Go is installed and "go" is available on PATH.
+  echo.
+  pause
   popd
   exit /b 1
 )
 go install github.com/wailsapp/wails/v2/cmd/wails@%WAILS_VERSION%
 if errorlevel 1 (
   echo Wails tool installation failed.
+  echo.
+  pause
   popd
   exit /b 1
 )
@@ -36,6 +41,8 @@ if not exist "%ROOT%\build\windows" mkdir "%ROOT%\build\windows"
 copy /Y "%ROOT%\assets\icon.ico" "%ROOT%\build\windows\icon.ico" >nul
 if errorlevel 1 (
   echo Failed to prepare the Wails application icon.
+  echo.
+  pause
   popd
   exit /b 1
 )
@@ -45,6 +52,8 @@ echo [2/3] Building Wails UI...
 if errorlevel 1 (
   echo.
   echo Wails build failed.
+  echo.
+  pause
   popd
   exit /b 1
 )

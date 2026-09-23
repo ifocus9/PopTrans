@@ -17,6 +17,9 @@ go run .\tools\winres -icon "%ROOT%\assets\icon.ico" -output "%RESOURCE_FILE%" -
 if errorlevel 1 (
   echo.
   echo Icon resource generation failed.
+  echo Make sure Go is installed and "go" is available on PATH.
+  echo.
+  pause
   popd
   exit /b 1
 )
@@ -28,6 +31,8 @@ if errorlevel 1 (
   del /Q "%RESOURCE_FILE%" >nul 2>nul
   echo.
   echo Build failed.
+  echo.
+  pause
   popd
   exit /b 1
 )
