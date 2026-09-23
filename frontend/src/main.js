@@ -1108,6 +1108,16 @@ function parseProgress(status) {
   return null
 }
 
+function isDownloadingModel(status) {
+  if (!status || typeof status !== "string") return false
+  if (status.includes("下载完成")) return false
+  return (
+    status.includes("下载") ||
+    status.includes("官网") ||
+    parseProgress(status) !== null
+  )
+}
+
 function renderStartup() {
   const isMain =
     (state.mode === "settings" || state.mode === "translate") &&
@@ -1128,15 +1138,16 @@ function renderStartup() {
   const status = state.startup_status || "正在加载翻译模型..."
   const error = state.startup_error
   const progress = parseProgress(status)
+  const isDownloading = isDownloadingModel(status)
 
   app.innerHTML = `
     <main class="startup-shell" role="status" aria-live="polite">
       <header class="startup-header" style="--wails-draggable: drag;">
         <div class="startup-brand">
           <div class="brand-mark" aria-hidden="true"><i data-lucide="languages"></i></div>
-          <span class="startup-title">PopTrans · 模型准备</span>
+          <span class="startup-title">${isDownloading ? "PopTrans · 模型准备" : "PopTrans · 正在启动"}</span>
         </div>
-        <button class="startup-close-btn" id="startupDismissBtn" type="button" title="最小化到托盘后台下载" aria-label="最小化到托盘后台下载">
+        <button class="startup-close-btn" id="startupDismissBtn" type="button" title="${isDownloading ? "最小化到托盘后台下载" : "最小化到托盘"}" aria-label="${isDownloading ? "最小化到托盘后台下载" : "最小化到托盘"}">
           <i data-lucide="x"></i>
         </button>
       </header>
@@ -1146,6 +1157,9 @@ function renderStartup() {
         <div class="startup-progress" aria-hidden="true">
           <span ${progress !== null ? `style="width: ${progress}%; animation: none;"` : ""}></span>
         </div>
+        ${
+          isDownloading
+            ? `
         <div class="startup-actions">
           <button class="startup-bg-btn" id="startupBgBtn" type="button" title="转入后台静默下载">
             <i data-lucide="sparkles"></i>
@@ -1153,6 +1167,9 @@ function renderStartup() {
           </button>
           <p class="startup-hint">首次启动需下载模型，可隐藏窗口后台运行</p>
         </div>
+        `
+            : ""
+        }
       </div>
     </main>
   `
