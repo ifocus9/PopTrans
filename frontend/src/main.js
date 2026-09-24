@@ -21,6 +21,7 @@ import {
   Trash2,
   X,
   Zap,
+  Power,
 } from "lucide"
 import {
   HideWindow,
@@ -61,6 +62,7 @@ const icons = {
   Trash2,
   X,
   Zap,
+  Power,
 }
 const systemTheme = window.matchMedia("(prefers-color-scheme: dark)")
 let healthTimer
@@ -93,6 +95,7 @@ let state = {
     theme: "system",
     acceleration_device: "auto",
     ai_idle_minutes: 15,
+    launch_at_login: false,
   },
   health: {},
   manualTranslate: {
@@ -835,6 +838,23 @@ function renderSettingsViewHTML() {
 
       <div class="section-rule"></div>
 
+      <section class="settings-section" aria-labelledby="launchHeading">
+        <div class="section-heading with-toggle">
+          <div class="section-icon"><i data-lucide="power"></i></div>
+          <div>
+            <h2 id="launchHeading">开机启动</h2>
+            <p>登录 Windows 后自动在后台启动</p>
+          </div>
+          <label class="switch" title="开机启动">
+            <input id="launchAtLogin" type="checkbox" ${state.config.launch_at_login ? "checked" : ""} />
+            <span class="switch-track"><span class="switch-thumb"></span></span>
+            <span class="sr-only">开机启动</span>
+          </label>
+        </div>
+      </section>
+
+      <div class="section-rule"></div>
+
       <section class="settings-section" aria-labelledby="aiIdleHeading">
         <div class="section-heading">
           <div class="section-icon"><i data-lucide="languages"></i></div>
@@ -1069,6 +1089,9 @@ async function saveSettings() {
     ocr_hotkey_display: normalizeDisplay(ocrHotkeyDisplay),
     logging_enabled: Boolean(
       document.querySelector("#loggingEnabled")?.checked,
+    ),
+    launch_at_login: Boolean(
+      document.querySelector("#launchAtLogin")?.checked,
     ),
     server_port: serverPort,
     ai_idle_minutes: aiIdleMinutes,

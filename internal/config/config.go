@@ -34,6 +34,9 @@ type Config struct {
 	// AIIdleMinutes is how long the AI backend stays alive after its last request.
 	// 0 means never auto-exit. Missing values fall back to DefaultAIIdleMinutes.
 	AIIdleMinutes int `json:"ai_idle_minutes"`
+	// LaunchAtLogin enables starting the app automatically when the user logs in.
+	// The host process writes its own executable path to the HKCU Run key.
+	LaunchAtLogin bool `json:"launch_at_login"`
 }
 
 var Default = Config{
@@ -48,6 +51,7 @@ var Default = Config{
 	AccelerationDevice: "auto",
 	UIIdleMinutes:      DefaultUIIdleMinutes,
 	AIIdleMinutes:      DefaultAIIdleMinutes,
+	LaunchAtLogin:      false,
 }
 
 func ResolveBaseDir() string {

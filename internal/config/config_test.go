@@ -294,3 +294,47 @@ func TestInvalidAccelerationDeviceFallsBackToAuto(t *testing.T) {
 	}
 }
 
+func TestLaunchAtLoginDefaultsToDisabled(t *testing.T) {
+	cfg, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LaunchAtLogin {
+		t.Fatal("launch_at_login should default to false")
+	}
+}
+
+func TestLaunchAtLoginRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Default
+	cfg.LaunchAtLogin = true
+	if err := Save(dir, cfg); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.LaunchAtLogin {
+		t.Fatal("launch_at_login was not persisted")
+	}
+}
+
+func TestLaunchAtLoginMissingUsesDefault(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(dir, "settings.json"),
+		[]byte(`{"theme":"system"}`),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.LaunchAtLogin {
+		t.Fatal("legacy settings should not enable launch_at_login")
+	}
+}
+

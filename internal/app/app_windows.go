@@ -59,6 +59,10 @@ type App struct {
 	overlay          *SelectionOverlay
 	ui               *uidaemon.Manager
 	hotkeysSuspended bool
+	// autostart marks a login-triggered launch (--autostart): warm the AI
+	// engine in the background but skip the startup UI window so the process
+	// only appears in the tray.
+	autostart bool
 
 	statusMu sync.Mutex
 	status   string
@@ -103,6 +107,7 @@ func New() (*App, error) {
 		supervisor:         backend.NewSupervisor(baseDir, client),
 		status:             "正在初始化...",
 		backendIdleTimeout: cfg.AIIdleTimeout(),
+		autostart:          hasArg("--autostart"),
 	}
 	app.ui = uidaemon.NewManager(baseDir, app.resolveWailsExe, app.handleUIDaemonEvent)
 	return app, nil
@@ -141,6 +146,12 @@ func (a *App) Run() error {
 	}
 	log.Printf("app tray icon added")
 
+	// 按配置校准开机自启动注册表项：开启时保证 Run 键指向当前 exe（安装
+	// 目录移动也能自动修正路径），关闭时清除残留项。
+	if err := a.syncLaunchAtLogin(); err != nil {
+		log.Printf("app sync launch at login failed: %v", err)
+	}
+
 	if err := a.registerHotkeys(); err != nil {
 		log.Printf("app register hotkeys failed: %v", err)
 		win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
@@ -154,7 +165,11 @@ func (a *App) Run() error {
 	// Start the Wails UI immediately so the user sees model download/load
 	// progress during application startup. The UI daemon owns only the loading
 	// window here; it hides itself once the backend reports translator_ready.
-	go a.ensureStartupUI()
+	// Login autostart skips the UI entirely: the daemon is started on demand
+	// by the first tray/hotkey action, so boot only fills the tray.
+	if !a.autostart {
+		go a.ensureStartupUI()
+	}
 	go a.ensureBackendReady()
 
 	_, err = win.MessageLoop()
@@ -645,6 +660,7 @@ func (a *App) reloadSettings() {
 func (a *App) applySettings(next config.Config) error {
 	prev := a.cfg
 	keepSuspended := a.hotkeysSuspended
+	launchChanged := next.LaunchAtLogin != prev.LaunchAtLogin
 	win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
 	win.UnregisterHotKey(a.hwnd, hotkeyOCR)
 
@@ -676,6 +692,22 @@ func (a *App) applySettings(next config.Config) error {
 		return err
 	}
 
+	if launchChanged {
+		if err := a.syncLaunchAtLogin(); err != nil {
+			log.Printf("app set launch at login failed, restoring previous config: %v", err)
+			win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
+			win.UnregisterHotKey(a.hwnd, hotkeyOCR)
+			a.cfg = prev
+			_ = a.registerHotkeys()
+			if keepSuspended {
+				win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
+				win.UnregisterHotKey(a.hwnd, hotkeyOCR)
+			}
+			_ = config.Save(a.baseDir, prev)
+			return fmt.Errorf("设置开机启动失败: %w", err)
+		}
+	}
+
 	if keepSuspended {
 		win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
 		win.UnregisterHotKey(a.hwnd, hotkeyOCR)
@@ -683,6 +715,25 @@ func (a *App) applySettings(next config.Config) error {
 	_ = applog.Configure(filepath.Join(a.baseDir, "translate.log"), a.cfg.LoggingEnabled)
 	a.setBackendIdleTimeout(a.cfg.AIIdleTimeout())
 	a.setStatus("设置已保存")
+	return nil
+}
+
+// syncLaunchAtLogin writes or clears the HKCU Run entry so the app launches at
+// login, according to the current config. The host process path (os.Executable)
+// is used so the entry tracks the install location across directory moves.
+func (a *App) syncLaunchAtLogin() error {
+	exePath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("get executable path: %w", err)
+	}
+	if err := win.SetLaunchAtLogin("PopTrans", exePath, a.cfg.LaunchAtLogin); err != nil {
+		return err
+	}
+	if a.cfg.LaunchAtLogin {
+		log.Printf("app launch at login enabled: path=%s", exePath)
+	} else {
+		log.Printf("app launch at login disabled/cleared")
+	}
 	return nil
 }
 
@@ -1021,4 +1072,13 @@ func previewText(text string, limit int) string {
 		return text
 	}
 	return text[:limit] + "..."
+}
+
+func hasArg(name string) bool {
+	for _, arg := range os.Args[1:] {
+		if arg == name {
+			return true
+		}
+	}
+	return false
 }

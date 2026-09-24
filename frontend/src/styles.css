@@ -849,6 +849,16 @@ p {
   scrollbar-width: thin;
 }
 
+/*
+ * 把设置页滚动容器提升为独立合成层。WebView2(DirectComposition + 透明窗口,
+ * 125% DPI)下,开关 thumb 的 transform 过渡会触发局部失效重绘,可能把滚动
+ * 容器下方已滚出视口的瓦片置成未绘制状态(内容占位但显示空白,滚动条高度
+ * 不变)。独立层后,开关重绘与内容光栅化互不影响。
+ */
+.settings-content {
+  transform: translateZ(0);
+}
+
 .settings-section {
   max-width: none;
 }
