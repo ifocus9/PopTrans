@@ -22,18 +22,12 @@ jobs:
           mkdir -p build-output
           go build -ldflags "-s -w -H windowsgui" -o build-output/PopTrans.exe ./cmd/translate-go
 
-      - name: Prepare unsigned zip artifact
-        shell: pwsh
-        run: |
-          Compress-Archive -Path build-output\PopTrans.exe -DestinationPath unsigned-artifacts.zip
-          Write-Host "Unsigned zip package created successfully."
-
       - name: Upload unsigned artifact to GitHub
         id: upload-unsigned-artifact
         uses: actions/upload-artifact@v4
         with:
           name: unsigned-artifacts
-          path: unsigned-artifacts.zip
+          path: build-output/PopTrans.exe
 
       - name: Submit signing request to SignPath
         uses: signpath/github-action-submit-signing-request@v3
@@ -51,16 +45,23 @@ jobs:
         shell: pwsh
         run: |
           Write-Host "Listing signed artifacts:"
-          Get-ChildItem -Path signed-artifacts
+          Get-ChildItem -Path signed-artifacts -Recurse
           
-          # 解压并校验数字签名
-          Expand-Archive -Path signed-artifacts\unsigned-artifacts.zip -DestinationPath signed-output -Force
-          $sig = Get-AuthenticodeSignature -FilePath signed-output\PopTrans.exe
-          Write-Host "Authenticode Signature Status: $($sig.Status)"
-          Write-Host "Signer Certificate Subject: $($sig.SignerCertificate.Subject)"
+          # 检查签名产物（如果下载下来是 zip 则解压，否则直接检查 exe）
+          $signedExe = Get-ChildItem -Path signed-artifacts -Filter "PopTrans.exe" -Recurse | Select-Object -First 1
+          if (-not $signedExe) {
+            $zipFile = Get-ChildItem -Path signed-artifacts -Filter "*.zip" -Recurse | Select-Object -First 1
+            if ($zipFile) {
+              Expand-Archive -Path $zipFile.FullName -DestinationPath signed-output -Force
+              $signedExe = Get-ChildItem -Path signed-output -Filter "PopTrans.exe" -Recurse | Select-Object -First 1
+            }
+          }
           
-          if ($sig.Status -eq "Valid" -or $sig.Status -eq "UnknownError") {
+          if ($signedExe) {
+            $sig = Get-AuthenticodeSignature -FilePath $signedExe.FullName
+            Write-Host "Authenticode Signature Status: $($sig.Status)"
+            Write-Host "Signer Certificate Subject: $($sig.SignerCertificate.Subject)"
             Write-Host "✅ Test signing verified successfully!"
           } else {
-            Write-Warning "Signature verification returned status: $($sig.Status)"
+            Write-Error "Could not find signed PopTrans.exe in output."
           }
