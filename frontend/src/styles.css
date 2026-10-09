@@ -2035,6 +2035,82 @@ p {
   border-color: #b6e3ff;
 }
 
+/* Light Theme for Startup Window */
+:root[data-theme="light"] .startup-shell {
+  color: #25232b;
+  border-color: #c8cbd5;
+  background:
+    radial-gradient(
+      circle at 50% 15%,
+      rgba(101, 75, 216, 0.1),
+      transparent 50%
+    ),
+    linear-gradient(145deg, #ffffff, #f4f5f9);
+  box-shadow: 0 12px 36px rgba(35, 30, 55, 0.14), inset 0 1px 0 #ffffff;
+}
+
+:root[data-theme="light"] .startup-header,
+:root[data-theme="light"] .startup-titlebar {
+  border-bottom-color: #dcdee6;
+  background: rgba(247, 247, 250, 0.7);
+}
+
+:root[data-theme="light"] .startup-brand .brand-mark {
+  color: var(--accent);
+}
+
+:root[data-theme="light"] .startup-title {
+  color: #25232b;
+}
+
+:root[data-theme="light"] .startup-close-btn {
+  color: #6f6b78;
+}
+
+:root[data-theme="light"] .startup-close-btn:hover {
+  color: #25232b;
+  border-color: rgba(60, 55, 70, 0.12);
+  background: rgba(60, 55, 70, 0.06);
+}
+
+:root[data-theme="light"] .startup-status {
+  color: #43404c;
+}
+
+:root[data-theme="light"] .startup-error {
+  color: #c93b3b;
+}
+
+:root[data-theme="light"] .startup-progress {
+  background: rgba(60, 55, 70, 0.1);
+}
+
+:root[data-theme="light"] .startup-progress span {
+  background: linear-gradient(90deg, #654bd8, #287bbd);
+}
+
+:root[data-theme="light"] .startup-bg-btn {
+  color: #383442;
+  border-color: #cbced8;
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+}
+
+:root[data-theme="light"] .startup-bg-btn svg {
+  color: #654bd8;
+}
+
+:root[data-theme="light"] .startup-bg-btn:hover {
+  color: #1b1920;
+  border-color: #b0b4c3;
+  background: #ffffff;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
+}
+
+:root[data-theme="light"] .startup-hint {
+  color: #7b7785;
+}
+
 @media (max-width: 480px) {
   .app-header,
   .settings-content,

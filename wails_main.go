@@ -28,15 +28,30 @@ func main() {
 
 	daemonMode := hasArg(os.Args, "--daemon")
 	background := &options.RGBA{A: 0}
+
+	cfg, err := config.Load(baseDir)
+	if err != nil {
+		cfg = config.Default
+	}
+	winTheme := wailswindows.SystemDefault
+	switch cfg.Theme {
+	case "light":
+		winTheme = wailswindows.Light
+	case "dark":
+		winTheme = wailswindows.Dark
+	default:
+		winTheme = wailswindows.SystemDefault
+	}
+
 	windowsOptions := &wailswindows.Options{
-		Theme:                wailswindows.Dark,
+		Theme:                winTheme,
 		WebviewIsTransparent: true,
 		WindowIsTranslucent:  true,
 		BackdropType:         wailswindows.Acrylic,
 	}
 	app := wailsui.NewApp(baseDir, os.Args)
 
-	err := wails.Run(&options.App{
+	err = wails.Run(&options.App{
 		Title:         "选中翻译",
 		Width:         458,
 		Height:        640,

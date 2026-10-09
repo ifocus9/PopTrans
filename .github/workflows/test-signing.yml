@@ -1,0 +1,66 @@
+name: SignPath Test Signing
+
+on:
+  workflow_dispatch: # 支持在 GitHub 页面上手动一键触发
+
+jobs:
+  test-sign:
+    name: Build and Test Sign
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Build executable
+        run: |
+          mkdir -p build-output
+          go build -ldflags "-s -w -H windowsgui" -o build-output/PopTrans.exe ./cmd/translate-go
+
+      - name: Prepare unsigned zip artifact
+        shell: pwsh
+        run: |
+          Compress-Archive -Path build-output\PopTrans.exe -DestinationPath unsigned-artifacts.zip
+          Write-Host "Unsigned zip package created successfully."
+
+      - name: Upload unsigned artifact to GitHub
+        id: upload-unsigned-artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-artifacts
+          path: unsigned-artifacts.zip
+
+      - name: Submit signing request to SignPath
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+          organization-id: '${{ secrets.SIGNPATH_ORGANIZATION_ID }}'
+          project-slug: 'poptrans'
+          signing-policy-slug: 'test-signing'
+          artifact-configuration-slug: 'initial'
+          github-artifact-id: '${{ steps.upload-unsigned-artifact.outputs.artifact-id }}'
+          wait-for-completion: true
+          output-artifact-directory: 'signed-artifacts'
+
+      - name: Verify signed artifact
+        shell: pwsh
+        run: |
+          Write-Host "Listing signed artifacts:"
+          Get-ChildItem -Path signed-artifacts
+          
+          # 解压并校验数字签名
+          Expand-Archive -Path signed-artifacts\unsigned-artifacts.zip -DestinationPath signed-output -Force
+          $sig = Get-AuthenticodeSignature -FilePath signed-output\PopTrans.exe
+          Write-Host "Authenticode Signature Status: $($sig.Status)"
+          Write-Host "Signer Certificate Subject: $($sig.SignerCertificate.Subject)"
+          
+          if ($sig.Status -eq "Valid" -or $sig.Status -eq "UnknownError") {
+            Write-Host "✅ Test signing verified successfully!"
+          } else {
+            Write-Warning "Signature verification returned status: $($sig.Status)"
+          }

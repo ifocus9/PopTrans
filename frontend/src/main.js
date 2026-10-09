@@ -71,6 +71,16 @@ let lastResultHeight = 0
 let windowShown = false
 let unbindStateEvent = null
 let activeTheme = "system"
+try {
+  const cachedTheme = localStorage.getItem("poptrans_theme")
+  if (cachedTheme && ["light", "dark", "system"].includes(cachedTheme)) {
+    activeTheme = cachedTheme
+  }
+} catch {
+  // ignore
+}
+applyTheme(activeTheme)
+
 let startupWindowSized = false
 let mainWindowSized = false
 let startupDismissed = false
@@ -995,6 +1005,12 @@ function applyTheme(theme = "system") {
 
   document.documentElement.dataset.theme = resolved
   document.documentElement.style.colorScheme = resolved
+
+  try {
+    localStorage.setItem("poptrans_theme", selected)
+  } catch {
+    // ignore
+  }
 
   if (!window.runtime) return
   if (selected === "light") WindowSetLightTheme()
