@@ -661,25 +661,31 @@ func GetFocusHWND() HWND {
 //	这里改为：先把本线程输入附加到前台窗口所在线程并尽力置前，清理可能残留的修饰键，
 //	再注入干净的 Ctrl+C。具体的“偶发丢弃”由 CaptureSelectedText 在超时窗口内多次重试来兜底。
 func sendCtrlC(foregroundHWND HWND) {
-	var attached bool
+	// attach 时立即记住目标线程 ID，detach 必须对同一个线程做。
+	// 旧实现 detach 前重新从前台 HWND 反查线程，若期间前台窗口被销毁/复用，
+	// 会 detach 到错误线程、遗留与 Chrome 输入队列的 attach 关系；
+	// 同时 detach 失败原来被静默忽略（_ = AttachThreadInput），这里改为记录日志，
+	// 便于事后从 translate.log 定位“卡死”与遗留 attach 的关联。
+	selfThread := GetCurrentThreadId()
+	var attachedTo uint32
 	if foregroundHWND != 0 {
 		fgThread, _ := GetWindowThreadProcessId(foregroundHWND)
-		selfThread := GetCurrentThreadId()
 		if fgThread != 0 && fgThread != selfThread {
 			if err := AttachThreadInput(fgThread, selfThread, true); err == nil {
-				attached = true
+				attachedTo = fgThread
 			} else {
-				log.Printf("sendCtrlC: attach thread input failed: %v", err)
+				log.Printf("sendCtrlC: attach thread input failed: target=%d self=%d err=%v", fgThread, selfThread, err)
 			}
 		}
 		// 尽力把前台窗口带回前台；浏览器复制选区通常要求它持有前台/焦点。
 		SetForegroundWindow(foregroundHWND)
 		time.Sleep(20 * time.Millisecond)
 	}
-	if attached {
+	if attachedTo != 0 {
 		defer func() {
-			fgThread, _ := GetWindowThreadProcessId(foregroundHWND)
-			_ = AttachThreadInput(fgThread, GetCurrentThreadId(), false)
+			if err := AttachThreadInput(attachedTo, selfThread, false); err != nil {
+				log.Printf("sendCtrlC: detach thread input failed: target=%d self=%d err=%v", attachedTo, selfThread, err)
+			}
 		}()
 	}
 

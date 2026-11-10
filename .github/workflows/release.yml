@@ -1,0 +1,135 @@
+name: Build, Sign and Release
+
+on:
+  push:
+    tags:
+      - 'v*' # 触发规则：当推送版本标签（如 v1.5.0）时自动运行
+  workflow_dispatch: # 支持在 GitHub 网页上手动点击运行
+
+permissions:
+  contents: write # 授予自动创建和上传 GitHub Release 的权限
+
+jobs:
+  build-sign-release:
+    name: Build, Sign & Release PopTrans
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 1. 环境准备
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements-build.txt
+
+      # 2. 编译各核心模块
+      - name: Build Wails UI (translate-ui.exe)
+        shell: pwsh
+        run: |
+          go install github.com/wailsapp/wails/v2/cmd/wails@v2.13.0
+          if (-not (Test-Path "build\windows")) { New-Item -ItemType Directory -Path "build\windows" -Force }
+          Copy-Item "assets\icon.ico" "build\windows\icon.ico" -Force
+          wails build -clean
+
+      - name: Build AI Engine (ai_engine.exe)
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --distpath "dist-ai" --workpath "build-ai" "backend/ai_engine.spec"
+          # 导出 RapidOCR 内置模型到发布目录
+          if (-not (Test-Path "dist-go\models\rapidocr")) { New-Item -ItemType Directory -Path "dist-go\models\rapidocr" -Force }
+          python -c "from pathlib import Path; import shutil, rapidocr_onnxruntime; src=Path(rapidocr_onnxruntime.__file__).resolve().parent/'models'; dst=Path('dist-go')/'models'/'rapidocr'; [shutil.copy2(src/name, dst/name) for name in ('ch_PP-OCRv4_det_infer.onnx','ch_PP-OCRv4_rec_infer.onnx','ch_ppocr_mobile_v2.0_cls_infer.onnx')]"
+
+      - name: Build Go Host Core (PopTrans.exe)
+        shell: pwsh
+        run: |
+          go run ./tools/winres -icon "assets/icon.ico" -output "cmd/translate-go/translate-go-res.syso" -arch amd64
+          if (-not (Test-Path "dist-go")) { New-Item -ItemType Directory -Path "dist-go" -Force }
+          go build -ldflags "-s -w -H windowsgui" -o "dist-go/PopTrans.exe" ./cmd/translate-go
+          if (Test-Path "cmd/translate-go/translate-go-res.syso") { Remove-Item "cmd/translate-go/translate-go-res.syso" -Force }
+
+      # 3. 组装待签名的二进制文件集合
+      - name: Prepare Binaries for Code Signing
+        shell: pwsh
+        run: |
+          Copy-Item "build\bin\translate-ui.exe" "dist-go\translate-ui.exe" -Force
+          Copy-Item "dist-ai\ai_engine.exe" "dist-go\ai_engine.exe" -Force
+          Copy-Item "assets\icon.ico" "dist-go\icon.ico" -Force
+          if (-not (Test-Path "dist-go\models\Hy-MT2-1.8B-GGUF")) { New-Item -ItemType Directory -Path "dist-go\models\Hy-MT2-1.8B-GGUF" -Force }
+          
+          # 创建准备提交给 SignPath 签名的目录
+          New-Item -ItemType Directory -Path "binaries-to-sign" -Force
+          Copy-Item "dist-go\PopTrans.exe" "binaries-to-sign\"
+          Copy-Item "dist-go\translate-ui.exe" "binaries-to-sign\"
+          Copy-Item "dist-go\ai_engine.exe" "binaries-to-sign\"
+
+      - name: Upload unsigned binaries to GitHub
+        id: upload-unsigned-binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-binaries
+          path: binaries-to-sign/*
+
+      # 4. 提交 SignPath 代码签名
+      - name: Submit signing request to SignPath
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+          organization-id: '${{ secrets.SIGNPATH_ORGANIZATION_ID }}'
+          project-slug: 'poptrans'
+          # 注意：在 SignPath 官方正式证书下发前为 'test-signing'，正式证书导入后修改为 'release-signing'
+          signing-policy-slug: 'test-signing'
+          artifact-configuration-slug: 'initial'
+          github-artifact-id: '${{ steps.upload-unsigned-binaries.outputs.artifact-id }}'
+          wait-for-completion: true
+          output-artifact-directory: 'signed-binaries'
+
+      # 5. 替换已签名的二进制文件并打包完整发行包
+      - name: Package Final Signed Release
+        shell: pwsh
+        run: |
+          Write-Host "Replacing signed executables in dist-go..."
+          $zipFile = Get-ChildItem -Path signed-binaries -Filter "*.zip" -Recurse | Select-Object -First 1
+          if ($zipFile) {
+            Expand-Archive -Path $zipFile.FullName -DestinationPath signed-extracted -Force
+            Copy-Item -Path signed-extracted\*.exe -Destination dist-go\ -Force
+          } else {
+            Copy-Item -Path signed-binaries\*.exe -Destination dist-go\ -Force
+          }
+
+          # 验证签名状态
+          Get-ChildItem -Path dist-go\*.exe | ForEach-Object {
+            $sig = Get-AuthenticodeSignature -FilePath $_.FullName
+            Write-Host "[$($_.Name)] Signature Status: $($sig.Status) | Signer: $($sig.SignerCertificate.Subject)"
+          }
+
+          # 调用现有发布打包脚本
+          & .\scripts\package_zip.ps1 -DistDir "dist-go"
+
+      # 6. 自动创建并发布 GitHub Release
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          files: PopTrans-*.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
