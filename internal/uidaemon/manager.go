@@ -12,6 +12,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	win "translate-plugin/internal/platform/windows"
 )
 
 const (
@@ -285,9 +287,9 @@ func (m *Manager) killStaleDaemon() {
 }
 
 func (m *Manager) startProcess(ctx context.Context) error {
-	exePath := m.resolveUI()
-	if exePath == "" {
-		return errors.New("translate-ui.exe not found")
+	exePath, err := win.TrustedExecutable(m.resolveUI(), "translate-ui.exe")
+	if err != nil {
+		return err
 	}
 
 	m.mu.Lock()
@@ -299,13 +301,16 @@ func (m *Manager) startProcess(ctx context.Context) error {
 	}
 
 	RemoveEndpoint(m.endpointDir)
-	cmd := exec.Command(
+	// Arguments are passed as a fixed argv list (never through a shell); the
+	// executable itself was validated against the bundled UI binary name.
+	args := []string{
 		exePath,
 		"--daemon",
 		"--callback-url", callbackURL,
 		"--callback-token", callbackTok,
-	)
-	cmd.Args = append(cmd.Args, m.extraArgs...)
+	}
+	args = append(args, m.extraArgs...)
+	cmd := &exec.Cmd{Path: exePath, Args: args}
 	cmd.Dir = filepath.Dir(exePath)
 	// The extracted UI lives in <baseDir>/runtime; it must still read settings
 	// and models from the real application directory.
