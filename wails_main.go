@@ -27,6 +27,11 @@ func main() {
 	configureWailsLogging(baseDir)
 
 	daemonMode := hasArg(os.Args, "--daemon")
+	overlayMode := hasArg(os.Args, "--overlay")
+	windowTitle := "选中翻译"
+	if overlayMode {
+		windowTitle = "选中翻译浮层"
+	}
 	background := &options.RGBA{A: 0}
 
 	cfg, err := config.Load(baseDir)
@@ -49,16 +54,28 @@ func main() {
 		WindowIsTranslucent:  true,
 		BackdropType:         wailswindows.Acrylic,
 	}
+	if overlayMode {
+		// Overlay/live windows get their shape from a window region computed by
+		// the page, so everything outside the toolbar and chips is see-through
+		// and click-through without acrylic blur or layered-color-key limits.
+		background = &options.RGBA{R: 0, G: 0, B: 0, A: 255}
+		windowsOptions = &wailswindows.Options{
+			Theme:                winTheme,
+			WebviewIsTransparent: true,
+			WindowIsTranslucent:  false,
+			BackdropType:         wailswindows.None,
+		}
+	}
 	app := wailsui.NewApp(baseDir, os.Args)
 
 	err = wails.Run(&options.App{
-		Title:         "选中翻译",
+		Title:         windowTitle,
 		Width:         458,
 		Height:        640,
 		StartHidden:   true,
 		DisableResize: true,
 		Frameless:     true,
-		AlwaysOnTop:   false,
+		AlwaysOnTop:   overlayMode,
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},

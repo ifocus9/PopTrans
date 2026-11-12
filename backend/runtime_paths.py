@@ -6,6 +6,11 @@ from pathlib import Path
 
 
 def application_dir() -> Path:
+    # The single-exe host extracts the engine into <baseDir>/runtime and passes
+    # the real application directory down through the environment.
+    override = os.environ.get("POPTRANS_BASE_DIR", "").strip()
+    if override:
+        return Path(override).resolve()
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent

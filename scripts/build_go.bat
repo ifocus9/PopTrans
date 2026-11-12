@@ -12,7 +12,7 @@ set GOCACHE=%ROOT%\.gocache
 
 set RESOURCE_FILE=%ROOT%\cmd\translate-go\translate-go-res.syso
 
-echo [1/3] Generating Windows application icon...
+echo [1/4] Generating Windows application icon...
 go run .\tools\winres -icon "%ROOT%\assets\icon.ico" -output "%RESOURCE_FILE%" -arch amd64
 if errorlevel 1 (
   echo.
@@ -24,9 +24,35 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo [2/3] Building Go frontend...
+set "BUNDLE_TAGS="
+echo [2/4] Embedding UI and AI engine (single-exe release)...
+if exist "%ROOT%\build\bin\translate-ui.exe" if exist "%ROOT%\dist-go\ai_engine.exe" (
+  if not exist "%ROOT%\internal\runtimebundle\assets" mkdir "%ROOT%\internal\runtimebundle\assets"
+  copy /Y "%ROOT%\build\bin\translate-ui.exe" "%ROOT%\internal\runtimebundle\assets\translate-ui.exe" >nul
+  if errorlevel 1 (
+    echo Failed to stage translate-ui.exe for embedding.
+    pause
+    popd
+    exit /b 1
+  )
+  copy /Y "%ROOT%\dist-go\ai_engine.exe" "%ROOT%\internal\runtimebundle\assets\ai_engine.exe" >nul
+  if errorlevel 1 (
+    echo Failed to stage ai_engine.exe for embedding.
+    pause
+    popd
+    exit /b 1
+  )
+  set "BUNDLE_TAGS=-tags bundle"
+) else (
+  echo Bundled assets not found; building a multi-file development layout.
+)
+
+echo [3/4] Building Go frontend...
 if not exist "%ROOT%\dist-go" mkdir "%ROOT%\dist-go"
-go build -ldflags "-H windowsgui" -o "%ROOT%\dist-go\PopTrans.exe" .\cmd\translate-go
+set "BUILD_ID="
+for /f %%I in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMddHHmmss"') do set "BUILD_ID=%%I"
+if not defined BUILD_ID set "BUILD_ID=dev-%RANDOM%%RANDOM%"
+go build %BUNDLE_TAGS% -ldflags "-H windowsgui -X translate-plugin/internal/runtimebundle.buildID=%BUILD_ID%" -o "%ROOT%\dist-go\PopTrans.exe" .\cmd\translate-go
 if errorlevel 1 (
   del /Q "%RESOURCE_FILE%" >nul 2>nul
   echo.
@@ -39,7 +65,7 @@ if errorlevel 1 (
 
 del /Q "%RESOURCE_FILE%" >nul 2>nul
 
-echo [3/3] Build complete:
+echo [4/4] Build complete:
 echo %ROOT%\dist-go\PopTrans.exe
 popd
 exit /b 0

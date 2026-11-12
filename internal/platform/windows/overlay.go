@@ -10,9 +10,14 @@ import (
 const (
 	SelectionTransparentColor = 0x00010101
 	selectionAccentColor      = 0x00FF3D8B // COLORREF for #8B3DFF.
+	selectionCrosshairColor   = 0x00F0F0F0
+	selectionHintColor        = 0x00141418
 	selectionLabelWidth       = int32(112)
 	selectionLabelHeight      = int32(24)
 	selectionLabelGap         = int32(6)
+	selectionHintWidth        = int32(460)
+	selectionHintHeight       = int32(34)
+	selectionHintTop          = int32(26)
 	drawTextCenter            = 0x00000001
 	drawTextVCenter           = 0x00000004
 	drawTextSingleLine        = 0x00000020
@@ -80,7 +85,7 @@ func InvalidateWindow(hwnd HWND) {
 	procInvalidateRect.Call(uintptr(hwnd), 0, 0)
 }
 
-func PaintSelectionOverlay(hwnd HWND, width, height int32, selection Rect, hasSelection bool) uintptr {
+func PaintSelectionOverlay(hwnd HWND, width, height int32, selection Rect, hasSelection bool, cursor Point, showCrosshair bool, hint string) uintptr {
 	var ps PaintStruct
 	hdc, _, _ := procBeginPaint.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&ps)))
 	if hdc == 0 {
@@ -120,6 +125,17 @@ func PaintSelectionOverlay(hwnd HWND, width, height int32, selection Rect, hasSe
 		deleteObject(bgBrush)
 	}
 
+	if showCrosshair {
+		brush := createSolidBrush(selectionCrosshairColor)
+		if brush != 0 {
+			horizontal := Rect{Left: 0, Top: cursor.Y, Right: width, Bottom: cursor.Y + 1}
+			vertical := Rect{Left: cursor.X, Top: 0, Right: cursor.X + 1, Bottom: height}
+			procFillRect.Call(paintDC, uintptr(unsafe.Pointer(&horizontal)), brush)
+			procFillRect.Call(paintDC, uintptr(unsafe.Pointer(&vertical)), brush)
+			deleteObject(brush)
+		}
+	}
+
 	if hasSelection {
 		transparentBrush := createSolidBrush(SelectionTransparentColor)
 		if transparentBrush != 0 {
@@ -144,9 +160,57 @@ func PaintSelectionOverlay(hwnd HWND, width, height int32, selection Rect, hasSe
 		}
 
 		drawSelectionSizeLabel(paintDC, width, height, selection)
+	} else if hint != "" {
+		drawSelectionHint(paintDC, width, hint)
 	}
 
 	return 0
+}
+
+func drawSelectionHint(hdc uintptr, overlayWidth int32, hint string) {
+	labelUTF16, err := xwindows.UTF16FromString(hint)
+	if err != nil || len(labelUTF16) < 2 {
+		return
+	}
+
+	left := (overlayWidth - selectionHintWidth) / 2
+	if left < 4 {
+		left = 4
+	}
+	labelRect := Rect{
+		Left:   left,
+		Top:    selectionHintTop,
+		Right:  left + selectionHintWidth,
+		Bottom: selectionHintTop + selectionHintHeight,
+	}
+	background := createSolidBrush(selectionHintColor)
+	if background == 0 {
+		return
+	}
+	procFillRect.Call(hdc, uintptr(unsafe.Pointer(&labelRect)), background)
+	deleteObject(background)
+
+	accent := createSolidBrush(selectionAccentColor)
+	if accent != 0 {
+		accentRect := Rect{
+			Left:   labelRect.Left,
+			Top:    labelRect.Top,
+			Right:  labelRect.Left + 4,
+			Bottom: labelRect.Bottom,
+		}
+		procFillRect.Call(hdc, uintptr(unsafe.Pointer(&accentRect)), accent)
+		deleteObject(accent)
+	}
+
+	procSetBkMode.Call(hdc, Transparent)
+	procSetTextColor.Call(hdc, 0x00FFFFFF)
+	procDrawTextW.Call(
+		hdc,
+		uintptr(unsafe.Pointer(&labelUTF16[0])),
+		uintptr(len(labelUTF16)-1),
+		uintptr(unsafe.Pointer(&labelRect)),
+		drawTextCenter|drawTextVCenter|drawTextSingleLine|drawTextNoPrefix,
+	)
 }
 
 func drawSelectionSizeLabel(hdc uintptr, overlayWidth, overlayHeight int32, selection Rect) {

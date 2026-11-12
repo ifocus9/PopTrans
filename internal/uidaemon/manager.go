@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -20,6 +21,15 @@ const (
 	EventConfigSaved = 2
 	// EventUIExited is posted when the UI process exits unexpectedly.
 	EventUIExited = 3
+	// EventHotkeyPause/EventHotkeyResume bracket hotkey recording in the UI.
+	EventHotkeyPause  = 4
+	EventHotkeyResume = 5
+	// EventOverlayClosed is posted when the screenshot overlay window closes.
+	EventOverlayClosed = 6
+	// EventLivePause/EventLiveResume/EventLiveStop control the live loop.
+	EventLivePause  = 7
+	EventLiveResume = 8
+	EventLiveStop   = 9
 
 	processQueryLimitedInformation = 0x1000
 	stillActive                    = 259
@@ -30,9 +40,11 @@ type HostCallback func(event int)
 
 // Manager owns the single UI daemon process from the host side.
 type Manager struct {
-	baseDir   string
-	resolveUI func() string
-	onEvent   HostCallback
+	baseDir     string
+	endpointDir string
+	extraArgs   []string
+	resolveUI   func() string
+	onEvent     HostCallback
 
 	mu          sync.Mutex
 	cmd         *exec.Cmd
@@ -47,10 +59,24 @@ type Manager struct {
 
 func NewManager(baseDir string, resolveUI func() string, onEvent HostCallback) *Manager {
 	return &Manager{
-		baseDir:   baseDir,
-		resolveUI: resolveUI,
-		onEvent:   onEvent,
+		baseDir:     baseDir,
+		endpointDir: baseDir,
+		resolveUI:   resolveUI,
+		onEvent:     onEvent,
 	}
+}
+
+// SetEndpointDir publishes this daemon's endpoint in a separate directory,
+// allowing an overlay/live UI process to coexist with the main window.
+func (m *Manager) SetEndpointDir(dir string) {
+	if dir != "" {
+		m.endpointDir = dir
+	}
+}
+
+// SetExtraArgs appends launch arguments for the UI process (e.g. --overlay).
+func (m *Manager) SetExtraArgs(args []string) {
+	m.extraArgs = args
 }
 
 func (m *Manager) EnsureReady(ctx context.Context) error {
@@ -120,6 +146,34 @@ func (m *Manager) ShowResult(ctx context.Context, payload ResultPayload) error {
 	return client.ShowResult(ctx, payload)
 }
 
+func (m *Manager) ShowOverlay(ctx context.Context, payload OverlayPayload) error {
+	if err := m.EnsureReady(ctx); err != nil {
+		return err
+	}
+	client, err := m.currentClient()
+	if err != nil {
+		return err
+	}
+	return client.ShowOverlay(ctx, payload)
+}
+
+func (m *Manager) ShowLive(ctx context.Context, payload LivePayload) error {
+	client, err := m.currentClient()
+	if err == nil {
+		if err := client.ShowLive(ctx, payload); err == nil {
+			return nil
+		}
+	}
+	if err := m.EnsureReady(ctx); err != nil {
+		return err
+	}
+	client, err = m.currentClient()
+	if err != nil {
+		return err
+	}
+	return client.ShowLive(ctx, payload)
+}
+
 func (m *Manager) Hide(ctx context.Context) error {
 	client, err := m.currentClient()
 	if err != nil {
@@ -171,7 +225,7 @@ func (m *Manager) Stop() {
 	m.mu.Lock()
 	m.resetLocked()
 	m.mu.Unlock()
-	RemoveEndpoint(m.baseDir)
+	RemoveEndpoint(m.endpointDir)
 }
 
 func (m *Manager) ensureCallback() error {
@@ -216,7 +270,7 @@ func (m *Manager) currentClient() (*Client, error) {
 }
 
 func (m *Manager) killStaleDaemon() {
-	endpoint, err := ReadEndpoint(m.baseDir)
+	endpoint, err := ReadEndpoint(m.endpointDir)
 	if err != nil {
 		return
 	}
@@ -227,7 +281,7 @@ func (m *Manager) killStaleDaemon() {
 			time.Sleep(150 * time.Millisecond)
 		}
 	}
-	RemoveEndpoint(m.baseDir)
+	RemoveEndpoint(m.endpointDir)
 }
 
 func (m *Manager) startProcess(ctx context.Context) error {
@@ -244,14 +298,18 @@ func (m *Manager) startProcess(ctx context.Context) error {
 		return errors.New("ui callback server not ready")
 	}
 
-	RemoveEndpoint(m.baseDir)
+	RemoveEndpoint(m.endpointDir)
 	cmd := exec.Command(
 		exePath,
 		"--daemon",
 		"--callback-url", callbackURL,
 		"--callback-token", callbackTok,
 	)
+	cmd.Args = append(cmd.Args, m.extraArgs...)
 	cmd.Dir = filepath.Dir(exePath)
+	// The extracted UI lives in <baseDir>/runtime; it must still read settings
+	// and models from the real application directory.
+	cmd.Env = environmentWith(os.Environ(), "POPTRANS_BASE_DIR", m.baseDir)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,
 		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
@@ -280,7 +338,7 @@ func (m *Manager) startProcess(ctx context.Context) error {
 			m.waitCh = nil
 		}
 		m.mu.Unlock()
-		RemoveEndpoint(m.baseDir)
+		RemoveEndpoint(m.endpointDir)
 		log.Printf("ui daemon process exited: pid=%d err=%v", cmd.Process.Pid, err)
 		if m.onEvent != nil {
 			m.onEvent(EventUIExited)
@@ -315,7 +373,7 @@ func (m *Manager) waitUntilReady(ctx context.Context) error {
 			}
 		}
 
-		endpoint, err := ReadEndpoint(m.baseDir)
+		endpoint, err := ReadEndpoint(m.endpointDir)
 		if err == nil {
 			client := NewClient(endpoint)
 			if status, healthErr := client.Health(ctx); healthErr == nil && status.Ready {
@@ -347,6 +405,18 @@ func (m *Manager) resetLocked() {
 	m.callbackTok = ""
 	m.owned = false
 	m.waitCh = nil
+}
+
+func environmentWith(environ []string, key, value string) []string {
+	prefix := key + "="
+	result := make([]string, 0, len(environ)+1)
+	for _, entry := range environ {
+		if strings.HasPrefix(strings.ToUpper(entry), strings.ToUpper(prefix)) {
+			continue
+		}
+		result = append(result, entry)
+	}
+	return append(result, prefix+value)
 }
 
 func processExists(pid int) bool {

@@ -2,22 +2,31 @@ package wailsui
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
 	"translate-plugin/internal/backend"
 	"translate-plugin/internal/config"
+	"translate-plugin/internal/modelhub"
 	win "translate-plugin/internal/platform/windows"
 	"translate-plugin/internal/uidaemon"
 )
 
 const (
-	eventUIState = "ui:state"
+	eventUIState       = "ui:state"
+	eventOverlay       = "ui:overlay"
+	eventLive          = "ui:live"
+	eventModelDownload = "ui:model-download"
 )
 
 type App struct {
@@ -27,6 +36,9 @@ type App struct {
 	supervisor *backend.Supervisor
 
 	daemonMode    bool
+	overlayMode   bool
+	endpointDir   string
+	windowTitle   string
 	callbackURL   string
 	callbackToken string
 	notify        *uidaemon.NotifyClient
@@ -47,7 +59,52 @@ type App struct {
 
 	clickOutsideMu     sync.Mutex
 	clickOutsideCancel context.CancelFunc
+
+	downloadMu     sync.Mutex
+	downloadCancel context.CancelFunc
+	downloading    bool
+
+	// Screenshot overlay / live panel state. Overlay payloads are emitted
+	// through dedicated events instead of the polled UIState.
+	overlayRect uidaemon.ScreenRect
+	liveRect    uidaemon.ScreenRect
+
+	hitMu            sync.Mutex
+	hitTestRect      win.Rect
+	hitTestActive    bool
+	hitTestResizable bool
+	menuOpen         bool
+	overlayPrepared  bool
+	regionSig        string
+	origWndProc      uintptr
+
+	pinMu         sync.Mutex
+	overlayPinned bool
 }
+
+// hitTestApp is the single overlay-process App whose window is subclassed for
+// click-through hit testing.
+var hitTestApp *App
+
+var overlayHitTestProc = syscall.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
+	app := hitTestApp
+	if app != nil && msg == win.WmNcHitTest {
+		if app.hitTestEnabled() {
+			screen := win.LParamPoint(lParam)
+			client := win.ScreenToClient(win.HWND(hwnd), screen)
+
+			// Edge resizing is driven from the page: returning HTLEFT/HTTOP
+			// here would steal the pointerdown from the WebView edge strips.
+			if app.hitRect().Contains(client) {
+				return win.HtTransparent
+			}
+		}
+	}
+	if app != nil && app.origWndProc != 0 {
+		return win.CallWindowProc(app.origWndProc, win.HWND(hwnd), msg, wParam, lParam)
+	}
+	return win.DefWindowProc(win.HWND(hwnd), msg, wParam, lParam)
+})
 
 type UIState struct {
 	Config         config.Config  `json:"config"`
@@ -62,15 +119,17 @@ type UIState struct {
 }
 
 type TranslateResult struct {
-	Source string `json:"source"`
-	Result string `json:"result"`
+	Source    string `json:"source"`
+	Result    string `json:"result"`
+	LatencyMs int64  `json:"latency_ms"`
 }
 
 type ResultView struct {
-	Source  string `json:"source"`
-	Result  string `json:"result"`
-	Error   string `json:"error"`
-	Loading bool   `json:"loading"`
+	Source    string `json:"source"`
+	Result    string `json:"result"`
+	Error     string `json:"error"`
+	Loading   bool   `json:"loading"`
+	LatencyMs int64  `json:"latency_ms"`
 }
 
 func NewApp(baseDir string, args []string) *App {
@@ -83,16 +142,27 @@ func NewApp(baseDir string, args []string) *App {
 		baseDir:       baseDir,
 		client:        client,
 		supervisor:    backend.NewSupervisor(baseDir, client),
+		endpointDir:   baseDir,
+		windowTitle:   "选中翻译",
 		mode:          "settings",
 		visible:       false,
 		idleTimeout:   cfg.UIIdleTimeout(),
 		startupStatus: "正在启动本地服务...",
+		overlayPinned: true,
 	}
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--daemon":
 			app.daemonMode = true
+		case "--overlay":
+			app.overlayMode = true
+			app.mode = "overlay"
+		case "--endpoint-dir":
+			if i+1 < len(args) {
+				app.endpointDir = args[i+1]
+				i++
+			}
 		case "--callback-url":
 			if i+1 < len(args) {
 				app.callbackURL = args[i+1]
@@ -123,6 +193,12 @@ func NewApp(baseDir string, args []string) *App {
 		}
 	}
 
+	if app.overlayMode {
+		app.windowTitle = "选中翻译浮层"
+	}
+	if app.endpointDir == "" {
+		app.endpointDir = baseDir
+	}
 	if app.callbackURL != "" && app.callbackToken != "" {
 		app.notify = uidaemon.NewNotifyClient(app.callbackURL, app.callbackToken)
 	}
@@ -133,9 +209,22 @@ func (a *App) Startup(ctx context.Context) {
 	a.ctx = ctx
 
 	if a.daemonMode {
-		a.server = uidaemon.NewServer(a.baseDir, a)
+		a.server = uidaemon.NewServerWithEndpointDir(a.baseDir, a.endpointDir, a)
 		if _, err := a.server.Start(); err != nil {
 			log.Printf("ui daemon server start failed: %v", err)
+		}
+		if a.overlayMode {
+			// Dedicated overlay/live renderer: no workbench, no startup polling.
+			a.mu.Lock()
+			a.ready = true
+			a.mode = "overlay"
+			a.visible = false
+			a.settingsOpen = false
+			a.startupLoading = false
+			a.mu.Unlock()
+			go a.applyWindowAppearance()
+			go a.monitorClickThrough(ctx)
+			return
 		}
 		a.mu.Lock()
 		a.ready = true
@@ -148,6 +237,7 @@ func (a *App) Startup(ctx context.Context) {
 		// The host process starts the backend. Poll its health here so the UI can
 		// show download/load progress without racing a second backend process.
 		go a.monitorStartup()
+		go a.applyWindowAppearance()
 		return
 	}
 
@@ -173,6 +263,275 @@ func (a *App) Startup(ctx context.Context) {
 		defer cancel()
 		_ = a.supervisor.EnsureRunning(startCtx, func(string) {})
 	}()
+}
+
+// IsOverlayProcess tells the frontend whether this process renders only the
+// screenshot/live overlay (so it never builds the workbench UI).
+func (a *App) IsOverlayProcess() bool {
+	return a.overlayMode
+}
+
+// applyWindowAppearance gives both windows the product icon and keeps the
+// overlay window out of the taskbar/Alt-Tab list.
+func (a *App) applyWindowAppearance() {
+	iconPath := filepath.Join(a.baseDir, "icon.ico")
+	if _, err := os.Stat(iconPath); err != nil {
+		iconPath = filepath.Join(a.baseDir, "assets", "icon.ico")
+	}
+	for attempt := 0; attempt < 60; attempt++ {
+		if hwnd := win.FindWindowByTitle(a.windowTitle); hwnd != 0 {
+			a.prepareOverlayWindow()
+			win.SetWindowIconFromFile(hwnd, iconPath)
+			// The single-exe release has no icon.ico next to the app; use the
+			// icon resource compiled into this executable instead.
+			win.SetWindowIconFromResource(hwnd)
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	log.Printf("window appearance: window %q not found", a.windowTitle)
+}
+
+// prepareOverlayWindow keeps the overlay renderer out of the taskbar, clears
+// the acrylic backdrop so live translations are transparent, and installs the
+// click-through hit test.
+func (a *App) prepareOverlayWindow() {
+	if !a.overlayMode {
+		return
+	}
+	hwnd := win.FindWindowByTitle(a.windowTitle)
+	if hwnd == 0 {
+		return
+	}
+	a.hitMu.Lock()
+	prepared := a.overlayPrepared
+	a.hitMu.Unlock()
+	if prepared {
+		return
+	}
+	win.MakeToolWindow(hwnd)
+	// Keep the overlay out of screen captures so the live loop can capture the
+	// screen without hiding this window (which caused visible flicker).
+	// POPTRANS_ALLOW_CAPTURE=1 is a debugging aid for screenshots of the overlay.
+	if os.Getenv("POPTRANS_ALLOW_CAPTURE") != "1" {
+		if !win.SetWindowCaptureExcluded(hwnd) {
+			log.Printf("overlay: SetWindowDisplayAffinity failed; live capture will hide/show")
+		}
+	}
+	if a.origWndProc == 0 {
+		hitTestApp = a
+		a.origWndProc = win.SubclassWindow(hwnd, overlayHitTestProc)
+	}
+	a.hitMu.Lock()
+	a.overlayPrepared = true
+	a.hitMu.Unlock()
+}
+
+// monitorClickThrough keeps the overlay content area click-through. WebView2
+// renders inside a child window, so a WM_NCHITTEST subclass on the top-level
+// window cannot swallow mouse input for the rendered chips. Polling the cursor
+// lets us toggle WS_EX_TRANSPARENT exactly while it is over the image area.
+func (a *App) monitorClickThrough(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Millisecond)
+	defer ticker.Stop()
+	var hwnd win.HWND
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		if hwnd == 0 || !win.IsWindowVisible(hwnd) {
+			hwnd = win.FindWindowByTitle(a.windowTitle)
+		}
+		if hwnd == 0 {
+			continue
+		}
+		if !win.IsWindowVisible(hwnd) || !a.hitTestEnabled() {
+			win.SetClickThrough(hwnd, false)
+			continue
+		}
+		if a.menuVisible() {
+			// The "…" dropdown overlaps the image area; keep it clickable.
+			win.SetClickThrough(hwnd, false)
+			continue
+		}
+
+		cursor := win.ScreenToClient(hwnd, win.GetCursorPos())
+		interactive := !a.hitRect().Contains(cursor)
+		if a.hitTestEdgeResizable() {
+			// Leave the resize border interactive so dragging an edge can
+			// change the monitored region.
+			const edge = int32(8)
+			client := win.GetClientRect(hwnd)
+			if cursor.X < edge || cursor.Y < edge ||
+				cursor.X >= client.Right-edge || cursor.Y >= client.Bottom-edge {
+				interactive = true
+			}
+		}
+		win.SetClickThrough(hwnd, !interactive)
+	}
+}
+
+// SetOverlayWindowRect moves/resizes the overlay window while the user drags
+// one of its edges. Values arrive in CSS pixels; Win32 works in physical pixels.
+func (a *App) SetOverlayWindowRect(x, y, w, h int) {
+	if !a.overlayMode || w <= 0 || h <= 0 {
+		return
+	}
+	hwnd := win.FindWindowByTitle(a.windowTitle)
+	if hwnd == 0 {
+		return
+	}
+	current, err := win.GetWindowRect(hwnd)
+	if err != nil {
+		return
+	}
+	scale := float64(win.DpiForRect(current)) / 96.0
+	if scale <= 0 {
+		scale = 1
+	}
+	win.MoveWindow(
+		hwnd,
+		int32(float64(x)*scale),
+		int32(float64(y)*scale),
+		int32(float64(w)*scale),
+		int32(float64(h)*scale),
+		true,
+	)
+}
+
+// SetOverlayRegion applies the window shape the overlay page computed from its
+// rendered toolbar/chips. The JSON array uses physical client pixels; areas
+// outside it become invisible and click-through.
+func (a *App) SetOverlayRegion(rectsJSON string) {
+	if !a.overlayMode {
+		return
+	}
+	a.hitMu.Lock()
+	same := a.regionSig == rectsJSON
+	a.hitMu.Unlock()
+	if same {
+		// Re-applying an identical window region makes DWM repaint the shaped
+		// window; skip it so live updates don't flash.
+		return
+	}
+	var raw []struct {
+		X int `json:"x"`
+		Y int `json:"y"`
+		W int `json:"w"`
+		H int `json:"h"`
+	}
+	var request struct {
+		Rects []struct {
+			X int `json:"x"`
+			Y int `json:"y"`
+			W int `json:"w"`
+			H int `json:"h"`
+		} `json:"rects"`
+		Polys [][][2]int `json:"polys"`
+	}
+	if err := json.Unmarshal([]byte(rectsJSON), &request); err == nil &&
+		(len(request.Rects) > 0 || len(request.Polys) > 0 || strings.HasPrefix(strings.TrimSpace(rectsJSON), "{")) {
+		raw = request.Rects
+	} else if err := json.Unmarshal([]byte(rectsJSON), &raw); err != nil {
+		log.Printf("overlay region decode failed: %v", err)
+		return
+	}
+	hwnd := win.FindWindowByTitle(a.windowTitle)
+	if hwnd == 0 {
+		return
+	}
+	a.hitMu.Lock()
+	a.regionSig = rectsJSON
+	a.hitMu.Unlock()
+	if len(raw) == 0 && len(request.Polys) == 0 {
+		win.SetWindowRegion(hwnd, nil)
+		return
+	}
+	rects := make([]win.Rect, 0, len(raw))
+	for _, item := range raw {
+		rects = append(rects, win.Rect{
+			Left:   int32(item.X),
+			Top:    int32(item.Y),
+			Right:  int32(item.X + item.W),
+			Bottom: int32(item.Y + item.H),
+		})
+	}
+	polys := make([][]win.Point, 0, len(request.Polys))
+	for _, poly := range request.Polys {
+		points := make([]win.Point, 0, len(poly))
+		for _, point := range poly {
+			points = append(points, win.Point{X: int32(point[0]), Y: int32(point[1])})
+		}
+		if len(points) >= 3 {
+			polys = append(polys, points)
+		}
+	}
+	win.SetWindowRegionShapes(hwnd, rects, polys)
+}
+
+func (a *App) hitTestEnabled() bool {
+	a.hitMu.Lock()
+	defer a.hitMu.Unlock()
+	return a.hitTestActive
+}
+
+func (a *App) hitRect() win.Rect {
+	a.hitMu.Lock()
+	defer a.hitMu.Unlock()
+	return a.hitTestRect
+}
+
+func (a *App) hitTestEdgeResizable() bool {
+	a.hitMu.Lock()
+	defer a.hitMu.Unlock()
+	return a.hitTestActive && a.hitTestResizable
+}
+
+func (a *App) setHitTest(rect win.Rect, active, resizable bool) {
+	a.hitMu.Lock()
+	a.hitTestRect = rect
+	a.hitTestActive = active
+	a.hitTestResizable = resizable
+	a.hitMu.Unlock()
+}
+
+// SetOverlayMenu tells the click-through monitor that the overlay's "…" menu
+// is open. The dropdown extends into the image area, which normally passes
+// clicks through, so the whole window must stay interactive while it is shown.
+func (a *App) SetOverlayMenu(open bool) {
+	a.hitMu.Lock()
+	a.menuOpen = open
+	a.hitMu.Unlock()
+}
+
+func (a *App) menuVisible() bool {
+	a.hitMu.Lock()
+	defer a.hitMu.Unlock()
+	return a.menuOpen
+}
+
+func (a *App) isOverlayPinned() bool {
+	a.pinMu.Lock()
+	defer a.pinMu.Unlock()
+	return a.overlayPinned
+}
+
+func (a *App) setOverlayPinned(pinned bool) {
+	a.pinMu.Lock()
+	a.overlayPinned = pinned
+	a.pinMu.Unlock()
+}
+
+// SetOverlayPinned is called by the overlay toolbar's pin button. Overlays are
+// always-on-top by default; this keeps the Win32 z-order in sync with the UI.
+func (a *App) SetOverlayPinned(pinned bool) {
+	a.setOverlayPinned(pinned)
+	if hwnd := win.FindWindowByTitle(a.windowTitle); hwnd != 0 {
+		win.SetWindowTopmost(hwnd, pinned)
+	}
 }
 
 func (a *App) monitorStartup() {
@@ -334,6 +693,247 @@ func (a *App) SaveConfig(cfg config.Config) error {
 	return nil
 }
 
+// ModelSearchItem is one row in the "download a model" search results.
+type ModelSearchItem struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Source      string `json:"source"`
+	Downloads   int64  `json:"downloads"`
+	Description string `json:"description"`
+	SizeBytes   int64  `json:"size_bytes"`
+	Parameters  string `json:"parameters"`
+}
+
+// ModelFileItem is one GGUF file inside a searched repository.
+type ModelFileItem struct {
+	Name string `json:"name"`
+	Size int64  `json:"size"`
+}
+
+// ModelStatus tells the settings page whether a configured model is on disk.
+type ModelStatus struct {
+	ID        string `json:"id"`
+	Installed bool   `json:"installed"`
+	Size      int64  `json:"size"`
+	Path      string `json:"path"`
+}
+
+// ModelDownloadEvent is streamed through "ui:model-download".
+type ModelDownloadEvent struct {
+	Status     string  `json:"status"`
+	Source     string  `json:"source"`
+	Repo       string  `json:"repo"`
+	File       string  `json:"file"`
+	Name       string  `json:"name"`
+	Downloaded int64   `json:"downloaded"`
+	Total      int64   `json:"total"`
+	Percent    float64 `json:"percent"`
+	Speed      int64   `json:"speed"`
+	Error      string  `json:"error,omitempty"`
+}
+
+// SearchModels queries ModelScope/HuggingFace for GGUF repositories.
+func (a *App) SearchModels(source, query string) ([]ModelSearchItem, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	results, err := modelhub.Search(ctx, source, query)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]ModelSearchItem, 0, len(results))
+	for _, result := range results {
+		items = append(items, ModelSearchItem{
+			ID:          result.ID,
+			Name:        result.Name,
+			Source:      result.Source,
+			Downloads:   result.Downloads,
+			Description: result.Description,
+			SizeBytes:   result.SizeBytes,
+			Parameters:  result.Parameters,
+		})
+	}
+	return items, nil
+}
+
+// ListModelFiles lists the GGUF files inside a repository.
+func (a *App) ListModelFiles(source, repo string) ([]ModelFileItem, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	files, err := modelhub.Files(ctx, source, repo)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]ModelFileItem, 0, len(files))
+	for _, file := range files {
+		items = append(items, ModelFileItem{Name: file.Name, Size: file.Size})
+	}
+	return items, nil
+}
+
+// ModelStatuses reports which of the given models already exist on disk.
+func (a *App) ModelStatuses(models []config.ModelEntry) []ModelStatus {
+	normalized := config.NormalizeModels(models)
+	statuses := make([]ModelStatus, 0, len(normalized))
+	for _, entry := range normalized {
+		path := config.ModelPath(a.baseDir, entry)
+		status := ModelStatus{ID: entry.ID, Path: path}
+		if info, err := os.Stat(path); err == nil {
+			status.Installed = true
+			status.Size = info.Size()
+		}
+		statuses = append(statuses, status)
+	}
+	return statuses
+}
+
+// StartModelDownload downloads a repository file in the background and streams
+// progress through "ui:model-download".
+func (a *App) StartModelDownload(source, repo, file, name string) error {
+	repo = config.NormalizeModelRepo(repo)
+	file = config.NormalizeModelFile(file)
+	source = config.NormalizeModelSource(source)
+	if repo == "" || file == "" {
+		return fmt.Errorf("无效的模型仓库或文件名")
+	}
+	entry := config.ModelEntry{
+		Source: source,
+		Repo:   repo,
+		File:   file,
+		Name:   strings.TrimSpace(name),
+		Dir:    config.NormalizeModelDir("", repo),
+	}
+	dest := config.ModelPath(a.baseDir, entry)
+	if info, err := os.Stat(dest); err == nil && info.Size() > 0 {
+		return fmt.Errorf("模型文件已存在")
+	}
+
+	a.downloadMu.Lock()
+	if a.downloading {
+		a.downloadMu.Unlock()
+		return fmt.Errorf("已有模型正在下载")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	a.downloadCancel = cancel
+	a.downloading = true
+	a.downloadMu.Unlock()
+
+	displayName := entry.Name
+	if displayName == "" {
+		displayName = repo
+	}
+	log.Printf("model download start: source=%s repo=%s file=%s dest=%s", source, repo, file, dest)
+	a.emitModelDownload(ModelDownloadEvent{
+		Status: "downloading",
+		Source: source,
+		Repo:   repo,
+		File:   file,
+		Name:   displayName,
+	})
+	go func() {
+		defer func() {
+			a.downloadMu.Lock()
+			a.downloading = false
+			a.downloadCancel = nil
+			a.downloadMu.Unlock()
+		}()
+		var lastBytes int64
+		lastAt := time.Now()
+		lastEmit := time.Now()
+		err := modelhub.Download(ctx, source, repo, file, dest, func(progress modelhub.Progress) {
+			now := time.Now()
+			speed := int64(0)
+			if elapsed := now.Sub(lastAt).Seconds(); elapsed > 0.2 {
+				speed = int64(float64(progress.Downloaded-lastBytes) / elapsed)
+				lastBytes = progress.Downloaded
+				lastAt = now
+			}
+			if now.Sub(lastEmit) < 150*time.Millisecond {
+				return
+			}
+			lastEmit = now
+			percent := 0.0
+			if progress.Total > 0 {
+				percent = float64(progress.Downloaded) / float64(progress.Total) * 100
+			}
+			a.emitModelDownload(ModelDownloadEvent{
+				Status:     "downloading",
+				Source:     source,
+				Repo:       repo,
+				File:       file,
+				Name:       displayName,
+				Downloaded: progress.Downloaded,
+				Total:      progress.Total,
+				Percent:    percent,
+				Speed:      speed,
+			})
+		})
+		if err != nil {
+			status := "error"
+			message := err.Error()
+			if ctx.Err() != nil {
+				status = "canceled"
+				message = "下载已取消"
+			}
+			log.Printf("model download failed: source=%s repo=%s file=%s err=%v", source, repo, file, err)
+			a.emitModelDownload(ModelDownloadEvent{
+				Status: status, Source: source, Repo: repo, File: file, Name: displayName, Error: message,
+			})
+			return
+		}
+		if info, statErr := os.Stat(dest); statErr == nil {
+			a.emitModelDownload(ModelDownloadEvent{
+				Status:     "done",
+				Source:     source,
+				Repo:       repo,
+				File:       file,
+				Name:       displayName,
+				Downloaded: info.Size(),
+				Total:      info.Size(),
+				Percent:    100,
+			})
+		}
+	}()
+	return nil
+}
+
+// CancelModelDownload stops the running download, keeping the .part file for a
+// later resume.
+func (a *App) CancelModelDownload() {
+	a.downloadMu.Lock()
+	cancel := a.downloadCancel
+	a.downloadMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// DeleteModelFile removes a downloaded GGUF (and its partial file).
+func (a *App) DeleteModelFile(repo, file string) error {
+	repo = config.NormalizeModelRepo(repo)
+	file = config.NormalizeModelFile(file)
+	if repo == "" || file == "" {
+		return fmt.Errorf("无效的模型文件")
+	}
+	dir := config.NormalizeModelDir("", repo)
+	dest := filepath.Join(a.baseDir, "models", dir, config.LocalModelFile(file))
+	modelsRoot := filepath.Join(a.baseDir, "models") + string(os.PathSeparator)
+	if !strings.HasPrefix(dest, modelsRoot) {
+		return fmt.Errorf("拒绝删除模型目录之外的文件")
+	}
+	_ = os.Remove(dest + ".part")
+	if err := os.Remove(dest); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func (a *App) emitModelDownload(payload ModelDownloadEvent) {
+	if a.ctx == nil {
+		return
+	}
+	runtime.EventsEmit(a.ctx, eventModelDownload, payload)
+}
+
 func (a *App) Translate(text string) (TranslateResult, error) {
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -343,11 +943,70 @@ func (a *App) Translate(text string) (TranslateResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
 	defer cancel()
 
-	result, err := a.client.Translate(ctx, text)
+	sourceLang, targetLang := a.languagePair()
+	startedAt := time.Now()
+	result, err := a.client.TranslateWithLanguages(ctx, text, sourceLang, targetLang)
+	latency := time.Since(startedAt).Milliseconds()
 	if err != nil {
 		return TranslateResult{}, err
 	}
-	return TranslateResult{Source: text, Result: strings.TrimSpace(result)}, nil
+	return TranslateResult{
+		Source:    text,
+		Result:    strings.TrimSpace(result),
+		LatencyMs: latency,
+	}, nil
+}
+
+// languagePair reads the configured source/target languages. Auto is the
+// fallback when settings cannot be loaded.
+func (a *App) languagePair() (string, string) {
+	cfg, err := config.Load(a.baseDir)
+	if err != nil {
+		return "auto", "auto"
+	}
+	return cfg.SourceLanguage, cfg.TargetLanguage
+}
+
+// OCRTranslateImage accepts a data URL or bare base64 PNG from the workbench
+// clipboard/file import and returns the recognized text plus its translation.
+func (a *App) OCRTranslateImage(imageData string) (TranslateResult, error) {
+	raw := strings.TrimSpace(imageData)
+	if strings.HasPrefix(raw, "data:") {
+		if comma := strings.Index(raw, ","); comma >= 0 {
+			raw = raw[comma+1:]
+		}
+	}
+	decoded, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return TranslateResult{}, fmt.Errorf("图片数据无效: %w", err)
+	}
+	if len(decoded) == 0 {
+		return TranslateResult{}, fmt.Errorf("图片数据为空")
+	}
+	const maxImageBytes = 24 << 20
+	if len(decoded) > maxImageBytes {
+		return TranslateResult{}, fmt.Errorf("图片过大（上限 24MB）")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	sourceLang, targetLang := a.languagePair()
+	startedAt := time.Now()
+	result, err := a.client.OCRTranslateImageWithLanguages(ctx, decoded, sourceLang, targetLang)
+	latency := time.Since(startedAt).Milliseconds()
+	if err != nil {
+		return TranslateResult{}, err
+	}
+	source := strings.TrimSpace(result.SourceText)
+	if source == "" {
+		return TranslateResult{}, fmt.Errorf("未识别到文字")
+	}
+	return TranslateResult{
+		Source:    source,
+		Result:    strings.TrimSpace(result.Translation),
+		LatencyMs: latency,
+	}, nil
 }
 
 // HideWindow is called by the frontend close button in daemon mode.
@@ -384,7 +1043,7 @@ func (a *App) monitorClickOutside(ctx context.Context) {
 	case <-time.After(250 * time.Millisecond):
 	}
 
-	hwnd := win.FindWindowByTitle("选中翻译")
+	hwnd := win.FindWindowByTitle(a.windowTitle)
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -466,6 +1125,9 @@ func (a *App) Status() uidaemon.Status {
 
 // ShowSettings implements uidaemon.Handler.
 func (a *App) ShowSettings() error {
+	if a.overlayMode {
+		return nil
+	}
 	if a.ctx == nil {
 		return context.Canceled
 	}
@@ -486,6 +1148,9 @@ func (a *App) ShowSettings() error {
 
 // ShowTranslate implements uidaemon.Handler.
 func (a *App) ShowTranslate() error {
+	if a.overlayMode {
+		return nil
+	}
 	if a.ctx == nil {
 		return context.Canceled
 	}
@@ -506,6 +1171,9 @@ func (a *App) ShowTranslate() error {
 
 // ShowResult implements uidaemon.Handler.
 func (a *App) ShowResult(payload uidaemon.ResultPayload) error {
+	if a.overlayMode {
+		return nil
+	}
 	if a.ctx == nil {
 		return context.Canceled
 	}
@@ -517,10 +1185,11 @@ func (a *App) ShowResult(payload uidaemon.ResultPayload) error {
 	// Result can temporarily replace settings view; keep settingsOpen sticky so
 	// host continues suspending hotkeys until settings are explicitly closed.
 	a.result = ResultView{
-		Source:  payload.Source,
-		Result:  payload.Result,
-		Error:   payload.Error,
-		Loading: payload.Loading,
+		Source:    payload.Source,
+		Result:    payload.Result,
+		Error:     payload.Error,
+		Loading:   payload.Loading,
+		LatencyMs: payload.LatencyMs,
 	}
 	a.cancelIdleExitLocked()
 	a.mu.Unlock()
@@ -531,7 +1200,7 @@ func (a *App) ShowResult(payload uidaemon.ResultPayload) error {
 		positionResultWindow(a.ctx)
 		runtime.WindowSetSize(a.ctx, 425, 300)
 		runtime.WindowUnminimise(a.ctx)
-		hwnd := win.FindWindowByTitle("选中翻译")
+		hwnd := win.FindWindowByTitle(a.windowTitle)
 		if hwnd != 0 {
 			win.ForceForegroundWindow(hwnd)
 		}
@@ -543,21 +1212,215 @@ func (a *App) ShowResult(payload uidaemon.ResultPayload) error {
 	return nil
 }
 
+// ShowOverlay implements uidaemon.Handler. The window is resized to the
+// physical screenshot rectangle so translated blocks line up with the pixels
+// they were recognized from.
+func (a *App) ShowOverlay(payload uidaemon.OverlayPayload) error {
+	if a.ctx == nil {
+		return context.Canceled
+	}
+
+	windowRect := payload.WindowRect
+	if windowRect.Width <= 0 || windowRect.Height <= 0 {
+		windowRect = payload.Rect
+	}
+	a.prepareOverlayWindow()
+	// Screenshot overlays are also transparent: only the translated chips are
+	// drawn over the real screen, and the image area stays click-through.
+	a.setHitTest(
+		win.Rect{
+			Left:   int32(payload.Rect.X - windowRect.X),
+			Top:    int32(payload.Rect.Y - windowRect.Y),
+			Right:  int32(payload.Rect.X - windowRect.X + payload.Rect.Width),
+			Bottom: int32(payload.Rect.Y - windowRect.Y + payload.Rect.Height),
+		},
+		true,
+		false,
+	)
+	if hwnd := win.FindWindowByTitle(a.windowTitle); hwnd != 0 {
+		win.SetResizable(hwnd, false)
+	}
+
+	a.mu.Lock()
+	wasOverlay := a.mode == "overlay" && a.visible
+	rectChanged := a.overlayRect != windowRect
+	if !wasOverlay || rectChanged {
+		a.overlayRect = windowRect
+	}
+	a.mode = "overlay"
+	a.visible = true
+	a.settingsOpen = false
+	a.cancelIdleExitLocked()
+	a.mu.Unlock()
+
+	if !wasOverlay || rectChanged {
+		if !wasOverlay {
+			// Every new screenshot overlay starts pinned/always-on-top.
+			a.setOverlayPinned(true)
+		}
+		a.applyWindowRect(windowRect)
+		runtime.WindowUnminimise(a.ctx)
+		runtime.WindowSetAlwaysOnTop(a.ctx, a.isOverlayPinned())
+		if hwnd := win.FindWindowByTitle(a.windowTitle); hwnd != 0 {
+			win.ForceForegroundWindow(hwnd)
+		}
+	}
+
+	runtime.EventsEmit(a.ctx, eventOverlay, payload)
+	a.emitState()
+	return nil
+}
+
+// ShowLive implements uidaemon.Handler. The panel sits next to the monitored
+// region (never on top of it) so the live capture cannot see its own output.
+func (a *App) ShowLive(payload uidaemon.LivePayload) error {
+	if a.ctx == nil {
+		return context.Canceled
+	}
+
+	windowRect := payload.WindowRect
+	if windowRect.Width <= 0 || windowRect.Height <= 0 {
+		windowRect = payload.Anchor
+	}
+	a.prepareOverlayWindow()
+	// Live translation only draws text chips over the real screen; the chip
+	// area is click-through so the user can keep operating the app underneath.
+	a.setHitTest(
+		win.Rect{
+			Left:   int32(payload.Anchor.X - windowRect.X),
+			Top:    int32(payload.Anchor.Y - windowRect.Y),
+			Right:  int32(payload.Anchor.X - windowRect.X + payload.Anchor.Width),
+			Bottom: int32(payload.Anchor.Y - windowRect.Y + payload.Anchor.Height),
+		},
+		true,
+		true,
+	)
+	if hwnd := win.FindWindowByTitle(a.windowTitle); hwnd != 0 {
+		// Edge resizing is handled by the page so the shaped window keeps a
+		// consistent client area; the native thick frame would be clipped away
+		// by the window region.
+		win.SetResizable(hwnd, false)
+	}
+
+	a.mu.Lock()
+	wasLive := a.mode == "live" && a.visible
+	panelChanged := a.liveRect != windowRect
+	if windowRect.Width > 0 && windowRect.Height > 0 {
+		a.liveRect = windowRect
+	}
+	panel := a.liveRect
+	a.mode = "live"
+	a.visible = true
+	a.settingsOpen = false
+	a.cancelIdleExitLocked()
+	a.mu.Unlock()
+
+	if !wasLive || panelChanged {
+		if !wasLive {
+			// Every new live session starts pinned/always-on-top.
+			a.setOverlayPinned(true)
+		}
+		a.applyWindowRect(panel)
+		runtime.WindowUnminimise(a.ctx)
+		runtime.WindowSetAlwaysOnTop(a.ctx, a.isOverlayPinned())
+		if hwnd := win.FindWindowByTitle(a.windowTitle); hwnd != 0 {
+			win.ForceForegroundWindow(hwnd)
+		}
+	}
+
+	runtime.EventsEmit(a.ctx, eventLive, payload)
+	a.emitState()
+	return nil
+}
+
+// applyWindowRect positions the Wails window with physical pixels. Wails'
+// WindowSetPosition interprets coordinates relative to the current monitor,
+// which is wrong for a pixel-perfect screenshot overlay; MoveWindow is exact.
+func (a *App) applyWindowRect(rect uidaemon.ScreenRect) {
+	if rect.Width <= 0 || rect.Height <= 0 {
+		return
+	}
+	if hwnd := win.FindWindowByTitle(a.windowTitle); hwnd != 0 {
+		// A live window may have been dragged by the user; don't fight the
+		// drag when the computed rect already matches its actual position.
+		if current, err := win.GetWindowRect(hwnd); err == nil {
+			if absInt32(current.Left-int32(rect.X)) <= 2 &&
+				absInt32(current.Top-int32(rect.Y)) <= 2 &&
+				absInt32(current.Width()-int32(rect.Width)) <= 2 &&
+				absInt32(current.Height()-int32(rect.Height)) <= 2 {
+				return
+			}
+		}
+		// Move while still hidden, then show, so the overlay never flashes at
+		// the workbench's previous size/position.
+		win.MoveWindow(hwnd, int32(rect.X), int32(rect.Y), int32(rect.Width), int32(rect.Height), true)
+		win.ShowWindow(hwnd, win.SWShowNoActivate)
+		// Screenshot/live overlays are always-on-top by default; the pin button
+		// can turn this off until the next selection.
+		win.SetWindowTopmost(hwnd, a.isOverlayPinned())
+		return
+	}
+	runtime.WindowSetSize(a.ctx, rect.Width, rect.Height)
+	runtime.WindowSetPosition(a.ctx, rect.X, rect.Y)
+	runtime.WindowShow(a.ctx)
+}
+
+func absInt32(value int32) int32 {
+	if value < 0 {
+		return -value
+	}
+	return value
+}
+
+// SetHotkeyRecording is called by the settings UI while a hotkey field has
+// focus. Registered hotkeys are intercepted by Windows before the WebView can
+// see them, so they must be temporarily unregistered to record a new combo.
+func (a *App) SetHotkeyRecording(recording bool) error {
+	if a.notify == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return a.notify.HotkeyHold(ctx, recording)
+}
+
+// LiveControl lets the panel pause/resume/stop the host capture loop.
+func (a *App) LiveControl(action string) error {
+	if a.notify == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return a.notify.LiveControl(ctx, action)
+}
+
 // Hide implements uidaemon.Handler.
 func (a *App) Hide() error {
 	a.stopClickOutsideMonitor()
+	a.setHitTest(win.Rect{}, false, false)
+	a.SetOverlayMenu(false)
+	a.hitMu.Lock()
+	a.regionSig = ""
+	a.hitMu.Unlock()
 
 	if a.ctx == nil {
 		return nil
 	}
 
-	wasSettings := false
 	a.mu.Lock()
-	wasSettings = a.settingsOpen || a.mode == "settings" || a.mode == "translate"
+	wasSettings := a.settingsOpen || a.mode == "settings" || a.mode == "translate"
+	wasOverlay := a.mode == "overlay"
+	wasLive := a.mode == "live"
 	a.visible = false
 	a.settingsOpen = false
 	if a.mode == "result" {
 		a.result = ResultView{}
+	}
+	if wasOverlay {
+		a.overlayRect = uidaemon.ScreenRect{}
+	}
+	if wasLive {
+		a.liveRect = uidaemon.ScreenRect{}
 	}
 	a.mode = "settings"
 	a.mu.Unlock()
@@ -566,6 +1429,12 @@ func (a *App) Hide() error {
 	a.scheduleIdleExit()
 	if wasSettings {
 		a.notifyHidden()
+	}
+	if wasOverlay {
+		a.notifyOverlayClosed()
+	}
+	if wasLive {
+		a.notifyLiveStop()
 	}
 	return nil
 }
@@ -626,8 +1495,30 @@ func (a *App) notifyConfigSaved() {
 	}
 }
 
+func (a *App) notifyOverlayClosed() {
+	if a.notify == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := a.notify.OverlayClosed(ctx); err != nil {
+		log.Printf("notify overlay closed failed: %v", err)
+	}
+}
+
+func (a *App) notifyLiveStop() {
+	if a.notify == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := a.notify.LiveControl(ctx, "stop"); err != nil {
+		log.Printf("notify live stop failed: %v", err)
+	}
+}
+
 func (a *App) scheduleIdleExit() {
-	if !a.daemonMode {
+	if !a.daemonMode || a.overlayMode {
 		return
 	}
 

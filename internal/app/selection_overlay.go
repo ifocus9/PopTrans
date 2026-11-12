@@ -16,12 +16,15 @@ type SelectionOverlay struct {
 	completed  bool
 	start      win.Point
 	current    win.Point
+	cursor     win.Point
+	hint       string
 	onSelected func(win.Rect)
 	onCancel   func()
 }
 
-func NewSelectionOverlay(onSelected func(win.Rect), onCancel func()) *SelectionOverlay {
+func NewSelectionOverlay(hint string, onSelected func(win.Rect), onCancel func()) *SelectionOverlay {
 	return &SelectionOverlay{
+		hint:       hint,
 		onSelected: onSelected,
 		onCancel:   onCancel,
 	}
@@ -57,6 +60,9 @@ func (o *SelectionOverlay) Show(owner win.HWND) error {
 		return err
 	}
 
+	cursor := win.GetCursorPos()
+	o.cursor = win.Point{X: cursor.X - o.origin.X, Y: cursor.Y - o.origin.Y}
+
 	win.ShowWindow(hwnd, win.SWShow)
 	win.SetForegroundWindow(hwnd)
 	win.UpdateWindow(hwnd)
@@ -71,8 +77,20 @@ func (o *SelectionOverlay) HandleMessage(hwnd win.HWND, msg uint32, wParam, lPar
 	switch msg {
 	case win.WmEraseBkgnd:
 		return 1, true
+	case win.WmSetcursor:
+		win.SetCrosshairCursor()
+		return 1, true
 	case win.WmPaint:
-		return win.PaintSelectionOverlay(hwnd, o.width, o.height, o.selectionRect(), o.selecting), true
+		return win.PaintSelectionOverlay(
+			hwnd,
+			o.width,
+			o.height,
+			o.selectionRect(),
+			o.selecting,
+			o.cursor,
+			true,
+			o.hint,
+		), true
 	case win.WmLButtonDown:
 		pt := win.LParamPoint(lParam)
 		o.start = pt
@@ -82,10 +100,11 @@ func (o *SelectionOverlay) HandleMessage(hwnd win.HWND, msg uint32, wParam, lPar
 		win.InvalidateWindow(hwnd)
 		return 0, true
 	case win.WmMouseMove:
+		o.cursor = win.LParamPoint(lParam)
 		if o.selecting {
-			o.current = win.LParamPoint(lParam)
-			win.InvalidateWindow(hwnd)
+			o.current = o.cursor
 		}
+		win.InvalidateWindow(hwnd)
 		return 0, true
 	case win.WmLButtonUp:
 		if o.selecting {

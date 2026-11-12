@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import tempfile
 import threading
@@ -27,6 +28,9 @@ class OCRService:
     def __init__(self):
         self._engine = None
         self._loading_lock = threading.Lock()
+        # RapidOCR/ONNX sessions are not re-entrant; the API runs endpoints in
+        # the threadpool, so guard the actual recognition calls.
+        self._run_lock = threading.Lock()
 
     def is_loaded(self) -> bool:
         """OCR 模型是否已加载"""
@@ -266,7 +270,70 @@ class OCRService:
             logger.debug("OCR 几何去重: %d -> %d", len(boxes), len(kept))
         return kept
 
-    def recognize_image(self, img: Image.Image) -> dict:
+    @staticmethod
+    def _line_geometry(line: list[tuple], scale: float) -> dict:
+        """Rotated line box from the RapidOCR quadrilateral points.
+
+        The line direction comes from the first box's top edge (p0 -> p1), which
+        follows the actual text orientation. All line corners are projected onto
+        that direction and its normal to get a tight rotated rectangle.
+        """
+        points = []
+        for box in line:
+            pts = box[8] if len(box) > 8 else None
+            if pts:
+                points.extend((float(p[0]), float(p[1])) for p in pts)
+            else:
+                points.extend(
+                    [
+                        (float(box[2]), float(box[0])),
+                        (float(box[3]), float(box[0])),
+                        (float(box[3]), float(box[1])),
+                        (float(box[2]), float(box[1])),
+                    ]
+                )
+        if not points:
+            return {
+                "angle": 0.0,
+                "cx": 0.0,
+                "cy": 0.0,
+                "line_width": 0.0,
+                "line_height": 0.0,
+            }
+
+        first = line[0][8] if len(line[0]) > 8 else None
+        if first and len(first) >= 2:
+            angle = math.atan2(
+                float(first[1][1]) - float(first[0][1]),
+                float(first[1][0]) - float(first[0][0]),
+            )
+        else:
+            angle = 0.0
+        while angle <= -math.pi / 2:
+            angle += math.pi
+        while angle > math.pi / 2:
+            angle -= math.pi
+
+        dx, dy = math.cos(angle), math.sin(angle)
+        nx, ny = -dy, dx
+        projections = [(x * dx + y * dy, x * nx + y * ny) for x, y in points]
+        along_min = min(p[0] for p in projections)
+        along_max = max(p[0] for p in projections)
+        normal_min = min(p[1] for p in projections)
+        normal_max = max(p[1] for p in projections)
+        along_mid = (along_min + along_max) / 2.0
+        normal_mid = (normal_min + normal_max) / 2.0
+        cx = along_mid * dx + normal_mid * nx
+        cy = along_mid * dy + normal_mid * ny
+        return {
+            "angle": round(math.degrees(angle), 1),
+            "cx": round(cx / scale, 1),
+            "cy": round(cy / scale, 1),
+            "line_width": round((along_max - along_min) / scale, 1),
+            "line_height": round((normal_max - normal_min) / scale, 1),
+        }
+
+    def recognize_image(self, img: Image.Image, allow_retry: bool = True) -> dict:
         """
         接收 PIL Image 进行 OCR 识别。
         返回格式:
@@ -275,6 +342,10 @@ class OCRService:
             "lines": ["第一行", "第二行"],
             "raw_results": [...] # 原始 OCR 结果，可选
         }
+
+        allow_retry=False skips the second upscaled pass. The live loop captures
+        continuously, so re-recognizing every frame at a larger scale doubles the
+        cost for content the next frame will refresh anyway.
         """
         engine = self._ensure_engine()
 
@@ -286,16 +357,18 @@ class OCRService:
             primary_scale,
         )
 
-        primary_result, _ = engine(primary_img)
+        with self._run_lock:
+            primary_result, _ = engine(primary_img)
         primary_stats = self._summarize_ocr_result(primary_result)
 
         merged = primary_result or []
         chosen_scale = primary_scale
 
         retry_scale = self._next_scale_factor(img.size, primary_scale)
-        if self._needs_retry(primary_stats, retry_scale):
+        if allow_retry and self._needs_retry(primary_stats, retry_scale):
             retry_img, retry_scale = self._preprocess_image(img, scale_factor=retry_scale)
-            retry_result, _ = engine(retry_img)
+            with self._run_lock:
+                retry_result, _ = engine(retry_img)
             retry_stats = self._summarize_ocr_result(retry_result)
 
             if self._result_quality_score(retry_stats) >= self._result_quality_score(primary_stats):
@@ -306,7 +379,14 @@ class OCRService:
                 logger.info("OCR 回退放弃: 保留 %.1fx 首轮结果", primary_scale)
 
         if not merged:
-            return {"text": "", "lines": [], "scale": chosen_scale}
+            return {
+                "text": "",
+                "lines": [],
+                "line_boxes": [],
+                "scale": chosen_scale,
+                "image_width": img.size[0],
+                "image_height": img.size[1],
+            }
 
         raw_boxes = []
         for item in merged:
@@ -323,10 +403,19 @@ class OCRService:
             x_right = max(xs)
             height = y_bottom - y_top
             width = x_right - x_left
-            raw_boxes.append((y_top, y_bottom, x_left, x_right, text, height, width, score))
+            raw_boxes.append(
+                (y_top, y_bottom, x_left, x_right, text, height, width, score, box)
+            )
 
         if not raw_boxes:
-            return {"text": "", "lines": [], "scale": chosen_scale}
+            return {
+                "text": "",
+                "lines": [],
+                "line_boxes": [],
+                "scale": chosen_scale,
+                "image_width": img.size[0],
+                "image_height": img.size[1],
+            }
 
         boxes = self._dedupe_boxes(raw_boxes)
 
@@ -353,14 +442,43 @@ class OCRService:
         lines.sort(key=lambda line: sum(lb[0] for lb in line) / len(line))
 
         output_lines = []
+        line_boxes = []
+        # OCR boxes live in the (possibly upscaled) preprocessed image. Divide
+        # by the scale that produced the winning result to get original pixels.
+        scale = chosen_scale if chosen_scale > 0 else 1.0
+
         for line in lines:
             line.sort(key=lambda b: b[2])
             texts = [b[4].strip() for b in line if b[4].strip()]
-            output_lines.append(" ".join(texts))
+            text = " ".join(texts)
+            output_lines.append(text)
+
+            x_left = min(b[2] for b in line)
+            x_right = max(b[3] for b in line)
+            y_top = min(b[0] for b in line)
+            y_bottom = max(b[1] for b in line)
+            score = sum(b[7] for b in line) / len(line)
+            geometry = self._line_geometry(line, scale)
+            line_boxes.append({
+                "text": text,
+                "x": round(x_left / scale, 1),
+                "y": round(y_top / scale, 1),
+                "w": round((x_right - x_left) / scale, 1),
+                "h": round((y_bottom - y_top) / scale, 1),
+                "score": round(score, 3),
+                "angle": geometry["angle"],
+                "cx": geometry["cx"],
+                "cy": geometry["cy"],
+                "line_width": geometry["line_width"],
+                "line_height": geometry["line_height"],
+            })
 
         text = "\n".join(output_lines).strip()
         return {
             "text": text,
             "lines": output_lines,
-            "scale": chosen_scale
+            "line_boxes": line_boxes,
+            "scale": chosen_scale,
+            "image_width": img.size[0],
+            "image_height": img.size[1],
         }

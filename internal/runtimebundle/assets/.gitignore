@@ -1,0 +1,3 @@
+# Build-time payloads for the single-exe release build.
+# They are copied here by scripts/build_go.bat and embedded with `-tags bundle`.
+*.exe

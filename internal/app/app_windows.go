@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -16,6 +19,7 @@ import (
 	"translate-plugin/internal/config"
 	applog "translate-plugin/internal/logging"
 	win "translate-plugin/internal/platform/windows"
+	"translate-plugin/internal/runtimebundle"
 	"translate-plugin/internal/uidaemon"
 )
 
@@ -24,6 +28,7 @@ const (
 	trayIconID      = 1001
 	hotkeyTranslate = 2001
 	hotkeyOCR       = 2002
+	hotkeyLive      = 2003
 
 	menuIDStatus    = 3001
 	menuIDHotkey    = 3002
@@ -32,6 +37,10 @@ const (
 	menuIDToggleOCR = 3005
 	menuIDSettings  = 3006
 	menuIDTranslate = 3007
+	menuIDOCRRun    = 3008
+	menuIDLive      = 3009
+
+	overlayWindowTitle = "选中翻译浮层"
 
 	wmTray           = win.WmApp + 1
 	wmTranslateDone  = win.WmApp + 2
@@ -39,14 +48,19 @@ const (
 	wmBackendStatus  = win.WmApp + 4
 	wmTranslateLoad  = win.WmApp + 5
 	wmSettingsClosed = win.WmApp + 6
+	wmHotkeyPause    = win.WmApp + 7
+	wmHotkeyResume   = win.WmApp + 8
+	wmOverlayClosed  = win.WmApp + 9
+	wmLivePause      = win.WmApp + 10
+	wmLiveResume     = win.WmApp + 11
+	wmLiveStop       = win.WmApp + 12
 )
 
 var (
 	currentApp  *App
 	mainWndProc = syscall.NewCallback(mainWindowProc)
 
-	errOCREmptyResult    = errors.New("OCR 未识别到文本")
-	errOCRTranslateEmpty = errors.New("OCR 翻译结果为空")
+	errOCREmptyResult = errors.New("OCR 未识别到文本")
 )
 
 type App struct {
@@ -58,6 +72,9 @@ type App struct {
 	icon             win.HWND
 	overlay          *SelectionOverlay
 	ui               *uidaemon.Manager
+	overlayUI        *uidaemon.Manager
+	uiPath           string
+	enginePath       string
 	hotkeysSuspended bool
 	// autostart marks a login-triggered launch (--autostart): warm the AI
 	// engine in the background but skip the startup UI window so the process
@@ -67,11 +84,25 @@ type App struct {
 	statusMu sync.Mutex
 	status   string
 
-	resultMu sync.Mutex
-	source   string
-	result   string
-	lastErr  string
-	busy     bool
+	resultMu  sync.Mutex
+	source    string
+	result    string
+	lastErr   string
+	latencyMs int64
+	busy      bool
+
+	overlayMu  sync.Mutex
+	overlaySeq int
+
+	liveMu        sync.Mutex
+	liveCancel    context.CancelFunc
+	livePaused    bool
+	liveActive    bool
+	liveDragging  bool
+	liveDragEpoch int
+	liveLast      uidaemon.LivePayload
+	liveRect      win.Rect
+	liveBarSide   string
 
 	backendIdleMu      sync.Mutex
 	backendIdleUsers   int
@@ -99,17 +130,39 @@ func New() (*App, error) {
 		cfg.ServerPort,
 	)
 
+	// With a bundled release build this extracts translate-ui.exe and
+	// ai_engine.exe into <baseDir>/runtime on first launch.
+	runtimePaths, bundleErr := runtimebundle.Ensure(baseDir)
+	if bundleErr != nil {
+		log.Printf("app extract bundled runtime failed: %v", bundleErr)
+	}
+
 	client := backend.NewClient(config.BackendURL(cfg.ServerPort))
+	supervisor := backend.NewSupervisor(baseDir, client)
+	supervisor.SetEnginePath(runtimePaths.EnginePath)
 	app := &App{
 		baseDir:            baseDir,
 		cfg:                cfg,
 		client:             client,
-		supervisor:         backend.NewSupervisor(baseDir, client),
+		supervisor:         supervisor,
+		uiPath:             runtimePaths.UIPath,
+		enginePath:         runtimePaths.EnginePath,
 		status:             "正在初始化...",
 		backendIdleTimeout: cfg.AIIdleTimeout(),
 		autostart:          hasArg("--autostart"),
 	}
 	app.ui = uidaemon.NewManager(baseDir, app.resolveWailsExe, app.handleUIDaemonEvent)
+
+	// A dedicated overlay/live UI process keeps screenshot and live translation
+	// independent from the workbench window (opening/using one never closes or
+	// replaces the other).
+	overlayDir := filepath.Join(baseDir, "overlay-ui")
+	if err := os.MkdirAll(overlayDir, 0o755); err != nil {
+		log.Printf("app create overlay endpoint dir failed: %v", err)
+	}
+	app.overlayUI = uidaemon.NewManager(baseDir, app.resolveWailsExe, app.handleUIDaemonEvent)
+	app.overlayUI.SetEndpointDir(overlayDir)
+	app.overlayUI.SetExtraArgs([]string{"--overlay", "--endpoint-dir", overlayDir})
 	return app, nil
 }
 
@@ -153,36 +206,34 @@ func (a *App) Run() error {
 	}
 
 	if err := a.registerHotkeys(); err != nil {
-		log.Printf("app register hotkeys failed: %v", err)
+		// A conflicting global hotkey must not prevent the workbench from
+		// starting; the user can change it in settings.
+		log.Printf("app register hotkeys failed (continuing without them): %v", err)
 		win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
 		win.UnregisterHotKey(a.hwnd, hotkeyOCR)
-		win.DeleteTrayIcon(a.hwnd, trayIconID)
-		win.DestroyWindow(a.hwnd)
-		return err
+		win.UnregisterHotKey(a.hwnd, hotkeyLive)
+		a.setStatus("快捷键冲突，请在设置中修改")
+	} else {
+		log.Printf("app hotkeys registered")
 	}
-	log.Printf("app hotkeys registered")
 
 	// Start the Wails UI immediately so the user sees model download/load
 	// progress during application startup. The UI daemon owns only the loading
 	// window here; it hides itself once the backend reports translator_ready.
 	// Login autostart skips the UI entirely: the daemon is started on demand
 	// by the first tray/hotkey action, so boot only fills the tray.
+	// A normal launch opens the workbench immediately (which also warms the
+	// engine in the background). Login autostart stays tray-only so it never
+	// steals focus at logon.
 	if !a.autostart {
-		go a.ensureStartupUI()
+		go a.openTranslate()
 	}
 	go a.ensureBackendReady()
+	go a.prewarmOverlayUI()
 
 	_, err = win.MessageLoop()
 	log.Printf("app message loop exited: %v", err)
 	return err
-}
-
-func (a *App) ensureStartupUI() {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := a.ui.EnsureReady(ctx); err != nil {
-		log.Printf("app startup loading UI failed: %v", err)
-	}
 }
 
 func (a *App) Close() {
@@ -196,11 +247,17 @@ func (a *App) Close() {
 	if a.overlay != nil {
 		a.overlay.Close()
 	}
+	a.invalidateOverlay()
+	a.stopLiveSession(false)
+	if a.overlayUI != nil {
+		a.overlayUI.Stop()
+	}
 	if a.ui != nil {
 		a.ui.Stop()
 	}
 	win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
 	win.UnregisterHotKey(a.hwnd, hotkeyOCR)
+	win.UnregisterHotKey(a.hwnd, hotkeyLive)
 	win.DeleteTrayIcon(a.hwnd, trayIconID)
 	a.cancelBackendIdleStop()
 	a.supervisor.Stop()
@@ -218,9 +275,20 @@ func (a *App) registerHotkeys() error {
 	log.Printf("app main hotkey registered: expr=%q modifiers=%d keycode=%d", a.cfg.Hotkey, mainHotkey.Modifiers, mainHotkey.KeyCode)
 
 	if a.cfg.OcrEnabled {
-		return a.registerOCRHotkey()
+		if err := a.registerOCRHotkey(); err != nil {
+			return err
+		}
+	} else {
+		log.Printf("app ocr hotkey skipped: disabled in config")
 	}
-	log.Printf("app ocr hotkey skipped: disabled in config")
+
+	if a.cfg.LiveEnabled {
+		if err := a.registerLiveHotkey(); err != nil {
+			return err
+		}
+	} else {
+		log.Printf("app live hotkey skipped: disabled in config")
+	}
 
 	return nil
 }
@@ -237,12 +305,25 @@ func (a *App) registerOCRHotkey() error {
 	return nil
 }
 
+func (a *App) registerLiveHotkey() error {
+	liveHotkey, err := win.ParseHotkey(a.cfg.LiveHotkey)
+	if err != nil {
+		return fmt.Errorf("parse live hotkey: %w", err)
+	}
+	if err := win.RegisterHotKey(a.hwnd, hotkeyLive, liveHotkey); err != nil {
+		return err
+	}
+	log.Printf("app live hotkey registered: expr=%q modifiers=%d keycode=%d", a.cfg.LiveHotkey, liveHotkey.Modifiers, liveHotkey.KeyCode)
+	return nil
+}
+
 func (a *App) suspendHotkeys() {
 	if a.hotkeysSuspended {
 		return
 	}
 	win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
 	win.UnregisterHotKey(a.hwnd, hotkeyOCR)
+	win.UnregisterHotKey(a.hwnd, hotkeyLive)
 	a.hotkeysSuspended = true
 	log.Printf("app hotkeys suspended")
 }
@@ -254,9 +335,11 @@ func (a *App) resumeHotkeys() error {
 
 	win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
 	win.UnregisterHotKey(a.hwnd, hotkeyOCR)
+	win.UnregisterHotKey(a.hwnd, hotkeyLive)
 	if err := a.registerHotkeys(); err != nil {
 		win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
 		win.UnregisterHotKey(a.hwnd, hotkeyOCR)
+		win.UnregisterHotKey(a.hwnd, hotkeyLive)
 		return err
 	}
 	a.hotkeysSuspended = false
@@ -291,9 +374,11 @@ func (a *App) ensureBackendReady() {
 		return nil
 	})
 	if err != nil {
+		// Keep the workbench usable: surface the failure in the tray/status and
+		// let the next explicit translation action report the error. A blocking
+		// startup popup here would leave users with no usable window.
 		log.Printf("app ensure backend ready failed: %v", err)
 		a.setStatus("本地 API 启动失败")
-		a.pushError("", err.Error())
 		return
 	}
 
@@ -318,6 +403,9 @@ func (a *App) handleTranslate() {
 	}
 	a.busy = true
 	a.resultMu.Unlock()
+
+	// A text-selection translation takes over the floating window.
+	a.stopLiveSession(false)
 
 	log.Printf("app handle translate start")
 	a.setStatus("正在捕获选中文本...")
@@ -353,14 +441,19 @@ func (a *App) handleTranslate() {
 		defer cancel()
 
 		var result string
+		var latencyMs int64
 		err = a.withBackend(ctx, func(status string) {
 			if status == "" {
 				status = "等待模型加载中..."
 			}
 			a.setStatus(status)
 		}, func(reqCtx context.Context) error {
+			startedAt := time.Now()
 			var translateErr error
-			result, translateErr = a.client.Translate(reqCtx, text)
+			result, translateErr = a.client.TranslateWithLanguages(
+				reqCtx, text, a.cfg.SourceLanguage, a.cfg.TargetLanguage,
+			)
+			latencyMs = time.Since(startedAt).Milliseconds()
 			return translateErr
 		})
 		if err != nil {
@@ -372,7 +465,7 @@ func (a *App) handleTranslate() {
 
 		log.Printf("app translate success: result_chars=%d preview=%q", len(result), previewText(result, 120))
 		a.setStatus("就绪")
-		a.pushResult(text, result)
+		a.pushResult(text, result, latencyMs)
 	}()
 }
 
@@ -391,10 +484,18 @@ func (a *App) captureSelectedText() (string, error) {
 	return "", fmt.Errorf("no selected text detected")
 }
 
+const (
+	ocrSelectionHint  = "拖拽框选要翻译的区域 · Esc 取消"
+	liveSelectionHint = "拖拽框选实时翻译区域 · Esc 取消"
+)
+
 func (a *App) handleOCRGo() {
 	if !a.cfg.OcrEnabled {
 		log.Printf("app handle ocr ignored: disabled")
 		a.pushError("", "OCR 已在设置中禁用")
+		return
+	}
+	if a.overlay != nil {
 		return
 	}
 
@@ -406,12 +507,19 @@ func (a *App) handleOCRGo() {
 	a.busy = true
 	a.resultMu.Unlock()
 
+	// A fresh screenshot supersedes a running live session.
+	a.stopLiveSession(true)
+
 	log.Printf("app handle ocr start")
 	a.setStatus("OCR 框选区域...")
+	// Warm the engine while the user is still selecting, so the first
+	// screenshot does not sit behind a cold model start.
+	go a.ensureBackendReady()
 
-	a.overlay = NewSelectionOverlay(a.handleOCRSelection, a.handleOCRCancel)
+	a.overlay = NewSelectionOverlay(ocrSelectionHint, a.handleOCRSelection, a.handleOCRCancel)
 	if err := a.overlay.Show(a.hwnd); err != nil {
 		log.Printf("app show ocr overlay failed: %v", err)
+		a.overlay = nil
 		a.finishBusy()
 		a.setStatus("OCR 失败")
 		a.pushError("", err.Error())
@@ -427,6 +535,7 @@ func (a *App) handleOCRCancel() {
 func (a *App) handleOCRSelection(rect win.Rect) {
 	a.overlay = nil
 	a.setStatus("OCR 识别中...")
+	seq := a.beginOverlay()
 
 	go func() {
 		defer a.finishBusy()
@@ -440,73 +549,863 @@ func (a *App) handleOCRSelection(rect win.Rect) {
 			return
 		}
 
-		// Open the loading popup only after the screenshot is captured so the
-		// popup cannot appear inside the OCR selection, while still providing
-		// immediate feedback during recognition and translation.
-		a.pushLoading("")
+		// The overlay is transparent: only the translated chips are drawn on
+		// top of the live screen, so the captured image is never sent to the UI
+		// process.
+		windowRect, barSide := computeFrameLayout(rect)
+		basePayload := uidaemon.OverlayPayload{
+			Rect:        screenRect(rect),
+			WindowRect:  windowRect,
+			BarSide:     barSide,
+			ImageWidth:  int(rect.Width()),
+			ImageHeight: int(rect.Height()),
+			Style:       a.overlayStyle(),
+			Loading:     true,
+			Stage:       "ocr",
+			Progress:    15,
+		}
+		showCtx, showCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		if err := a.overlayUI.ShowOverlay(showCtx, basePayload); err != nil {
+			log.Printf("app show screenshot overlay failed: %v", err)
+		}
+		showCancel()
+		if !a.overlayCurrent(seq) {
+			return
+		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-		defer cancel()
+		a.setStatus("正在识别并翻译...")
+		reqCtx, reqCancel := context.WithTimeout(context.Background(), 150*time.Second)
+		defer reqCancel()
 
-		a.setStatus("正在识别 OCR 文本...")
-
-		var text string
-		var translation string
-		err = a.withBackend(ctx, func(status string) {
+		startedAt := time.Now()
+		var result backend.OCRTranslateBlocksResult
+		lines := 0
+		err = a.withBackend(reqCtx, func(status string) {
 			if status == "" {
 				status = "等待模型加载中..."
 			}
 			a.setStatus(status)
-		}, func(reqCtx context.Context) error {
-			var ocrErr error
-			text, ocrErr = a.client.OCRImage(reqCtx, pngBytes)
+		}, func(callCtx context.Context) error {
+			ocr, ocrErr := a.client.OCRBlocks(callCtx, pngBytes)
 			if ocrErr != nil {
-				return ocrErr
+				if !errors.Is(ocrErr, backend.ErrOCRBlocksUnsupported) {
+					return ocrErr
+				}
+				// Legacy engine: one combined call, no intermediate stage.
+				log.Printf("screenshot ocr endpoint unsupported, using legacy combined path")
+				var callErr error
+				result, callErr = a.ocrTranslateFrame(callCtx, pngBytes)
+				lines = len(result.Blocks)
+				return callErr
 			}
 
-			text = strings.TrimSpace(text)
-			if text == "" {
-				return errOCREmptyResult
-			}
-
-			// Update the existing popup as soon as OCR finishes, then keep the
-			// translation section in its loading state while translation runs.
-			a.pushLoading(text)
-			a.setStatus("正在翻译 OCR 文本...")
-
-			translation, ocrErr = a.client.Translate(reqCtx, text)
-			if ocrErr != nil {
-				return ocrErr
-			}
-			translation = strings.TrimSpace(translation)
-			if translation == "" {
-				return errOCRTranslateEmpty
-			}
-			return nil
+			lines = len(ocr.LineBoxes)
+			a.updateOverlayProgress(seq, basePayload, "translate", 55, lines)
+			var callErr error
+			result, callErr = a.translateOCRResult(callCtx, ocr)
+			return callErr
 		})
-		if err != nil {
-			if errors.Is(err, errOCREmptyResult) {
-				log.Printf("app ocr returned empty text")
-				a.setStatus("OCR 未识别到文本")
-				a.pushError("", err.Error())
-				return
-			}
-			if errors.Is(err, errOCRTranslateEmpty) {
-				log.Printf("app ocr translate returned empty result")
-				a.setStatus("OCR 翻译失败")
-				a.pushError(text, err.Error())
-				return
-			}
-			log.Printf("app ocr request failed: %v", err)
-			a.setStatus("OCR 失败")
-			a.pushError("", err.Error())
+
+		if !a.overlayCurrent(seq) {
+			log.Printf("app ocr result dropped: overlay closed")
 			return
 		}
 
-		log.Printf("app ocr translate success: source_chars=%d result_chars=%d source_preview=%q result_preview=%q", len(text), len(translation), previewText(text, 80), previewText(translation, 80))
-		a.setStatus("就绪")
-		a.pushResult(text, translation)
+		update := uidaemon.OverlayPayload{
+			Rect:        basePayload.Rect,
+			WindowRect:  basePayload.WindowRect,
+			BarSide:     basePayload.BarSide,
+			ImageWidth:  basePayload.ImageWidth,
+			ImageHeight: basePayload.ImageHeight,
+			Source:      strings.TrimSpace(result.SourceText),
+			Translation: strings.TrimSpace(result.Translation),
+			Style:       basePayload.Style,
+			LatencyMs:   time.Since(startedAt).Milliseconds(),
+		}
+		for _, block := range result.Blocks {
+			update.Blocks = append(update.Blocks, toTranslatedBlock(block))
+		}
+		clipBlockOverlaps(update.Blocks)
+		attachBlurredBackgrounds(pngBytes, update.Blocks)
+
+		switch {
+		case err != nil:
+			log.Printf("app ocr blocks request failed: %v", err)
+			update.Error = err.Error()
+			update.Stage = "error"
+			update.Progress = 0
+			a.setStatus("OCR 失败")
+		case update.Source == "":
+			log.Printf("app ocr returned empty text")
+			update.Error = errOCREmptyResult.Error()
+			update.Stage = "error"
+			update.Progress = 0
+			a.setStatus("OCR 未识别到文本")
+		default:
+			log.Printf("app ocr blocks success: blocks=%d source_chars=%d result_chars=%d", len(update.Blocks), len(update.Source), len(update.Translation))
+			update.Stage = "done"
+			update.Progress = 100
+			update.Lines = len(update.Blocks)
+			a.setStatus("就绪")
+		}
+
+		updateCtx, updateCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer updateCancel()
+		if err := a.overlayUI.ShowOverlay(updateCtx, update); err != nil {
+			log.Printf("app update screenshot overlay failed: %v", err)
+		}
 	}()
+}
+
+// ocrTranslateFrame prefers the line-level blocks endpoint. Older packaged
+// engines only expose /api/v1/ocr + /v1/chat/completions; fall back to the
+// legacy two-step path so the overlay still works (as a full-text panel).
+func (a *App) ocrTranslateFrame(ctx context.Context, pngBytes []byte) (backend.OCRTranslateBlocksResult, error) {
+	result, err := a.client.OCRTranslateBlocksWithLanguages(
+		ctx, pngBytes, a.cfg.SourceLanguage, a.cfg.TargetLanguage,
+	)
+	if err == nil {
+		return result, nil
+	}
+	if !errors.Is(err, backend.ErrOCRBlocksUnsupported) {
+		return result, err
+	}
+
+	log.Printf("blocks endpoint unavailable, falling back to legacy ocr+translate")
+	text, ocrErr := a.client.OCRImage(ctx, pngBytes)
+	if ocrErr != nil {
+		return backend.OCRTranslateBlocksResult{}, ocrErr
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return backend.OCRTranslateBlocksResult{}, errOCREmptyResult
+	}
+	translation, translateErr := a.client.TranslateWithLanguages(
+		ctx, text, a.cfg.SourceLanguage, a.cfg.TargetLanguage,
+	)
+	if translateErr != nil {
+		return backend.OCRTranslateBlocksResult{}, translateErr
+	}
+	return backend.OCRTranslateBlocksResult{
+		SourceText:  text,
+		Translation: strings.TrimSpace(translation),
+	}, nil
+}
+
+// updateOverlayProgress refreshes the screenshot overlay's stage/progress
+// without touching its content. It is a no-op once the overlay was closed.
+func (a *App) updateOverlayProgress(seq int, base uidaemon.OverlayPayload, stage string, progress, lines int) {
+	if !a.overlayCurrent(seq) {
+		return
+	}
+	base.Loading = true
+	base.Stage = stage
+	base.Progress = progress
+	base.Lines = lines
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := a.overlayUI.ShowOverlay(ctx, base); err != nil {
+		log.Printf("app update overlay progress failed: %v", err)
+	}
+}
+
+func glossaryHits(hits []backend.GlossaryHit) []uidaemon.GlossaryHit {
+	if len(hits) == 0 {
+		return nil
+	}
+	result := make([]uidaemon.GlossaryHit, 0, len(hits))
+	for _, hit := range hits {
+		result = append(result, uidaemon.GlossaryHit{
+			Term:        hit.Term,
+			Translation: hit.Translation,
+			Source:      hit.Source,
+			Note:        hit.Note,
+		})
+	}
+	return result
+}
+
+func toTranslatedBlock(block backend.OCRBlock) uidaemon.TranslatedBlock {
+	sourceHeight := block.LineHeight
+	if sourceHeight <= 0 {
+		sourceHeight = block.H
+	}
+	return uidaemon.TranslatedBlock{
+		Text:         block.Text,
+		Translation:  block.Translation,
+		X:            block.X,
+		Y:            block.Y,
+		W:            block.W,
+		H:            block.H,
+		Score:        block.Score,
+		GlossaryHits: glossaryHits(block.GlossaryHits),
+		Angle:        block.Angle,
+		CX:           block.CX,
+		CY:           block.CY,
+		LineWidth:    block.LineWidth,
+		LineHeight:   block.LineHeight,
+		SourceHeight: sourceHeight,
+	}
+}
+
+func screenRect(rect win.Rect) uidaemon.ScreenRect {
+	return uidaemon.ScreenRect{
+		X:      int(rect.Left),
+		Y:      int(rect.Top),
+		Width:  int(rect.Width()),
+		Height: int(rect.Height()),
+	}
+}
+
+func (a *App) beginOverlay() int {
+	a.overlayMu.Lock()
+	defer a.overlayMu.Unlock()
+	a.overlaySeq++
+	return a.overlaySeq
+}
+
+func (a *App) overlayCurrent(seq int) bool {
+	a.overlayMu.Lock()
+	defer a.overlayMu.Unlock()
+	return a.overlaySeq == seq
+}
+
+func (a *App) invalidateOverlay() {
+	a.beginOverlay()
+}
+
+// ── 区域实时翻译 ──────────────────────────────────────────
+
+func (a *App) handleLiveHotkey() {
+	a.liveMu.Lock()
+	active := a.liveActive
+	a.liveMu.Unlock()
+
+	if active {
+		a.stopLiveSession(true)
+		return
+	}
+	if !a.cfg.LiveEnabled {
+		a.pushError("", "实时翻译已在设置中禁用")
+		return
+	}
+	if a.overlay != nil {
+		return
+	}
+	a.resultMu.Lock()
+	busy := a.busy
+	a.resultMu.Unlock()
+	if busy {
+		log.Printf("app live translation ignored: another ocr/translate is running")
+		return
+	}
+
+	// Drop any stale one-shot screenshot result before taking over.
+	a.invalidateOverlay()
+
+	log.Printf("app live translation selection start")
+	a.setStatus("实时翻译框选区域...")
+	go a.ensureBackendReady()
+
+	a.overlay = NewSelectionOverlay(liveSelectionHint, a.startLiveSession, func() {
+		a.overlay = nil
+		a.setStatus("就绪")
+	})
+	if err := a.overlay.Show(a.hwnd); err != nil {
+		log.Printf("app show live selection overlay failed: %v", err)
+		a.overlay = nil
+		a.setStatus("实时翻译失败")
+		a.pushError("", err.Error())
+	}
+}
+
+func (a *App) overlayStyle() uidaemon.OverlayStyle {
+	return uidaemon.OverlayStyle{
+		FontFamily: a.cfg.OverlayFontFamily,
+		FontWeight: a.cfg.OverlayFontWeight,
+	}
+}
+
+func (a *App) prewarmOverlayUI() {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := a.overlayUI.EnsureReady(ctx); err != nil {
+		log.Printf("app prewarm overlay ui failed: %v", err)
+	}
+}
+
+func (a *App) startLiveSession(rect win.Rect) {
+	a.overlay = nil
+	a.stopLiveSession(false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	windowRect, barSide := computeFrameLayout(rect)
+	initial := uidaemon.LivePayload{
+		Anchor:     screenRect(rect),
+		WindowRect: windowRect,
+		BarSide:    barSide,
+		Status:     "translating",
+		Stage:      "ocr",
+		Progress:   10,
+	}
+	a.liveMu.Lock()
+	a.liveCancel = cancel
+	a.liveActive = true
+	a.livePaused = false
+	a.liveDragging = false
+	a.liveDragEpoch++
+	a.liveLast = initial
+	a.liveRect = rect
+	a.liveBarSide = barSide
+	a.liveMu.Unlock()
+
+	a.setStatus("实时翻译监听中")
+	a.pushLive(initial)
+	go a.liveMoveWatcher(ctx)
+	go a.liveLoop(ctx, rect)
+}
+
+// liveLoop captures the selected region, deduplicates identical frames, runs
+// OCR, then translates the recognized lines. OCR and the LLM are deliberately
+// serialized: both are CPU/memory-bandwidth bound, and overlapping them
+// measured ~30% slower than running them one after the other on a 20-thread
+// CPU, so a pipeline would lose time rather than save it.
+func (a *App) liveLoop(ctx context.Context, rect win.Rect) {
+	ticker := time.NewTicker(700 * time.Millisecond)
+	defer ticker.Stop()
+
+	var lastHash uint64
+	first := true
+	lastEpoch := -1
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		if a.isLivePaused() || a.isLiveDragging() {
+			continue
+		}
+
+		// The user may drag or resize the live window at any time; derive the
+		// monitored area from the window's current geometry.
+		captureRect, windowRect, barSide, geometryOK := a.currentLiveGeometry()
+		if !geometryOK {
+			continue
+		}
+		epoch := a.liveEpoch()
+		if epoch != lastEpoch {
+			// A drag/resize invalidated the previous content; recapture even if
+			// the new pixels happen to hash the same.
+			lastEpoch = epoch
+			first = true
+			lastHash = 0
+		}
+
+		startedAt := time.Now()
+		// The overlay is excluded from capture (SetWindowDisplayAffinity), so it
+		// can stay visible while we grab the screen. Only fall back to hiding it
+		// when affinity is unavailable; hide/show flickers visibly.
+		overlayWindow := win.FindWindowByTitle(overlayWindowTitle)
+		captureExcluded := overlayWindow != 0 && win.WindowCaptureExcluded(overlayWindow)
+		if overlayWindow != 0 && !captureExcluded {
+			win.ShowWindow(overlayWindow, win.SWHide)
+			time.Sleep(30 * time.Millisecond)
+		}
+		pngBytes, err := win.CaptureScreenPNG(captureRect)
+		if overlayWindow != 0 && !captureExcluded {
+			win.ShowWindow(overlayWindow, win.SWShowNoActivate)
+		}
+		if err != nil {
+			log.Printf("app live capture failed: %v", err)
+			continue
+		}
+		digest := hashBytes(pngBytes)
+		if !first && digest == lastHash {
+			continue
+		}
+		first = false
+		lastHash = digest
+		a.pushLiveProgress("ocr", 15, 0)
+
+		reqCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		var result backend.OCRTranslateBlocksResult
+		var callErr error
+		ocr, ocrErr := a.client.OCRBlocks(reqCtx, pngBytes)
+		switch {
+		case errors.Is(ocrErr, backend.ErrOCRBlocksUnsupported):
+			log.Printf("app live ocr endpoint unsupported, using legacy combined path")
+			a.pushLiveProgress("translate", 55, 0)
+			result, callErr = a.ocrTranslateFrame(reqCtx, pngBytes)
+		case ocrErr != nil:
+			callErr = ocrErr
+		default:
+			a.pushLiveProgress("translate", 55, len(ocr.LineBoxes))
+			result, callErr = a.translateOCRResult(reqCtx, ocr)
+		}
+		cancel()
+		if ctx.Err() != nil {
+			return
+		}
+
+		// A drag/resize during inference invalidates this frame: the watcher
+		// already cleared the overlay, so never push stale blocks back.
+		if a.liveEpoch() != epoch || a.isLiveDragging() {
+			first = true
+			lastHash = 0
+			continue
+		}
+		// If the window moved/resized while the engine was working, discard this
+		// frame and immediately process the new region instead.
+		if nextAnchor, _, _, nextOK := a.currentLiveGeometry(); nextOK && nextAnchor != captureRect {
+			first = true
+			lastHash = 0
+			continue
+		}
+
+		payload := a.livePayloadFrom(captureRect, windowRect, barSide, pngBytes, result, callErr)
+		payload.LatencyMs = time.Since(startedAt).Milliseconds()
+		a.pushLive(payload)
+
+		if callErr != nil {
+			// Retry the same screen after the engine becomes available.
+			first = true
+			lastHash = 0
+		}
+	}
+}
+
+// translateOCRResult translates an already-OCR'd frame, falling back to
+// whole-text translation for engines without the split blocks endpoint.
+func (a *App) translateOCRResult(ctx context.Context, ocr backend.OCRBlocksResult) (backend.OCRTranslateBlocksResult, error) {
+	text := strings.TrimSpace(ocr.Text)
+	if len(ocr.LineBoxes) > 0 {
+		result, err := a.client.TranslateBlocksWithLanguages(
+			ctx,
+			ocr.LineBoxes,
+			ocr.Text,
+			ocr.ImageWidth,
+			ocr.ImageHeight,
+			a.cfg.SourceLanguage,
+			a.cfg.TargetLanguage,
+		)
+		if !errors.Is(err, backend.ErrOCRBlocksUnsupported) {
+			return result, err
+		}
+		log.Printf("translate_blocks endpoint unavailable, translating whole text")
+	}
+	if text == "" {
+		// Blank region: clear the overlay quietly instead of showing an error.
+		return backend.OCRTranslateBlocksResult{}, nil
+	}
+	translation, err := a.client.TranslateWithLanguages(
+		ctx, text, a.cfg.SourceLanguage, a.cfg.TargetLanguage,
+	)
+	if err != nil {
+		return backend.OCRTranslateBlocksResult{}, err
+	}
+	return backend.OCRTranslateBlocksResult{
+		SourceText:  text,
+		Translation: strings.TrimSpace(translation),
+		ImageWidth:  ocr.ImageWidth,
+		ImageHeight: ocr.ImageHeight,
+	}, nil
+}
+
+// currentLiveGeometry derives the monitored image area from the live window's
+// current screen geometry. Dragging or resizing the window therefore changes
+// the capture region immediately.
+func (a *App) currentLiveGeometry() (win.Rect, win.Rect, string, bool) {
+	a.liveMu.Lock()
+	base := a.liveRect
+	side := a.liveBarSide
+	a.liveMu.Unlock()
+
+	if base.Width() <= 0 || base.Height() <= 0 {
+		return base, win.Rect{}, side, false
+	}
+	hwnd := win.FindWindowByTitle(overlayWindowTitle)
+	if hwnd == 0 || !win.IsWindowVisible(hwnd) {
+		return base, win.Rect{}, side, false
+	}
+	window, err := win.GetWindowRect(hwnd)
+	if err != nil || window.Width() <= 0 || window.Height() <= 0 {
+		return base, win.Rect{}, side, false
+	}
+
+	dpi := win.DpiForRect(window)
+	scale := float64(dpi) / 96.0
+	if scale <= 0 {
+		scale = 1
+	}
+	border := int32(math.Round(2 * scale))
+	bar := int32(math.Round(44 * scale))
+
+	var anchor win.Rect
+	if side == "bottom" {
+		anchor = win.Rect{
+			Left:   window.Left + border,
+			Top:    window.Top + border,
+			Right:  window.Right - border,
+			Bottom: window.Bottom - border - bar,
+		}
+	} else {
+		anchor = win.Rect{
+			Left:   window.Left + border,
+			Top:    window.Top + border + bar,
+			Right:  window.Right - border,
+			Bottom: window.Bottom - border,
+		}
+	}
+	if anchor.Width() < 10 || anchor.Height() < 10 {
+		return base, window, side, false
+	}
+	return anchor, window, side, true
+}
+
+func (a *App) livePayloadFrom(anchor win.Rect, window win.Rect, barSide string, pngBytes []byte, result backend.OCRTranslateBlocksResult, err error) uidaemon.LivePayload {
+	if window.Width() <= 0 || window.Height() <= 0 {
+		computed, computedSide := computeFrameLayout(anchor)
+		window = win.Rect{
+			Left:   int32(computed.X),
+			Top:    int32(computed.Y),
+			Right:  int32(computed.X + computed.Width),
+			Bottom: int32(computed.Y + computed.Height),
+		}
+		barSide = computedSide
+	}
+	payload := uidaemon.LivePayload{
+		Anchor:      screenRect(anchor),
+		WindowRect:  screenRect(window),
+		BarSide:     barSide,
+		ImageWidth:  int(anchor.Width()),
+		ImageHeight: int(anchor.Height()),
+		Source:      strings.TrimSpace(result.SourceText),
+		Translation: strings.TrimSpace(result.Translation),
+		Status:      "listening",
+		Style:       a.overlayStyle(),
+	}
+	for _, block := range result.Blocks {
+		payload.Blocks = append(payload.Blocks, toTranslatedBlock(block))
+	}
+	clipBlockOverlaps(payload.Blocks)
+	attachBlurredBackgrounds(pngBytes, payload.Blocks)
+	if err != nil {
+		payload.Status = "error"
+		payload.Error = err.Error()
+		payload.Stage = "error"
+		payload.Progress = 0
+	} else {
+		payload.Stage = "done"
+		payload.Progress = 100
+		payload.Lines = len(payload.Blocks)
+	}
+	return payload
+}
+
+func sameWindowRect(a, b win.Rect) bool {
+	return a.Left == b.Left && a.Top == b.Top && a.Right == b.Right && a.Bottom == b.Bottom
+}
+
+// clipBlockOverlaps shrinks nearly-horizontal line boxes so a line never covers
+// the next one, even when OCR boxes touch or overlap in dense text. The
+// original height is preserved in SourceHeight so the font size still matches
+// the source text.
+func clipBlockOverlaps(blocks []uidaemon.TranslatedBlock) {
+	for index := range blocks {
+		block := &blocks[index]
+		if math.Abs(block.Angle) > 3 || block.SourceHeight <= 0 {
+			continue
+		}
+		top := block.CY - block.LineHeight/2
+		if block.LineHeight <= 0 {
+			top = block.Y
+		}
+		bottom := top + block.SourceHeight
+		limit := math.Inf(1)
+		for otherIndex := range blocks {
+			if otherIndex == index {
+				continue
+			}
+			other := &blocks[otherIndex]
+			if math.Abs(other.Angle) > 3 {
+				continue
+			}
+			otherTop := other.CY - other.LineHeight/2
+			if other.LineHeight <= 0 {
+				otherTop = other.Y
+			}
+			if otherTop <= top+0.5 {
+				continue
+			}
+			if block.X+block.W <= other.X || other.X+other.W <= block.X {
+				continue
+			}
+			if otherTop < limit {
+				limit = otherTop
+			}
+		}
+		if math.IsInf(limit, 1) {
+			continue
+		}
+		const gap = 1.0
+		if bottom <= limit-gap {
+			continue
+		}
+		newHeight := limit - gap - top
+		if newHeight < 3 {
+			newHeight = 3
+		}
+		if block.LineHeight > 0 {
+			block.LineHeight = newHeight
+			block.CY = top + newHeight/2
+		}
+		block.H = newHeight
+	}
+}
+
+// pushLiveStatus updates only the status bubble while keeping the current
+// payload, used when resuming after a drag.
+func (a *App) pushLiveStatus(status string) {
+	a.liveMu.Lock()
+	payload := a.liveLast
+	a.liveMu.Unlock()
+	payload.Status = status
+	payload.Stage = ""
+	payload.Progress = 0
+	a.pushLive(payload)
+}
+
+// pushLiveProgress shows the current recognition/translation stage while the
+// existing blocks stay on screen.
+func (a *App) pushLiveProgress(stage string, progress, lines int) {
+	a.liveMu.Lock()
+	payload := a.liveLast
+	active := a.liveActive
+	a.liveMu.Unlock()
+	if !active {
+		return
+	}
+	payload.Status = "translating"
+	payload.Stage = stage
+	payload.Progress = progress
+	payload.Lines = lines
+	payload.Error = ""
+	a.pushLive(payload)
+}
+
+// clearLiveContent wipes every translated block so the image area becomes
+// transparent again while the user drags/resizes the live window.
+func (a *App) clearLiveContent() {
+	a.liveMu.Lock()
+	payload := a.liveLast
+	a.liveMu.Unlock()
+	payload.Blocks = nil
+	payload.Source = ""
+	payload.Translation = ""
+	payload.Error = ""
+	payload.LatencyMs = 0
+	payload.Status = "paused"
+	payload.Stage = ""
+	payload.Progress = 0
+	payload.Lines = 0
+	a.pushLive(payload)
+}
+
+func (a *App) liveEpoch() int {
+	a.liveMu.Lock()
+	defer a.liveMu.Unlock()
+	return a.liveDragEpoch
+}
+
+func (a *App) isLiveDragging() bool {
+	a.liveMu.Lock()
+	defer a.liveMu.Unlock()
+	return a.liveDragging
+}
+
+func (a *App) isLivePaused() bool {
+	a.liveMu.Lock()
+	defer a.liveMu.Unlock()
+	return a.livePaused
+}
+
+// beginLiveDrag marks a new drag and advances the epoch; it returns true only
+// on the transition into dragging.
+func (a *App) beginLiveDrag() bool {
+	a.liveMu.Lock()
+	defer a.liveMu.Unlock()
+	if a.liveDragging {
+		return false
+	}
+	a.liveDragging = true
+	a.liveDragEpoch++
+	return true
+}
+
+func (a *App) endLiveDrag() {
+	a.liveMu.Lock()
+	a.liveDragging = false
+	a.liveMu.Unlock()
+}
+
+// liveMoveWatcher polls the overlay window rect quickly (60 ms) so a drag or
+// resize pauses translation and blanks the overlay immediately, instead of
+// waiting for the 700 ms capture loop. When the window has been stable for
+// ~300 ms, capture resumes on the next loop tick.
+func (a *App) liveMoveWatcher(ctx context.Context) {
+	ticker := time.NewTicker(60 * time.Millisecond)
+	defer ticker.Stop()
+	var last win.Rect
+	stable := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		_, window, _, ok := a.currentLiveGeometry()
+		if !ok {
+			continue
+		}
+		if last.Width() > 0 && !sameWindowRect(window, last) {
+			stable = 0
+			if a.beginLiveDrag() {
+				log.Printf("app live drag start: clearing overlay")
+				a.clearLiveContent()
+			}
+		} else if a.isLiveDragging() {
+			stable++
+			if stable >= 5 {
+				a.endLiveDrag()
+				if !a.isLivePaused() {
+					a.pushLiveStatus("listening")
+				}
+				stable = 0
+			}
+		}
+		last = window
+	}
+}
+
+func (a *App) pushLive(payload uidaemon.LivePayload) {
+	a.liveMu.Lock()
+	a.liveLast = payload
+	a.liveMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := a.overlayUI.ShowLive(ctx, payload); err != nil {
+		log.Printf("app show live panel failed: %v", err)
+	}
+}
+
+func (a *App) setLivePaused(paused bool) {
+	a.liveMu.Lock()
+	if !a.liveActive {
+		a.liveMu.Unlock()
+		return
+	}
+	a.livePaused = paused
+	if !paused {
+		// Force the capture worker to re-grab the current screen: frames can
+		// have been dropped while paused, so dedupe must not skip them.
+		a.liveDragEpoch++
+	}
+	payload := a.liveLast
+	payload.Stage = ""
+	payload.Progress = 0
+	payload.Lines = 0
+	a.liveMu.Unlock()
+
+	if paused {
+		payload.Status = "paused"
+		a.setStatus("实时翻译已暂停")
+	} else {
+		payload.Status = "listening"
+		a.setStatus("实时翻译监听中")
+	}
+	payload.Error = ""
+	a.pushLive(payload)
+}
+
+func (a *App) stopLiveSession(hideUI bool) {
+	a.liveMu.Lock()
+	cancel := a.liveCancel
+	active := a.liveActive
+	a.liveCancel = nil
+	a.liveActive = false
+	a.livePaused = false
+	a.liveLast = uidaemon.LivePayload{}
+	a.liveMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	// Make sure a capture interrupted mid-loop never leaves the window cloaked.
+	if hwnd := win.FindWindowByTitle(overlayWindowTitle); hwnd != 0 {
+		win.SetWindowCloaked(hwnd, false)
+	}
+	if !active {
+		return
+	}
+	log.Printf("app live translation stopped")
+	a.setStatus("就绪")
+	if hideUI {
+		ctx, cancelCtx := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelCtx()
+		if err := a.ui.Hide(ctx); err != nil {
+			log.Printf("app hide live panel failed: %v", err)
+		}
+	}
+}
+
+const (
+	frameBarDip    = 44.0
+	frameBorderDip = 2.0
+)
+
+// computeFrameLayout expands the selected image area by a toolbar strip and a
+// border placed outside the image. The strip prefers the space above the
+// selection and falls back below it, so it never covers translated text.
+func computeFrameLayout(rect win.Rect) (uidaemon.ScreenRect, string) {
+	dpi := win.DpiForRect(rect)
+	scale := float64(dpi) / 96.0
+	if scale <= 0 {
+		scale = 1
+	}
+	bar := int32(math.Round(frameBarDip * scale))
+	border := int32(math.Round(frameBorderDip * scale))
+
+	area := win.WorkAreaForPoint(win.Point{X: rect.Left, Y: rect.Top})
+	side := "top"
+	y := rect.Top - bar - border
+	if y < area.Top {
+		side = "bottom"
+		y = rect.Top - border
+		if y+rect.Height()+border+bar > area.Bottom {
+			// No room outside on either side (e.g. full-screen selection):
+			// keep the strip above and let it overlap the image's top edge.
+			side = "top"
+			y = area.Top
+		}
+	}
+
+	window := uidaemon.ScreenRect{
+		X:      int(rect.Left - border),
+		Y:      int(y),
+		Width:  int(rect.Width() + 2*border),
+		Height: int(rect.Height() + 2*border + bar),
+	}
+	return window, side
+}
+
+func hashBytes(data []byte) uint64 {
+	digest := fnv.New64a()
+	_, _ = digest.Write(data)
+	return digest.Sum64()
 }
 
 func (a *App) finishBusy() {
@@ -515,11 +1414,12 @@ func (a *App) finishBusy() {
 	a.resultMu.Unlock()
 }
 
-func (a *App) pushResult(source, result string) {
+func (a *App) pushResult(source, result string, latencyMs int64) {
 	a.resultMu.Lock()
 	a.source = source
 	a.result = result
 	a.lastErr = ""
+	a.latencyMs = latencyMs
 	a.resultMu.Unlock()
 	log.Printf("app push result: source_chars=%d result_chars=%d", len(source), len(result))
 	win.PostMessage(a.hwnd, wmTranslateDone, 0, 0)
@@ -530,6 +1430,7 @@ func (a *App) pushError(source, errMsg string) {
 	a.source = source
 	a.result = ""
 	a.lastErr = errMsg
+	a.latencyMs = 0
 	a.resultMu.Unlock()
 	log.Printf("app push error: source_chars=%d error=%q", len(source), errMsg)
 	win.PostMessage(a.hwnd, wmTranslateError, 0, 0)
@@ -540,6 +1441,7 @@ func (a *App) pushLoading(source string) {
 	a.source = source
 	a.result = ""
 	a.lastErr = ""
+	a.latencyMs = 0
 	a.resultMu.Unlock()
 	log.Printf("app push loading: source_chars=%d preview=%q", len(source), previewText(source, 120))
 	win.PostMessage(a.hwnd, wmTranslateLoad, 0, 0)
@@ -570,12 +1472,21 @@ func (a *App) showTrayMenu() {
 		ocrToggleText = "禁用 OCR"
 	}
 
+	liveText := "实时翻译"
+	a.liveMu.Lock()
+	if a.liveActive {
+		liveText = "停止实时翻译"
+	}
+	a.liveMu.Unlock()
+
 	items := []win.MenuItem{
 		{ID: menuIDStatus, Text: "状态: " + a.status, Disabled: true},
 		{ID: menuIDHotkey, Text: "翻译快捷键: " + a.cfg.HotkeyDisplay, Disabled: true},
-		{ID: menuIDOCR, Text: "OCR 快捷键: " + a.cfg.OcrHotkeyDisplay, Disabled: true},
+		{ID: menuIDOCR, Text: "截图快捷键: " + a.cfg.OcrHotkeyDisplay, Disabled: true},
 		{Separator: true},
 		{ID: menuIDTranslate, Text: "文本翻译"},
+		{ID: menuIDOCRRun, Text: "截图翻译（悬浮层）"},
+		{ID: menuIDLive, Text: liveText},
 		{ID: menuIDToggleOCR, Text: ocrToggleText},
 		{Separator: true},
 		{ID: menuIDExit, Text: "退出"},
@@ -593,13 +1504,9 @@ func (a *App) openTranslate() {
 }
 
 func (a *App) showWailsTranslate() error {
-	a.suspendHotkeys()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := a.ui.ShowTranslate(ctx); err != nil {
-		if resumeErr := a.resumeHotkeys(); resumeErr != nil {
-			log.Printf("app resume hotkeys after translate open failed: %v", resumeErr)
-		}
 		return err
 	}
 	log.Printf("app wake ai engine after translate opened")
@@ -617,13 +1524,9 @@ func (a *App) openSettings() {
 }
 
 func (a *App) showWailsSettings() error {
-	a.suspendHotkeys()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := a.ui.ShowSettings(ctx); err != nil {
-		if resumeErr := a.resumeHotkeys(); resumeErr != nil {
-			log.Printf("app resume hotkeys after settings open failed: %v", resumeErr)
-		}
 		return err
 	}
 	// 设置弹窗会展示引擎状态徽标。若 AI 引擎正处于休眠（空闲自动回收），
@@ -641,18 +1544,33 @@ func (a *App) reloadSettings() {
 		a.pushError("", err.Error())
 		return
 	}
-	if next == a.cfg {
+	if reflect.DeepEqual(next, a.cfg) {
 		return
 	}
 	loggingChanged := next.LoggingEnabled != a.cfg.LoggingEnabled
 	portChanged := next.ServerPort != a.cfg.ServerPort
 	deviceChanged := next.AccelerationDevice != a.cfg.AccelerationDevice
+	threadsChanged := next.AIThreads != a.cfg.AIThreads
+	downloadChanged := next.ModelDownloadSource != a.cfg.ModelDownloadSource ||
+		next.ModelDownloadBaseURL != a.cfg.ModelDownloadBaseURL
+	// Adding or removing other catalogue entries must not restart a working
+	// engine; only a change to the active model file does. A source-only change
+	// is handled by needsDownload below.
+	prevActive := config.ActiveModel(a.cfg)
+	nextActive := config.ActiveModel(next)
+	activeChanged := prevActive.ID != nextActive.ID ||
+		prevActive.Repo != nextActive.Repo ||
+		prevActive.File != nextActive.File ||
+		prevActive.Dir != nextActive.Dir
 	if err := a.applySettings(next); err != nil {
 		log.Printf("app apply reloaded settings failed: %v", err)
 		a.pushError("", err.Error())
 		return
 	}
-	if loggingChanged || portChanged || deviceChanged {
+	// The download source only matters when the model still has to be fetched;
+	// do not reload an already working model just because the preference changed.
+	needsDownload := (downloadChanged || activeChanged) && !config.ModelInstalled(a.baseDir, next)
+	if loggingChanged || portChanged || deviceChanged || threadsChanged || activeChanged || needsDownload {
 		go a.restartBackendForConfigChange(portChanged)
 	}
 }
@@ -663,17 +1581,20 @@ func (a *App) applySettings(next config.Config) error {
 	launchChanged := next.LaunchAtLogin != prev.LaunchAtLogin
 	win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
 	win.UnregisterHotKey(a.hwnd, hotkeyOCR)
+	win.UnregisterHotKey(a.hwnd, hotkeyLive)
 
 	a.cfg = next
 	if err := a.registerHotkeys(); err != nil {
 		log.Printf("app apply settings failed, restoring previous config: %v", err)
 		win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
 		win.UnregisterHotKey(a.hwnd, hotkeyOCR)
+		win.UnregisterHotKey(a.hwnd, hotkeyLive)
 		a.cfg = prev
 		_ = a.registerHotkeys()
 		if keepSuspended {
 			win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
 			win.UnregisterHotKey(a.hwnd, hotkeyOCR)
+			win.UnregisterHotKey(a.hwnd, hotkeyLive)
 		}
 		_ = config.Save(a.baseDir, prev)
 		return err
@@ -683,11 +1604,13 @@ func (a *App) applySettings(next config.Config) error {
 		log.Printf("app save settings failed, restoring previous config: %v", err)
 		win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
 		win.UnregisterHotKey(a.hwnd, hotkeyOCR)
+		win.UnregisterHotKey(a.hwnd, hotkeyLive)
 		a.cfg = prev
 		_ = a.registerHotkeys()
 		if keepSuspended {
 			win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
 			win.UnregisterHotKey(a.hwnd, hotkeyOCR)
+			win.UnregisterHotKey(a.hwnd, hotkeyLive)
 		}
 		return err
 	}
@@ -697,20 +1620,26 @@ func (a *App) applySettings(next config.Config) error {
 			log.Printf("app set launch at login failed, restoring previous config: %v", err)
 			win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
 			win.UnregisterHotKey(a.hwnd, hotkeyOCR)
+			win.UnregisterHotKey(a.hwnd, hotkeyLive)
 			a.cfg = prev
 			_ = a.registerHotkeys()
 			if keepSuspended {
 				win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
 				win.UnregisterHotKey(a.hwnd, hotkeyOCR)
+				win.UnregisterHotKey(a.hwnd, hotkeyLive)
 			}
 			_ = config.Save(a.baseDir, prev)
 			return fmt.Errorf("设置开机启动失败: %w", err)
 		}
 	}
 
+	if !a.cfg.LiveEnabled {
+		a.stopLiveSession(true)
+	}
 	if keepSuspended {
 		win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
 		win.UnregisterHotKey(a.hwnd, hotkeyOCR)
+		win.UnregisterHotKey(a.hwnd, hotkeyLive)
 	}
 	_ = applog.Configure(filepath.Join(a.baseDir, "translate.log"), a.cfg.LoggingEnabled)
 	a.setBackendIdleTimeout(a.cfg.AIIdleTimeout())
@@ -784,6 +1713,7 @@ func (a *App) toggleOCR() {
 		}
 	} else {
 		win.UnregisterHotKey(a.hwnd, hotkeyOCR)
+		win.UnregisterHotKey(a.hwnd, hotkeyLive)
 		a.cfg.OcrEnabled = false
 	}
 
@@ -935,31 +1865,51 @@ func (a *App) showLoading() {
 }
 
 func (a *App) showWailsResult(source, result, errMsg string, loading bool) error {
+	a.resultMu.Lock()
+	latencyMs := a.latencyMs
+	a.resultMu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	return a.ui.ShowResult(ctx, uidaemon.ResultPayload{
-		Source:  source,
-		Result:  result,
-		Error:   errMsg,
-		Loading: loading,
+		Source:    source,
+		Result:    result,
+		Error:     errMsg,
+		Loading:   loading,
+		LatencyMs: latencyMs,
 	})
 }
 
 func (a *App) handleUIDaemonEvent(event int) {
 	switch event {
-	case uidaemon.EventSettingsHidden:
-		win.PostMessage(a.hwnd, wmSettingsClosed, 0, 0)
-	case uidaemon.EventConfigSaved:
+	case uidaemon.EventSettingsHidden, uidaemon.EventConfigSaved:
 		win.PostMessage(a.hwnd, wmSettingsClosed, 0, 0)
 	case uidaemon.EventUIExited:
-		if a.hotkeysSuspended {
-			win.PostMessage(a.hwnd, wmSettingsClosed, 0, 0)
-		}
+		// Always re-post: resumeHotkeys is idempotent, and reading the flag on
+		// this goroutine would race the window thread.
+		win.PostMessage(a.hwnd, wmSettingsClosed, 0, 0)
+	case uidaemon.EventHotkeyPause:
+		win.PostMessage(a.hwnd, wmHotkeyPause, 0, 0)
+	case uidaemon.EventHotkeyResume:
+		win.PostMessage(a.hwnd, wmHotkeyResume, 0, 0)
+	case uidaemon.EventOverlayClosed:
+		win.PostMessage(a.hwnd, wmOverlayClosed, 0, 0)
+	case uidaemon.EventLivePause:
+		win.PostMessage(a.hwnd, wmLivePause, 0, 0)
+	case uidaemon.EventLiveResume:
+		win.PostMessage(a.hwnd, wmLiveResume, 0, 0)
+	case uidaemon.EventLiveStop:
+		win.PostMessage(a.hwnd, wmLiveStop, 0, 0)
 	}
 }
 
 func (a *App) resolveWailsExe() string {
+	if a.uiPath != "" {
+		if _, err := os.Stat(a.uiPath); err == nil {
+			return a.uiPath
+		}
+	}
 	candidates := []string{
+		filepath.Join(a.baseDir, runtimebundle.DirName, "translate-ui.exe"),
 		filepath.Join(a.baseDir, "build", "bin", "translate-ui.exe"),
 		filepath.Join(a.baseDir, "translate-ui.exe"),
 	}
@@ -1001,6 +1951,12 @@ func mainWindowProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		case menuIDTranslate:
 			currentApp.openTranslate()
 			return 0
+		case menuIDOCRRun:
+			currentApp.handleOCRGo()
+			return 0
+		case menuIDLive:
+			currentApp.handleLiveHotkey()
+			return 0
 		case menuIDToggleOCR:
 			currentApp.toggleOCR()
 			return 0
@@ -1024,6 +1980,9 @@ func mainWindowProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 			return 0
 		case hotkeyOCR:
 			currentApp.handleOCRGo()
+			return 0
+		case hotkeyLive:
+			currentApp.handleLiveHotkey()
 			return 0
 		}
 	case wmTranslateDone:
@@ -1052,6 +2011,33 @@ func mainWindowProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 			log.Printf("resume hotkeys after wails settings closed: %v", err)
 			currentApp.pushError("", err.Error())
 		}
+		return 0
+	case wmHotkeyPause:
+		log.Printf("main window proc: hotkey recording started")
+		currentApp.suspendHotkeys()
+		return 0
+	case wmHotkeyResume:
+		log.Printf("main window proc: hotkey recording finished")
+		if err := currentApp.resumeHotkeys(); err != nil {
+			log.Printf("resume hotkeys after recording: %v", err)
+		}
+		return 0
+	case wmOverlayClosed:
+		log.Printf("main window proc: screenshot overlay closed")
+		currentApp.invalidateOverlay()
+		currentApp.finishBusy()
+		return 0
+	case wmLivePause:
+		log.Printf("main window proc: live translation paused")
+		currentApp.setLivePaused(true)
+		return 0
+	case wmLiveResume:
+		log.Printf("main window proc: live translation resumed")
+		currentApp.setLivePaused(false)
+		return 0
+	case wmLiveStop:
+		log.Printf("main window proc: live translation stopped by ui")
+		currentApp.stopLiveSession(false)
 		return 0
 	case win.WmClose:
 		log.Printf("main window proc: wm_close")

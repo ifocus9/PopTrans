@@ -16,9 +16,10 @@ import (
 
 // Server is the loopback control plane exposed by the single UI process.
 type Server struct {
-	baseDir string
-	token   string
-	handler Handler
+	baseDir    string
+	endpointDir string
+	token      string
+	handler    Handler
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -32,6 +33,8 @@ type Handler interface {
 	ShowSettings() error
 	ShowTranslate() error
 	ShowResult(payload ResultPayload) error
+	ShowOverlay(payload OverlayPayload) error
+	ShowLive(payload LivePayload) error
 	Hide() error
 	Quit() error
 	OnHidden()
@@ -39,9 +42,19 @@ type Handler interface {
 }
 
 func NewServer(baseDir string, handler Handler) *Server {
+	return NewServerWithEndpointDir(baseDir, baseDir, handler)
+}
+
+// NewServerWithEndpointDir lets a second UI process (overlay/live) publish its
+// endpoint in a separate directory so it can coexist with the main window.
+func NewServerWithEndpointDir(baseDir, endpointDir string, handler Handler) *Server {
+	if endpointDir == "" {
+		endpointDir = baseDir
+	}
 	return &Server{
-		baseDir: baseDir,
-		handler: handler,
+		baseDir:     baseDir,
+		endpointDir: endpointDir,
+		handler:     handler,
 	}
 }
 
@@ -69,6 +82,8 @@ func (s *Server) Start() (Endpoint, error) {
 	mux.HandleFunc(EndpointShowSettings, s.withAuth(s.handleShowSettings))
 	mux.HandleFunc(EndpointShowTranslate, s.withAuth(s.handleShowTranslate))
 	mux.HandleFunc(EndpointShowResult, s.withAuth(s.handleShowResult))
+	mux.HandleFunc(EndpointShowOverlay, s.withAuth(s.handleShowOverlay))
+	mux.HandleFunc(EndpointShowLive, s.withAuth(s.handleShowLive))
 	mux.HandleFunc(EndpointHide, s.withAuth(s.handleHide))
 	mux.HandleFunc(EndpointShutdown, s.withAuth(s.handleShutdown))
 	mux.HandleFunc(EndpointNotifyHidden, s.withAuth(s.handleNotifyHidden))
@@ -87,7 +102,7 @@ func (s *Server) Start() (Endpoint, error) {
 		StartedAt: time.Now().UTC(),
 	}
 
-	if err := WriteEndpoint(s.baseDir, s.endpoint); err != nil {
+	if err := WriteEndpoint(s.endpointDir, s.endpoint); err != nil {
 		_ = listener.Close()
 		s.listener = nil
 		s.server = nil
@@ -111,7 +126,7 @@ func (s *Server) Stop() {
 	s.listener = nil
 	s.mu.Unlock()
 
-	RemoveEndpoint(s.baseDir)
+	RemoveEndpoint(s.endpointDir)
 	if server == nil {
 		return
 	}
@@ -186,6 +201,40 @@ func (s *Server) handleShowResult(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"ok": true})
 }
 
+func (s *Server) handleShowOverlay(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var payload OverlayPayload
+	if err := jsonDecode(r, &payload); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.handler.ShowOverlay(payload); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s *Server) handleShowLive(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var payload LivePayload
+	if err := jsonDecode(r, &payload); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.handler.ShowLive(payload); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
 func (s *Server) handleHide(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -237,7 +286,8 @@ func writeJSON(w http.ResponseWriter, value any) {
 
 func jsonDecode(r *http.Request, out any) error {
 	defer r.Body.Close()
-	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	// Overlay updates embed a compressed screenshot; allow generous headroom.
+	dec := json.NewDecoder(io.LimitReader(r.Body, 64<<20))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(out); err != nil {
 		return fmt.Errorf("decode body: %w", err)

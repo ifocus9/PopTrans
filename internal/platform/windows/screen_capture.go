@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"image"
+	"image/jpeg"
 	"image/png"
 	"unsafe"
 
@@ -50,6 +51,23 @@ var (
 	procCreateSolidBrush       = modGDI32.NewProc("CreateSolidBrush")
 	procDeleteObject           = modGDI32.NewProc("DeleteObject")
 )
+
+// EncodePNGToJPEG converts a captured PNG into a smaller JPEG payload for the
+// overlay preview. OCR keeps using the lossless PNG bytes.
+func EncodePNGToJPEG(pngBytes []byte, quality int) ([]byte, error) {
+	img, err := png.Decode(bytes.NewReader(pngBytes))
+	if err != nil {
+		return nil, fmt.Errorf("decode captured png: %w", err)
+	}
+	if quality < 1 || quality > 100 {
+		quality = 85
+	}
+	var out bytes.Buffer
+	if err := jpeg.Encode(&out, img, &jpeg.Options{Quality: quality}); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
 
 func CaptureScreenPNG(rect Rect) ([]byte, error) {
 	rect = NormalizeRect(rect)

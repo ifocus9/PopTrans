@@ -2,8 +2,11 @@ import unittest
 
 from backend.translator import (
     Translator,
+    _glossary_hits,
+    build_lines_prompt,
     build_translation_prompt,
     normalize_target_language,
+    parse_numbered_translations,
 )
 
 
@@ -38,6 +41,34 @@ class TranslatorLanguageTests(unittest.TestCase):
         self.assertEqual(normalize_target_language("Vietnamese"), "vi")
         self.assertEqual(normalize_target_language("zh-Hant"), "zh-hant")
         self.assertIsNone(normalize_target_language(None))
+
+    def test_auto_language_is_treated_as_automatic(self):
+        self.assertIsNone(normalize_target_language("auto"))
+        self.assertIsNone(normalize_target_language("AUTO"))
+
+    def test_prompt_includes_matching_glossary_terms(self):
+        prompt = build_translation_prompt(
+            "zh",
+            "The GPU is fast.",
+            glossary=[
+                {"term": "GPU", "translation": "图形处理器", "source": "显卡手册"},
+                {"term": "CPU", "translation": "中央处理器", "source": ""},
+            ],
+        )
+        self.assertIn("GPU => 图形处理器", prompt)
+        self.assertNotIn("CPU => 中央处理器", prompt)
+
+    def test_glossary_hits_only_for_present_terms(self):
+        hits = _glossary_hits(
+            "GPU and LLM",
+            [
+                {"term": "GPU", "translation": "图形处理器", "source": "手册"},
+                {"term": "CPU", "translation": "中央处理器", "source": ""},
+            ],
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["term"], "GPU")
+        self.assertEqual(hits[0]["source"], "手册")
 
     def test_rejects_unsupported_language(self):
         with self.assertRaisesRegex(ValueError, "不支持的目标语言"):
@@ -98,6 +129,78 @@ class TranslatorLanguageTests(unittest.TestCase):
         self.assertIn("configured", info)
         self.assertIn("actual", info)
         self.assertIn("gpu_layers", info)
+
+
+class LinePromptTests(unittest.TestCase):
+    def test_plain_prompt_drops_numbering_and_states_line_count(self):
+        prompt = build_lines_prompt(
+            "zh", ["First line", "Second line"], numbered=False
+        )
+
+        self.assertIn("exactly 2 lines", prompt)
+        self.assertNotIn("[1]", prompt)
+        self.assertTrue(prompt.endswith("\n\nFirst line\nSecond line"))
+
+    def test_numbered_prompt_keeps_markers(self):
+        prompt = build_lines_prompt("zh", ["First line"])
+
+        self.assertTrue(prompt.endswith("\n\n[1] First line"))
+
+    def test_parser_accepts_plain_one_line_per_input_output(self):
+        parsed = parse_numbered_translations("第一行\n第二行\n", 2)
+
+        self.assertEqual(parsed, ["第一行", "第二行"])
+
+    def test_parser_rejects_plain_output_with_wrong_line_count(self):
+        self.assertIsNone(parse_numbered_translations("第一行\n第二行", 3))
+
+    def test_translate_lines_uses_plain_prompt_first(self):
+        class PlainModel:
+            def __init__(self):
+                self.prompts = []
+
+            def create_chat_completion(self, messages, **kwargs):
+                self.prompts.append(messages[0]["content"])
+                return {"choices": [{"message": {"content": "译文一\n译文二"}}]}
+
+        translator = Translator()
+        translator.ready = True
+        translator._model = PlainModel()
+
+        results, error = translator.translate_lines(["one", "two"], "zh")
+
+        self.assertIsNone(error)
+        self.assertEqual(results, ["译文一", "译文二"])
+        self.assertEqual(len(translator._model.prompts), 1)
+        self.assertNotIn("[1]", translator._model.prompts[0])
+
+    def test_translate_lines_falls_back_to_numbered_prompt(self):
+        class NumberedFallbackModel:
+            def __init__(self):
+                self.prompts = []
+
+            def create_chat_completion(self, messages, **kwargs):
+                prompt = messages[0]["content"]
+                self.prompts.append(prompt)
+                if "[1]" not in prompt:
+                    return {"choices": [{"message": {"content": "只有一行"}}]}
+                return {
+                    "choices": [
+                        {"message": {"content": "[1] 译文一\n[2] 译文二"}}
+                    ]
+                }
+
+        translator = Translator()
+        translator.ready = True
+        translator._model = NumberedFallbackModel()
+
+        results, error = translator.translate_lines(["one", "two"], "zh")
+
+        self.assertIsNone(error)
+        self.assertEqual(results, ["译文一", "译文二"])
+        self.assertEqual(len(translator._model.prompts), 2)
+        self.assertNotIn("[1]", translator._model.prompts[0])
+        self.assertIn("[1]", translator._model.prompts[1])
 
 
 if __name__ == "__main__":

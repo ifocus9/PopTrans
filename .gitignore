@@ -72,6 +72,11 @@ PopTrans.exe
 # WorkBuddy workspace
 .workbuddy/
 
+# Local agent/tooling workspaces
+.zcode/
+.mimosa/
+.tmp-perf/
+
 # UI daemon runtime discovery
 translate-ui-endpoint.json
 

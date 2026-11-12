@@ -97,6 +97,9 @@ const (
 	SWShownormal     = 1
 	SWPNoSize        = 0x0001
 	SWPNoMove        = 0x0002
+	SWPNoZOrder      = 0x0004
+	SWPNoActivate    = 0x0010
+	SWPFrameChanged  = 0x0020
 	SWPShowWindow    = 0x0040
 
 	WSOverlapped = 0x00000000
@@ -109,11 +112,13 @@ const (
 	WSTabStop    = 0x00010000
 	WSBorder     = 0x00800000
 	WSDisabled   = 0x08000000
+	WsThickFrame = 0x00040000
 
-	WsExClientEdge = 0x00000200
-	WsExToolWindow = 0x00000080
-	WsExTopmost    = 0x00000008
-	WsExLayered    = 0x00080000
+	WsExClientEdge  = 0x00000200
+	WsExToolWindow  = 0x00000080
+	WsExTopmost     = 0x00000008
+	WsExLayered     = 0x00080000
+	WsExTransparent = 0x00000020
 
 	ESMultiline   = 0x0004
 	ESAutoVScroll = 0x0040
@@ -143,8 +148,12 @@ const (
 	ImageIcon      = 1
 	LrLoadFromFile = 0x00000010
 	LrDefaultSize  = 0x00000040
+	LrShared       = 0x00008000
 
-	CSDblClks     = 0x0008
+	wdaMonitor            = 0x00000001
+	wdaExcludeFromCapture = 0x00000011
+
+	CSDblClks = 0x0008
 
 	WmApp           = 0x8000
 	WmCommand       = 0x0111
@@ -161,6 +170,9 @@ const (
 	WmRButtonUp     = 0x0205
 	WmRButtonDblClk = 0x0206
 	WmSize          = 0x0005
+	WmSetcursor     = 0x0020
+	WmSetIcon       = 0x0080
+	WmNcHitTest     = 0x0084
 	WmHotkey        = 0x0312
 
 	SMCxScreen        = 0
@@ -185,9 +197,27 @@ const (
 	InputKeyboard     = 1
 
 	GwlpUserData = -21
+	GwlpExStyle  = -20
+	GwlpStyle    = -16
+	GwlpWndProc  = -4
+
+	// HtTransparent tells Windows the click belongs to the window underneath.
+	HtTransparent = ^uintptr(0)
+	HtLeft        = 10
+	HtRight       = 11
+	HtTop         = 12
+	HtTopLeft     = 13
+	HtTopRight    = 14
+	HtBottom      = 15
+	HtBottomLeft  = 16
+	HtBottomRight = 17
+
+	IconSmall = 0
+	IconBig   = 1
 
 	IdiApplication = 32512
 	IdcArrow       = 32512
+	IdcCross       = 32515
 
 	LwaColorKey = 0x00000001
 	LwaAlpha    = 0x00000002
@@ -201,6 +231,7 @@ var (
 	modShcore   = xwindows.NewLazySystemDLL("shcore.dll")
 	modShell32  = xwindows.NewLazySystemDLL("shell32.dll")
 	modKernel32 = xwindows.NewLazySystemDLL("kernel32.dll")
+	modGdi32    = xwindows.NewLazySystemDLL("gdi32.dll")
 
 	procRegisterClassExW              = modUser32.NewProc("RegisterClassExW")
 	procCreateWindowExW               = modUser32.NewProc("CreateWindowExW")
@@ -218,6 +249,7 @@ var (
 	procLoadImageW                    = modUser32.NewProc("LoadImageW")
 	procLoadIconW                     = modUser32.NewProc("LoadIconW")
 	procLoadCursorW                   = modUser32.NewProc("LoadCursorW")
+	procSetCursor                     = modUser32.NewProc("SetCursor")
 	procMapVirtualKeyW                = modUser32.NewProc("MapVirtualKeyW")
 	procShellNotifyIconW              = modShell32.NewProc("Shell_NotifyIconW")
 	procCreatePopupMenu               = modUser32.NewProc("CreatePopupMenu")
@@ -229,7 +261,15 @@ var (
 	procMonitorFromRect               = modUser32.NewProc("MonitorFromRect")
 	procGetMonitorInfoW               = modUser32.NewProc("GetMonitorInfoW")
 	procFindWindowW                   = modUser32.NewProc("FindWindowW")
+	procIsWindowVisible               = modUser32.NewProc("IsWindowVisible")
 	procGetWindowRect                 = modUser32.NewProc("GetWindowRect")
+	procSetWindowDisplayAffinity      = modUser32.NewProc("SetWindowDisplayAffinity")
+	procGetWindowDisplayAffinity      = modUser32.NewProc("GetWindowDisplayAffinity")
+	procGetClientRect                 = modUser32.NewProc("GetClientRect")
+	procCreateRectRgn                 = modGdi32.NewProc("CreateRectRgn")
+	procCreatePolygonRgn              = modGdi32.NewProc("CreatePolygonRgn")
+	procCombineRgn                    = modGdi32.NewProc("CombineRgn")
+	procSetWindowRgn                  = modUser32.NewProc("SetWindowRgn")
 	procGetDpiForWindow               = modUser32.NewProc("GetDpiForWindow")
 	procSetWindowPos                  = modUser32.NewProc("SetWindowPos")
 	procMoveWindow                    = modUser32.NewProc("MoveWindow")
@@ -261,6 +301,9 @@ var (
 	procGetFocus                      = modUser32.NewProc("GetFocus")
 	procSetProcessDpiAwarenessContext = modUser32.NewProc("SetProcessDpiAwarenessContext")
 	procSetProcessDpiAwareness        = modShcore.NewProc("SetProcessDpiAwareness")
+	procGetDpiForMonitor              = modShcore.NewProc("GetDpiForMonitor")
+	procCallWindowProcW               = modUser32.NewProc("CallWindowProcW")
+	procScreenToClient                = modUser32.NewProc("ScreenToClient")
 	procSetCapture                    = modUser32.NewProc("SetCapture")
 	procReleaseCapture                = modUser32.NewProc("ReleaseCapture")
 	procInvalidateRect                = modUser32.NewProc("InvalidateRect")
@@ -413,6 +456,16 @@ func LoadTrayIcon(iconPath string) HWND {
 		}
 	}
 
+	// Single-exe releases do not ship icon.ico. Use the icon group embedded in
+	// this executable instead of falling back to the generic Windows icon.
+	if hinst, _, _ := procGetModuleHandleW.Call(0); hinst != 0 {
+		for _, id := range []uintptr{3, 1} {
+			if ret, _, _ := procLoadImageW.Call(hinst, id, ImageIcon, 0, 0, LrDefaultSize|LrShared); ret != 0 {
+				return HWND(ret)
+			}
+		}
+	}
+
 	ret, _, _ := procLoadIconW.Call(0, IdiApplication)
 	return HWND(ret)
 }
@@ -533,8 +586,294 @@ func IsChecked(hwnd HWND) bool {
 	return ret == BSTChecked
 }
 
+// SubclassWindow replaces a window procedure and returns the previous one.
+func SubclassWindow(hwnd HWND, newProc uintptr) uintptr {
+	index := int32(GwlpWndProc)
+	previous, _, _ := procSetWindowLongPtrW.Call(
+		uintptr(hwnd),
+		uintptr(index),
+		newProc,
+	)
+	return previous
+}
+
+func CallWindowProc(previous uintptr, hwnd HWND, msg uint32, wParam, lParam uintptr) uintptr {
+	result, _, _ := procCallWindowProcW.Call(
+		previous,
+		uintptr(hwnd),
+		uintptr(msg),
+		wParam,
+		lParam,
+	)
+	return result
+}
+
+func ScreenToClient(hwnd HWND, point Point) Point {
+	pt := point
+	procScreenToClient.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&pt)))
+	return pt
+}
+
+func IsWindowVisible(hwnd HWND) bool {
+	if hwnd == 0 {
+		return false
+	}
+	ret, _, _ := procIsWindowVisible.Call(uintptr(hwnd))
+	return ret != 0
+}
+
+// SetWindowCaptureExcluded hides the window from screen capture (BitBlt,
+// PrintWindow, WGC) while keeping it visible on the monitor. Live translation
+// uses this so its own text never lands in the captured frame — no hide/show
+// flicker is needed anymore.
+func SetWindowCaptureExcluded(hwnd HWND) bool {
+	if hwnd == 0 {
+		return false
+	}
+	ret, _, _ := procSetWindowDisplayAffinity.Call(uintptr(hwnd), wdaExcludeFromCapture)
+	return ret != 0
+}
+
+// WindowCaptureExcluded reports whether the window is excluded from capture.
+func WindowCaptureExcluded(hwnd HWND) bool {
+	if hwnd == 0 {
+		return false
+	}
+	var affinity uint32
+	ret, _, _ := procGetWindowDisplayAffinity.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&affinity)))
+	return ret != 0 && affinity == wdaExcludeFromCapture
+}
+
 func SetForegroundWindow(hwnd HWND) {
 	procSetForegroundWindow.Call(uintptr(hwnd))
+}
+
+// SetCrosshairCursor switches the pointer to a crosshair, used by the screen
+// selection overlay. Call from WM_SETCURSOR and return TRUE.
+// MakeToolWindow removes a window from the taskbar and Alt-Tab list. Used by
+// the overlay/live process so frequent show/hide during capture never flickers
+// a taskbar button.
+// SetResizable toggles the thick frame so native edge resizing works for the
+// live overlay.
+func SetResizable(hwnd HWND, resizable bool) {
+	if hwnd == 0 {
+		return
+	}
+	index := int32(GwlpStyle)
+	style, _, _ := procGetWindowLongPtrW.Call(uintptr(hwnd), uintptr(index))
+	hasFrame := style&uintptr(WsThickFrame) != 0
+	if hasFrame == resizable {
+		return
+	}
+	if resizable {
+		style |= uintptr(WsThickFrame)
+	} else {
+		style &^= uintptr(WsThickFrame)
+	}
+	procSetWindowLongPtrW.Call(uintptr(hwnd), uintptr(index), style)
+	procSetWindowPos.Call(
+		uintptr(hwnd),
+		0,
+		0,
+		0,
+		0,
+		0,
+		SWPNoSize|SWPNoMove|SWPNoZOrder|SWPNoActivate|SWPFrameChanged,
+	)
+}
+
+func GetClientRect(hwnd HWND) Rect {
+	var rect Rect
+	procGetClientRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&rect)))
+	return rect
+}
+
+func MakeToolWindow(hwnd HWND) {
+	if hwnd == 0 {
+		return
+	}
+	index := int32(GwlpExStyle)
+	style, _, _ := procGetWindowLongPtrW.Call(uintptr(hwnd), uintptr(index))
+	if style&uintptr(WsExToolWindow) != 0 {
+		return
+	}
+	style |= uintptr(WsExToolWindow)
+	procSetWindowLongPtrW.Call(uintptr(hwnd), uintptr(index), style)
+	procSetWindowPos.Call(
+		uintptr(hwnd),
+		0,
+		0,
+		0,
+		0,
+		0,
+		SWPNoSize|SWPNoMove|SWPNoZOrder|SWPNoActivate|SWPFrameChanged,
+	)
+}
+
+// SetWindowRegion replaces the window shape with the union of rects (client
+// pixels). Everything outside the region is invisible and click-through, which
+// is how the overlay shows the desktop between translation chips without any
+// blur or layered-window tricks. An empty slice restores the full window.
+func SetWindowRegion(hwnd HWND, rects []Rect) {
+	SetWindowRegionShapes(hwnd, rects, nil)
+}
+
+// SetWindowRegionShapes combines rectangular regions with polygonal regions
+// (used for rotated text chips, whose exact quad cannot be represented by a
+// rectangle).
+func SetWindowRegionShapes(hwnd HWND, rects []Rect, polys [][]Point) {
+	if hwnd == 0 {
+		return
+	}
+	var combined uintptr
+	appendRegion := func(rgn uintptr) {
+		if rgn == 0 {
+			return
+		}
+		if combined == 0 {
+			combined = rgn
+			return
+		}
+		procCombineRgn.Call(combined, combined, rgn, 2) // RGN_OR
+		procDeleteObject.Call(rgn)
+	}
+	for _, r := range rects {
+		if r.Right <= r.Left || r.Bottom <= r.Top {
+			continue
+		}
+		rgn, _, _ := procCreateRectRgn.Call(
+			uintptr(r.Left),
+			uintptr(r.Top),
+			uintptr(r.Right),
+			uintptr(r.Bottom),
+		)
+		appendRegion(rgn)
+	}
+	for _, poly := range polys {
+		if len(poly) < 3 {
+			continue
+		}
+		rgn, _, _ := procCreatePolygonRgn.Call(
+			uintptr(unsafe.Pointer(&poly[0])),
+			uintptr(len(poly)),
+			2, // WINDING
+		)
+		appendRegion(rgn)
+	}
+	if combined == 0 {
+		procSetWindowRgn.Call(uintptr(hwnd), 0, 1)
+		return
+	}
+	procSetWindowRgn.Call(uintptr(hwnd), combined, 1)
+}
+
+// SetWindowTopmost raises/lowers a window without moving, resizing or
+// activating it. Overlay windows use this so they always stay above normal app
+// windows by default.
+func SetWindowTopmost(hwnd HWND, topmost bool) {
+	if hwnd == 0 {
+		return
+	}
+	insertAfter := ^uintptr(1) // HWND_NOTOPMOST
+	if topmost {
+		insertAfter = ^uintptr(0) // HWND_TOPMOST
+	}
+	procSetWindowPos.Call(
+		uintptr(hwnd),
+		insertAfter,
+		0,
+		0,
+		0,
+		0,
+		SWPNoSize|SWPNoMove|SWPNoActivate,
+	)
+}
+
+// SetClickThrough toggles WS_EX_TRANSPARENT so mouse input at the current
+// cursor position falls through to the window underneath. WebView2 hosts its
+// content in a child window, so the top-level WM_NCHITTEST subclass alone
+// cannot make the rendered area click-through; the overlay process toggles
+// this flag from a cursor poll instead.
+func SetClickThrough(hwnd HWND, enabled bool) {
+	if hwnd == 0 {
+		return
+	}
+	index := int32(GwlpExStyle)
+	style, _, _ := procGetWindowLongPtrW.Call(uintptr(hwnd), uintptr(index))
+	has := style&uintptr(WsExTransparent) != 0
+	if has == enabled {
+		return
+	}
+	if enabled {
+		style |= uintptr(WsExTransparent)
+	} else {
+		style &^= uintptr(WsExTransparent)
+	}
+	procSetWindowLongPtrW.Call(uintptr(hwnd), uintptr(index), style)
+	procSetWindowPos.Call(
+		uintptr(hwnd),
+		0,
+		0,
+		0,
+		0,
+		0,
+		SWPNoSize|SWPNoMove|SWPNoZOrder|SWPNoActivate|SWPFrameChanged,
+	)
+}
+
+// SetWindowIconFromFile applies an .ico file as the window's taskbar/Alt-Tab
+// icon.
+func SetWindowIconFromFile(hwnd HWND, path string) {
+	if hwnd == 0 || path == "" {
+		return
+	}
+	pathPtr, err := xwindows.UTF16PtrFromString(path)
+	if err != nil {
+		return
+	}
+	icon, _, _ := procLoadImageW.Call(
+		0,
+		uintptr(unsafe.Pointer(pathPtr)),
+		ImageIcon,
+		0,
+		0,
+		LrLoadFromFile|LrDefaultSize,
+	)
+	if icon == 0 {
+		return
+	}
+	procSendMessageW.Call(uintptr(hwnd), WmSetIcon, IconBig, icon)
+	procSendMessageW.Call(uintptr(hwnd), WmSetIcon, IconSmall, icon)
+}
+
+// SetWindowIconFromResource applies the icon embedded in the running
+// executable (winres group 3, which is also Wails' AppIconID). This keeps the
+// taskbar icon correct in the single-exe release where icon.ico is absent.
+func SetWindowIconFromResource(hwnd HWND) bool {
+	if hwnd == 0 {
+		return false
+	}
+	hinst, _, _ := procGetModuleHandleW.Call(0)
+	if hinst == 0 {
+		return false
+	}
+	for _, id := range []uintptr{3, 1} {
+		icon, _, _ := procLoadImageW.Call(hinst, id, ImageIcon, 0, 0, LrDefaultSize|LrShared)
+		if icon == 0 {
+			continue
+		}
+		procSendMessageW.Call(uintptr(hwnd), WmSetIcon, IconBig, icon)
+		procSendMessageW.Call(uintptr(hwnd), WmSetIcon, IconSmall, icon)
+		return true
+	}
+	return false
+}
+
+func SetCrosshairCursor() {
+	cursor, _, _ := procLoadCursorW.Call(0, IdcCross)
+	if cursor != 0 {
+		procSetCursor.Call(cursor)
+	}
 }
 
 func MessageBox(hwnd HWND, text, title string) {
@@ -553,6 +892,31 @@ func ScreenSize() (int32, int32) {
 	width, _, _ := procGetSystemMetrics.Call(SMCxScreen)
 	height, _, _ := procGetSystemMetrics.Call(SMCyScreen)
 	return int32(width), int32(height)
+}
+
+const mdtEffectiveDPI = 0
+
+// DpiForRect returns the effective DPI of the monitor containing rect.
+func DpiForRect(rect Rect) uint32 {
+	monitor, _, _ := procMonitorFromRect.Call(uintptr(unsafe.Pointer(&rect)), monitorDefaultToNearest)
+	if monitor != 0 {
+		var dpiX, dpiY uint32
+		ret, _, _ := procGetDpiForMonitor.Call(
+			monitor,
+			mdtEffectiveDPI,
+			uintptr(unsafe.Pointer(&dpiX)),
+			uintptr(unsafe.Pointer(&dpiY)),
+		)
+		if ret == 0 && dpiX > 0 {
+			return dpiX
+		}
+	}
+	if hwnd, _, _ := procGetForegroundWindow.Call(); hwnd != 0 {
+		if dpi, _, _ := procGetDpiForWindow.Call(hwnd); dpi > 0 {
+			return uint32(dpi)
+		}
+	}
+	return 96
 }
 
 func WorkAreaForPoint(point Point) Rect {

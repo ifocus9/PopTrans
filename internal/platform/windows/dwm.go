@@ -19,8 +19,25 @@ const (
 	dwmwaUseImmersiveDarkMode       = 20
 	dwmwaUseImmersiveDarkModeBefore = 19
 	dwmwaWindowCornerPreference     = 33
+	dwmwaCloak                      = 13
 	dwmwcpRound                     = 2
 )
+
+// SetWindowCloaked hides/shows a window through DWM without touching its
+// Wails-managed visibility state. Live capture uses it so the translation
+// overlay cannot appear in its own screenshots.
+func SetWindowCloaked(hwnd HWND, cloaked bool) {
+	value := int32(0)
+	if cloaked {
+		value = 1
+	}
+	procDwmSetWindowAttribute.Call(
+		uintptr(hwnd),
+		dwmwaCloak,
+		uintptr(unsafe.Pointer(&value)),
+		unsafe.Sizeof(value),
+	)
+}
 
 var (
 	modDwmapi = xwindows.NewLazySystemDLL("dwmapi.dll")

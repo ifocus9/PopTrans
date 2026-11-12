@@ -1,6 +1,8 @@
 package wailsui
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -109,4 +111,31 @@ func TestTranslateModeFlag(t *testing.T) {
 	if !app.visible || !app.settingsOpen {
 		t.Fatal("expected visible and settingsOpen to be true")
 	}
+}
+
+func TestStartModelDownloadBinding(t *testing.T) {
+	if os.Getenv("POPTRANS_LIVE_TEST") != "1" {
+		t.Skip("set POPTRANS_LIVE_TEST=1 to hit the network")
+	}
+	app := &App{baseDir: t.TempDir()}
+	repo := "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+	file := "qwen2.5-0.5b-instruct-q2_k.gguf"
+	if err := app.StartModelDownload("modelscope", repo, file, "test"); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	expected := filepath.Join(app.baseDir, "models", "Qwen-Qwen2.5-0.5B-Instruct-GGUF", file)
+	deadline := time.Now().Add(15 * time.Second)
+	var partSize int64
+	for time.Now().Before(deadline) {
+		if info, err := os.Stat(expected + ".part"); err == nil && info.Size() > 0 {
+			partSize = info.Size()
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	app.CancelModelDownload()
+	if partSize == 0 {
+		t.Fatalf("no partial download at %s", expected)
+	}
+	t.Logf("partial download at %s: %d bytes", expected+".part", partSize)
 }

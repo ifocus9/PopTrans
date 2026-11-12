@@ -43,13 +43,17 @@ jobs:
           pip install -r backend/requirements-build.txt
 
       # 2. 编译各核心模块
-      - name: Build Wails UI (translate-ui.exe)
+      - name: Build UI (translate-ui.exe)
         shell: pwsh
         run: |
-          go install github.com/wailsapp/wails/v2/cmd/wails@v2.13.0
-          if (-not (Test-Path "build\windows")) { New-Item -ItemType Directory -Path "build\windows" -Force }
-          Copy-Item "assets\icon.ico" "build\windows\icon.ico" -Force
-          wails build -clean
+          Push-Location frontend
+          npm ci
+          npm run build
+          Pop-Location
+          if (-not (Test-Path "build\bin")) { New-Item -ItemType Directory -Path "build\bin" -Force }
+          go run ./tools/winres -icon "assets/icon.ico" -output "translate-ui-res.syso" -arch amd64
+          go build -tags desktop,production -ldflags "-H windowsgui" -o "build/bin/translate-ui.exe" .
+          if (Test-Path "translate-ui-res.syso") { Remove-Item "translate-ui-res.syso" -Force }
 
       - name: Build AI Engine (ai_engine.exe)
         shell: pwsh
@@ -62,9 +66,13 @@ jobs:
       - name: Build Go Host Core (PopTrans.exe)
         shell: pwsh
         run: |
+          if (-not (Test-Path "internal/runtimebundle/assets")) { New-Item -ItemType Directory -Path "internal/runtimebundle/assets" -Force }
+          Copy-Item "build/bin/translate-ui.exe" "internal/runtimebundle/assets/translate-ui.exe" -Force
+          Copy-Item "dist-ai/ai_engine.exe" "internal/runtimebundle/assets/ai_engine.exe" -Force
+          $buildId = Get-Date -Format "yyyyMMddHHmmss"
           go run ./tools/winres -icon "assets/icon.ico" -output "cmd/translate-go/translate-go-res.syso" -arch amd64
           if (-not (Test-Path "dist-go")) { New-Item -ItemType Directory -Path "dist-go" -Force }
-          go build -ldflags "-s -w -H windowsgui" -o "dist-go/PopTrans.exe" ./cmd/translate-go
+          go build -tags bundle -ldflags "-s -w -H windowsgui -X translate-plugin/internal/runtimebundle.buildID=$buildId" -o "dist-go/PopTrans.exe" ./cmd/translate-go
           if (Test-Path "cmd/translate-go/translate-go-res.syso") { Remove-Item "cmd/translate-go/translate-go-res.syso" -Force }
 
       # 3. 组装待签名的二进制文件集合

@@ -30,8 +30,9 @@ const serverPortEnv = "TRANSLATE_SERVER_PORT"
 const StartupReadyTimeout = 30 * time.Minute
 
 type Supervisor struct {
-	baseDir string
-	client  *Client
+	baseDir    string
+	client     *Client
+	enginePath string
 
 	mu         sync.Mutex
 	cmd        *exec.Cmd
@@ -49,6 +50,11 @@ func NewSupervisor(baseDir string, client *Client) *Supervisor {
 		stopCtx:    stopCtx,
 		stopCancel: stopCancel,
 	}
+}
+
+// SetEnginePath points the supervisor at the extracted/bundled AI engine.
+func (s *Supervisor) SetEnginePath(path string) {
+	s.enginePath = path
 }
 
 func (s *Supervisor) EnsureRunning(ctx context.Context, onStatus func(string)) error {
@@ -128,6 +134,9 @@ func (s *Supervisor) EnsureRunning(ctx context.Context, onStatus func(string)) e
 			serverPort = cfg.ServerPort
 		}
 		cmd.Env = environmentWith(os.Environ(), serverPortEnv, strconv.Itoa(serverPort))
+		// Frozen engines may live in <baseDir>/runtime; tell them where the
+		// real settings/models directory is.
+		cmd.Env = environmentWith(cmd.Env, "POPTRANS_BASE_DIR", s.baseDir)
 		if loggingEnabled {
 			backendLogPath := filepath.Join(s.baseDir, "translate.log")
 			backendLogFile, err = os.OpenFile(backendLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
@@ -259,7 +268,10 @@ func (s *Supervisor) waitForReady(ctx, stopCtx context.Context, onStatus func(st
 }
 
 func (s *Supervisor) backendCommand() (*exec.Cmd, string, error) {
-	enginePath := filepath.Join(s.baseDir, "ai_engine.exe")
+	enginePath := s.enginePath
+	if enginePath == "" {
+		enginePath = filepath.Join(s.baseDir, "ai_engine.exe")
+	}
 	if _, err := os.Stat(enginePath); err == nil {
 		return exec.Command(enginePath), "ai_engine.exe", nil
 	}
