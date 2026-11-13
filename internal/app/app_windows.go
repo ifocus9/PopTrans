@@ -558,9 +558,9 @@ func (a *App) handleOCRSelection(rect win.Rect) {
 			return
 		}
 
-		// The overlay is transparent: only the translated chips are drawn on
-		// top of the live screen, so the captured image is never sent to the UI
-		// process.
+		// The overlay window matches the selection exactly and shows this frame
+		// as its base image, so translated chips can be hidden to reveal the
+		// untouched original.
 		windowRect, barSide := computeFrameLayout(rect)
 		imageDataURL := ""
 		if jpegBytes, jpegErr := win.EncodePNGToJPEG(pngBytes, 82); jpegErr == nil {
@@ -595,6 +595,9 @@ func (a *App) handleOCRSelection(rect win.Rect) {
 		startedAt := time.Now()
 		var result backend.OCRTranslateBlocksResult
 		lines := 0
+		// Progressive updates rebuild every chip; cache the blurred crops so
+		// earlier batches are not blurred and JPEG-encoded again on each pass.
+		backdrops := make(map[int]blockBackdrop)
 		err = a.withBackend(reqCtx, func(status string) {
 			if status == "" {
 				status = "等待模型加载中..."
@@ -622,7 +625,7 @@ func (a *App) handleOCRSelection(rect win.Rect) {
 					if !a.overlayCurrent(seq) {
 						return
 					}
-					payload := a.overlayPayloadFromResult(basePayload, pngBytes, partial, nil)
+					payload := a.overlayPayloadFromResult(basePayload, pngBytes, partial, nil, backdrops)
 					payload.Loading = true
 					payload.Stage = "translate"
 					payload.Progress = 55
@@ -647,7 +650,7 @@ func (a *App) handleOCRSelection(rect win.Rect) {
 			return
 		}
 
-		update := a.overlayResultPayload(basePayload, pngBytes, result, err, time.Since(startedAt))
+		update := a.overlayResultPayload(basePayload, pngBytes, result, err, time.Since(startedAt), backdrops)
 		switch {
 		case err != nil:
 			log.Printf("app ocr blocks request failed: %v", err)
@@ -668,13 +671,22 @@ func (a *App) handleOCRSelection(rect win.Rect) {
 	}()
 }
 
+// blockBackdrop is a blurred crop and its auto-selected text tone. Progressive
+// translation reuses cached backdrops for blocks from earlier batches.
+type blockBackdrop struct {
+	image string
+	color string
+}
+
 // overlayPayloadFromResult builds the image + chips payload without deciding
-// the final stage, so progressive updates can reuse it.
+// its final progress state. backdrops may be nil; when non-nil it is both read
+// and updated so repeated partial payloads only blur newly translated lines.
 func (a *App) overlayPayloadFromResult(
 	base uidaemon.OverlayPayload,
 	pngBytes []byte,
 	result backend.OCRTranslateBlocksResult,
 	err error,
+	backdrops map[int]blockBackdrop,
 ) uidaemon.OverlayPayload {
 	update := uidaemon.OverlayPayload{
 		Rect:         base.Rect,
@@ -687,11 +699,28 @@ func (a *App) overlayPayloadFromResult(
 		Translation:  strings.TrimSpace(result.Translation),
 		Style:        base.Style,
 	}
-	for _, block := range result.Blocks {
-		update.Blocks = append(update.Blocks, toTranslatedBlock(block))
+	for index, block := range result.Blocks {
+		translated := toTranslatedBlock(block)
+		if backdrops != nil && strings.TrimSpace(translated.Translation) != "" {
+			if cached, ok := backdrops[index]; ok {
+				translated.BackgroundImage = cached.image
+				translated.TextColor = cached.color
+			}
+		}
+		update.Blocks = append(update.Blocks, translated)
 	}
 	clipBlockOverlaps(update.Blocks)
 	attachBlurredBackgrounds(pngBytes, update.Blocks)
+	if backdrops != nil {
+		for index, block := range update.Blocks {
+			if block.BackgroundImage != "" {
+				backdrops[index] = blockBackdrop{
+					image: block.BackgroundImage,
+					color: block.TextColor,
+				}
+			}
+		}
+	}
 	if err != nil {
 		update.Error = err.Error()
 	}
@@ -706,8 +735,9 @@ func (a *App) overlayResultPayload(
 	result backend.OCRTranslateBlocksResult,
 	err error,
 	latency time.Duration,
+	backdrops map[int]blockBackdrop,
 ) uidaemon.OverlayPayload {
-	update := a.overlayPayloadFromResult(base, pngBytes, result, err)
+	update := a.overlayPayloadFromResult(base, pngBytes, result, err, backdrops)
 	update.LatencyMs = latency.Milliseconds()
 
 	switch {
@@ -932,7 +962,7 @@ func (a *App) refreshScreenshot() {
 			return
 		}
 
-		update := a.overlayResultPayload(base, frame.png, result, callErr, time.Since(startedAt))
+		update := a.overlayResultPayload(base, frame.png, result, callErr, time.Since(startedAt), nil)
 		switch {
 		case callErr != nil:
 			log.Printf("app refresh screenshot failed: %v", callErr)

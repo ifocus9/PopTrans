@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"translate-plugin/internal/backend"
 	"translate-plugin/internal/uidaemon"
 )
 
@@ -56,5 +57,50 @@ func TestAttachBlurredBackgrounds(t *testing.T) {
 	}
 	if bounds := decoded.Bounds(); bounds.Dx() < 2 || bounds.Dy() < 2 {
 		t.Fatalf("blurred patch too small: %v", bounds)
+	}
+}
+
+func TestOverlayPayloadReusesCachedBackdrops(t *testing.T) {
+	frame := image.NewRGBA(image.Rect(0, 0, 200, 100))
+	for y := 0; y < 100; y++ {
+		for x := 0; x < 200; x++ {
+			frame.Set(x, y, color.RGBA{R: 30, G: uint8(x), B: uint8(y), A: 255})
+		}
+	}
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, frame); err != nil {
+		t.Fatal(err)
+	}
+
+	const cached = "data:image/jpeg;base64,cached"
+	backdrops := map[int]blockBackdrop{
+		0: {image: cached, color: "#123456"},
+	}
+	app := &App{}
+	base := uidaemon.OverlayPayload{ImageWidth: 200, ImageHeight: 100}
+	first := app.overlayPayloadFromResult(base, encoded.Bytes(), backend.OCRTranslateBlocksResult{
+		Blocks: []backend.OCRBlock{
+			{Text: "first", Translation: "第一", X: 10, Y: 10, W: 60, H: 20},
+			{Text: "second", Translation: "", X: 10, Y: 40, W: 60, H: 20},
+		},
+	}, nil, backdrops)
+	if first.Blocks[0].BackgroundImage != cached || first.Blocks[0].TextColor != "#123456" {
+		t.Fatalf("cached backdrop not reused: %+v", first.Blocks[0])
+	}
+
+	second := app.overlayPayloadFromResult(base, encoded.Bytes(), backend.OCRTranslateBlocksResult{
+		Blocks: []backend.OCRBlock{
+			{Text: "first", Translation: "第一", X: 10, Y: 10, W: 60, H: 20},
+			{Text: "second", Translation: "第二", X: 10, Y: 40, W: 60, H: 20},
+		},
+	}, nil, backdrops)
+	if second.Blocks[0].BackgroundImage != cached {
+		t.Fatalf("first block was re-blurred: %+v", second.Blocks[0])
+	}
+	if !strings.HasPrefix(second.Blocks[1].BackgroundImage, "data:image/jpeg;base64,") {
+		t.Fatalf("newly translated block has no backdrop: %+v", second.Blocks[1])
+	}
+	if backdrops[1].image == "" || backdrops[1].color == "" {
+		t.Fatalf("new backdrop was not cached: %+v", backdrops[1])
 	}
 }
