@@ -104,3 +104,7 @@ if (Test-Path $zipPath) {
     Write-Host "[ERROR] Output zip file was not created!" -ForegroundColor Red
     exit 1
 }
+
+# robocopy returns 1 when files were copied; make the script's exit code reflect
+# package success so CI does not treat a completed archive as a failure.
+exit 0

@@ -103,6 +103,10 @@ jobs:
 
       # 4. 提交 SignPath 代码签名（未配置签名密钥时跳过，仍发布未签名包）
       - name: Submit signing request to SignPath
+        if: ${{ env.SIGNPATH_API_TOKEN != '' && env.SIGNPATH_ORGANIZATION_ID != '' }}
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORGANIZATION_ID: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
         continue-on-error: true
         uses: signpath/github-action-submit-signing-request@v3
         with:
