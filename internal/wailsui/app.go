@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -160,12 +162,20 @@ func NewApp(baseDir string, args []string) *App {
 			app.mode = "overlay"
 		case "--endpoint-dir":
 			if i+1 < len(args) {
-				app.endpointDir = args[i+1]
+				// The host only publishes the endpoint inside its own directory;
+				// ignore anything that is not an absolute path.
+				if dir := filepath.Clean(args[i+1]); filepath.IsAbs(dir) {
+					app.endpointDir = dir
+				}
 				i++
 			}
 		case "--callback-url":
 			if i+1 < len(args) {
-				app.callbackURL = args[i+1]
+				// Callback events are posted to the host's loopback server; never
+				// accept a remote URL from the command line.
+				if isLoopbackHTTPURL(args[i+1]) {
+					app.callbackURL = args[i+1]
+				}
 				i++
 			}
 		case "--callback-token":
@@ -203,6 +213,17 @@ func NewApp(baseDir string, args []string) *App {
 		app.notify = uidaemon.NewNotifyClient(app.callbackURL, app.callbackToken)
 	}
 	return app
+}
+
+// isLoopbackHTTPURL accepts only http://127.0.0.1:<port> (or another loopback
+// address), matching the host's callback server.
+func isLoopbackHTTPURL(raw string) bool {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme != "http" || parsed.Host == "" {
+		return false
+	}
+	ip := net.ParseIP(parsed.Hostname())
+	return ip != nil && ip.IsLoopback()
 }
 
 func (a *App) Startup(ctx context.Context) {

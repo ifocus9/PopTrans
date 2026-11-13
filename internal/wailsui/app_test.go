@@ -139,3 +139,30 @@ func TestStartModelDownloadBinding(t *testing.T) {
 	}
 	t.Logf("partial download at %s: %d bytes", expected+".part", partSize)
 }
+
+func TestLoopbackCallbackURLCheck(t *testing.T) {
+	accepted := []string{
+		"http://127.0.0.1:32145",
+		"http://127.0.0.1",
+		"http://[::1]:32145",
+	}
+	for _, raw := range accepted {
+		if !isLoopbackHTTPURL(raw) {
+			t.Fatalf("expected %q to be accepted", raw)
+		}
+	}
+
+	rejected := []string{
+		"https://127.0.0.1:32145",
+		"http://192.168.1.10:32145",
+		"http://example.com:32145",
+		"http://localhost:32145",
+		"file:///C:/temp",
+		"not a url",
+	}
+	for _, raw := range rejected {
+		if isLoopbackHTTPURL(raw) {
+			t.Fatalf("expected %q to be rejected", raw)
+		}
+	}
+}
