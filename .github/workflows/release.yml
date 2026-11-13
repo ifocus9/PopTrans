@@ -40,6 +40,10 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
+          # PyPI only ships the llama-cpp-python source distribution, which takes
+          # tens of minutes to compile on a Windows runner. Use the official
+          # prebuilt CPU wheel so requirements.txt sees it as already satisfied.
+          pip install "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.19/llama_cpp_python-0.3.19-cp312-cp312-win_amd64.whl"
           pip install -r backend/requirements-build.txt
 
       # 2. 编译各核心模块
