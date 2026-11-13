@@ -25,19 +25,77 @@ export namespace backend {
 
 export namespace config {
 	
+	export class GlossaryEntry {
+	    term: string;
+	    translation: string;
+	    source: string;
+	    note?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new GlossaryEntry(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.term = source["term"];
+	        this.translation = source["translation"];
+	        this.source = source["source"];
+	        this.note = source["note"];
+	    }
+	}
+	export class ModelEntry {
+	    id: string;
+	    name: string;
+	    source: string;
+	    repo: string;
+	    file: string;
+	    size?: number;
+	    dir?: string;
+	    builtin?: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new ModelEntry(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.source = source["source"];
+	        this.repo = source["repo"];
+	        this.file = source["file"];
+	        this.size = source["size"];
+	        this.dir = source["dir"];
+	        this.builtin = source["builtin"];
+	    }
+	}
 	export class Config {
 	    hotkey: string;
 	    hotkey_display: string;
 	    ocr_enabled: boolean;
 	    ocr_hotkey: string;
 	    ocr_hotkey_display: string;
+	    live_enabled: boolean;
+	    live_hotkey: string;
+	    live_hotkey_display: string;
 	    logging_enabled: boolean;
 	    server_port: number;
 	    theme: string;
 	    acceleration_device: string;
 	    ui_idle_minutes: number;
 	    ai_idle_minutes: number;
+	    ai_keep_alive: boolean;
+	    ai_threads: number;
 	    launch_at_login: boolean;
+	    model_download_source: string;
+	    model_download_base_url: string;
+	    models: ModelEntry[];
+	    active_model_id: string;
+	    source_language: string;
+	    target_language: string;
+	    overlay_font_family: string;
+	    overlay_font_weight: number;
+	    glossary: GlossaryEntry[];
 	
 	    static createFrom(source: any = {}) {
 	        return new Config(source);
@@ -50,25 +108,296 @@ export namespace config {
 	        this.ocr_enabled = source["ocr_enabled"];
 	        this.ocr_hotkey = source["ocr_hotkey"];
 	        this.ocr_hotkey_display = source["ocr_hotkey_display"];
+	        this.live_enabled = source["live_enabled"];
+	        this.live_hotkey = source["live_hotkey"];
+	        this.live_hotkey_display = source["live_hotkey_display"];
 	        this.logging_enabled = source["logging_enabled"];
 	        this.server_port = source["server_port"];
 	        this.theme = source["theme"];
 	        this.acceleration_device = source["acceleration_device"];
 	        this.ui_idle_minutes = source["ui_idle_minutes"];
 	        this.ai_idle_minutes = source["ai_idle_minutes"];
+	        this.ai_keep_alive = source["ai_keep_alive"];
+	        this.ai_threads = source["ai_threads"];
 	        this.launch_at_login = source["launch_at_login"];
+	        this.model_download_source = source["model_download_source"];
+	        this.model_download_base_url = source["model_download_base_url"];
+	        this.models = this.convertValues(source["models"], ModelEntry);
+	        this.active_model_id = source["active_model_id"];
+	        this.source_language = source["source_language"];
+	        this.target_language = source["target_language"];
+	        this.overlay_font_family = source["overlay_font_family"];
+	        this.overlay_font_weight = source["overlay_font_weight"];
+	        this.glossary = this.convertValues(source["glossary"], GlossaryEntry);
 	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
 	}
+	
 
 }
 
 export namespace uidaemon {
+	
+	export class GlossaryHit {
+	    term: string;
+	    translation: string;
+	    source: string;
+	    note?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new GlossaryHit(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.term = source["term"];
+	        this.translation = source["translation"];
+	        this.source = source["source"];
+	        this.note = source["note"];
+	    }
+	}
+	export class OverlayStyle {
+	    font_family: string;
+	    font_weight: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new OverlayStyle(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.font_family = source["font_family"];
+	        this.font_weight = source["font_weight"];
+	    }
+	}
+	export class TranslatedBlock {
+	    text: string;
+	    translation: string;
+	    x: number;
+	    y: number;
+	    w: number;
+	    h: number;
+	    score: number;
+	    glossary_hits?: GlossaryHit[];
+	    angle?: number;
+	    cx?: number;
+	    cy?: number;
+	    line_width?: number;
+	    line_height?: number;
+	    source_h?: number;
+	    text_color?: string;
+	    background_image?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new TranslatedBlock(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.text = source["text"];
+	        this.translation = source["translation"];
+	        this.x = source["x"];
+	        this.y = source["y"];
+	        this.w = source["w"];
+	        this.h = source["h"];
+	        this.score = source["score"];
+	        this.glossary_hits = this.convertValues(source["glossary_hits"], GlossaryHit);
+	        this.angle = source["angle"];
+	        this.cx = source["cx"];
+	        this.cy = source["cy"];
+	        this.line_width = source["line_width"];
+	        this.line_height = source["line_height"];
+	        this.source_h = source["source_h"];
+	        this.text_color = source["text_color"];
+	        this.background_image = source["background_image"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class ScreenRect {
+	    x: number;
+	    y: number;
+	    width: number;
+	    height: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new ScreenRect(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.x = source["x"];
+	        this.y = source["y"];
+	        this.width = source["width"];
+	        this.height = source["height"];
+	    }
+	}
+	export class LivePayload {
+	    anchor: ScreenRect;
+	    window_rect: ScreenRect;
+	    bar_side: string;
+	    image_data_url?: string;
+	    image_width: number;
+	    image_height: number;
+	    blocks: TranslatedBlock[];
+	    source: string;
+	    translation: string;
+	    status: string;
+	    error: string;
+	    style: OverlayStyle;
+	    version: number;
+	    stage?: string;
+	    progress?: number;
+	    lines?: number;
+	    latency_ms: number;
+	    theme?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new LivePayload(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.anchor = this.convertValues(source["anchor"], ScreenRect);
+	        this.window_rect = this.convertValues(source["window_rect"], ScreenRect);
+	        this.bar_side = source["bar_side"];
+	        this.image_data_url = source["image_data_url"];
+	        this.image_width = source["image_width"];
+	        this.image_height = source["image_height"];
+	        this.blocks = this.convertValues(source["blocks"], TranslatedBlock);
+	        this.source = source["source"];
+	        this.translation = source["translation"];
+	        this.status = source["status"];
+	        this.error = source["error"];
+	        this.style = this.convertValues(source["style"], OverlayStyle);
+	        this.version = source["version"];
+	        this.stage = source["stage"];
+	        this.progress = source["progress"];
+	        this.lines = source["lines"];
+	        this.latency_ms = source["latency_ms"];
+	        this.theme = source["theme"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class OverlayPayload {
+	    rect: ScreenRect;
+	    window_rect: ScreenRect;
+	    bar_side: string;
+	    image_width: number;
+	    image_height: number;
+	    image_data_url?: string;
+	    blocks: TranslatedBlock[];
+	    source: string;
+	    translation: string;
+	    loading: boolean;
+	    error: string;
+	    style: OverlayStyle;
+	    stage?: string;
+	    progress?: number;
+	    lines?: number;
+	    latency_ms: number;
+	    theme?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new OverlayPayload(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.rect = this.convertValues(source["rect"], ScreenRect);
+	        this.window_rect = this.convertValues(source["window_rect"], ScreenRect);
+	        this.bar_side = source["bar_side"];
+	        this.image_width = source["image_width"];
+	        this.image_height = source["image_height"];
+	        this.image_data_url = source["image_data_url"];
+	        this.blocks = this.convertValues(source["blocks"], TranslatedBlock);
+	        this.source = source["source"];
+	        this.translation = source["translation"];
+	        this.loading = source["loading"];
+	        this.error = source["error"];
+	        this.style = this.convertValues(source["style"], OverlayStyle);
+	        this.stage = source["stage"];
+	        this.progress = source["progress"];
+	        this.lines = source["lines"];
+	        this.latency_ms = source["latency_ms"];
+	        this.theme = source["theme"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
 	
 	export class ResultPayload {
 	    source: string;
 	    result: string;
 	    error: string;
 	    loading: boolean;
+	    latency_ms: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new ResultPayload(source);
@@ -80,8 +409,10 @@ export namespace uidaemon {
 	        this.result = source["result"];
 	        this.error = source["error"];
 	        this.loading = source["loading"];
+	        this.latency_ms = source["latency_ms"];
 	    }
 	}
+	
 	export class Status {
 	    ready: boolean;
 	    mode: string;
@@ -107,11 +438,96 @@ export namespace uidaemon {
 
 export namespace wailsui {
 	
+	export class ModelFileItem {
+	    name: string;
+	    size: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new ModelFileItem(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.size = source["size"];
+	    }
+	}
+	export class ModelSearchItem {
+	    id: string;
+	    name: string;
+	    source: string;
+	    downloads: number;
+	    description: string;
+	    size_bytes: number;
+	    parameters: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new ModelSearchItem(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.source = source["source"];
+	        this.downloads = source["downloads"];
+	        this.description = source["description"];
+	        this.size_bytes = source["size_bytes"];
+	        this.parameters = source["parameters"];
+	    }
+	}
+	export class ModelStatus {
+	    id: string;
+	    installed: boolean;
+	    size: number;
+	    path: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new ModelStatus(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.installed = source["installed"];
+	        this.size = source["size"];
+	        this.path = source["path"];
+	    }
+	}
+	export class OverlayMenuItem {
+	    id: number;
+	    label: string;
+	    shortcut: string;
+	    icon: string;
+	    checked: boolean;
+	    disabled: boolean;
+	    separator: boolean;
+	    header: boolean;
+	    danger: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new OverlayMenuItem(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.label = source["label"];
+	        this.shortcut = source["shortcut"];
+	        this.icon = source["icon"];
+	        this.checked = source["checked"];
+	        this.disabled = source["disabled"];
+	        this.separator = source["separator"];
+	        this.header = source["header"];
+	        this.danger = source["danger"];
+	    }
+	}
 	export class ResultView {
 	    source: string;
 	    result: string;
 	    error: string;
 	    loading: boolean;
+	    latency_ms: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new ResultView(source);
@@ -123,11 +539,13 @@ export namespace wailsui {
 	        this.result = source["result"];
 	        this.error = source["error"];
 	        this.loading = source["loading"];
+	        this.latency_ms = source["latency_ms"];
 	    }
 	}
 	export class TranslateResult {
 	    source: string;
 	    result: string;
+	    latency_ms: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new TranslateResult(source);
@@ -137,6 +555,7 @@ export namespace wailsui {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.source = source["source"];
 	        this.result = source["result"];
+	        this.latency_ms = source["latency_ms"];
 	    }
 	}
 	export class UIState {

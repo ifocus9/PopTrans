@@ -11,10 +11,13 @@ import sys
 import re
 import json
 import time
+import socket
+import ipaddress
 import threading
 import logging
 from collections import OrderedDict
 from typing import Optional, Tuple
+from urllib.parse import quote, urljoin, urlsplit
 
 from backend.runtime_paths import application_dir, settings_path
 
@@ -22,18 +25,182 @@ logger = logging.getLogger(__name__)
 
 # ── 模型配置 ──────────────────────────────────────────────
 
-MODEL_ID = "tencent/Hy-MT2-1.8B-GGUF"
-MODEL_FILENAME = "Hy-MT2-1.8B-Q4_K_M.gguf"
+MODEL_SOURCE_MODELSCOPE = "modelscope"
+MODEL_SOURCE_HUGGINGFACE = "huggingface"
+MODEL_SOURCE_CUSTOM = "custom"
+DEFAULT_MODEL_SOURCE = MODEL_SOURCE_MODELSCOPE
+MODEL_SOURCE_LABELS = {
+    MODEL_SOURCE_MODELSCOPE: "魔搭 ModelScope",
+    MODEL_SOURCE_HUGGINGFACE: "HuggingFace 官网",
+    MODEL_SOURCE_CUSTOM: "自定义镜像",
+}
+
+HUGGINGFACE_ENDPOINT = "https://huggingface.co"
+MODELSCOPE_ENDPOINT = "https://modelscope.cn"
+DEFAULT_MODEL_SIZE = 1133080448
+
+# The builtin model, used when settings.json has no usable model catalogue.
+_DEFAULT_MODEL_ID = "hy-mt2-1.8b-q4km"
+_DEFAULT_REPO_MODELSCOPE = "Tencent-Hunyuan/Hy-MT2-1.8B-GGUF"
+_DEFAULT_REPO_HUGGINGFACE = "tencent/Hy-MT2-1.8B-GGUF"
+_DEFAULT_FILENAME = "Hy-MT2-1.8B-Q4_K_M.gguf"
+_DEFAULT_DIR = "Hy-MT2-1.8B-GGUF"
 
 _BASE_DIR = os.fspath(application_dir())
 
-MODEL_DIR = os.path.join(_BASE_DIR, "models", "Hy-MT2-1.8B-GGUF")
-MODEL_PATH = os.path.join(MODEL_DIR, MODEL_FILENAME)
 
-# 直接从 HuggingFace 官网下载模型。
-# 之前使用的 hf-mirror.com 镜像连不上会导致下载失败，故改为官方源。
-HF_ENDPOINT = "https://huggingface.co"
-os.environ["HF_ENDPOINT"] = HF_ENDPOINT
+def _read_settings_json() -> dict:
+    try:
+        with open(settings_path(), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _sanitize_segment(value: str) -> str:
+    cleaned = []
+    for char in str(value or "").strip():
+        if char.isalnum() or char in "-_.":
+            cleaned.append(char)
+        else:
+            cleaned.append("-")
+    return "".join(cleaned).strip("-.")
+
+
+def _normalize_repo(repo: str) -> str:
+    repo = str(repo or "").replace("\\", "/").strip("/")
+    parts = [part for part in repo.split("/") if part]
+    if not parts or len(parts) > 2:
+        return ""
+    cleaned = [_sanitize_segment(part) for part in parts]
+    if any(not part or part in (".", "..") for part in cleaned):
+        return ""
+    return "/".join(cleaned)
+
+
+def _normalize_model_file(value: str) -> str:
+    """Validate a repo-relative .gguf path (kept verbatim for download URLs)."""
+    raw = str(value or "").replace("\\", "/").strip("/")
+    parts = [part for part in raw.split("/") if part]
+    if not parts or len(parts) > 4:
+        return ""
+    for part in parts:
+        if part in (".", ".."):
+            return ""
+        if any(ord(char) < 0x20 or ord(char) == 0x7F or char == ":" for char in part):
+            return ""
+    result = "/".join(parts)
+    return result if result.lower().endswith(".gguf") else ""
+
+
+def _local_model_file(value: str) -> str:
+    """Map a repo-relative path to a Windows-safe relative path."""
+    parts = str(value or "").replace("\\", "/").split("/")
+    cleaned = []
+    for part in parts:
+        chars = []
+        for char in part:
+            if ord(char) < 0x20 or ord(char) == 0x7F or char in '<>:"\\|?*':
+                chars.append("_")
+            else:
+                chars.append(char)
+        segment = "".join(chars).rstrip(". ")
+        cleaned.append(segment or "_")
+    return os.path.join(*cleaned) if cleaned else ""
+
+
+def _active_model_spec() -> dict:
+    """Resolve the active model from settings.json.
+
+    Go owns the model catalogue; the engine only needs the active entry to pick
+    the GGUF path and download coordinates. Falls back to the builtin model.
+    """
+    data = _read_settings_json()
+    models = data.get("models")
+    if not isinstance(models, list):
+        models = []
+    active_id = str(data.get("active_model_id") or "").strip()
+    entry = None
+    for item in models:
+        if isinstance(item, dict) and str(item.get("id") or "") == active_id:
+            entry = item
+            break
+    if entry is None and models and isinstance(models[0], dict):
+        entry = models[0]
+    if not isinstance(entry, dict):
+        entry = {}
+
+    entry_id = str(entry.get("id") or "").strip()
+    entry_repo = _normalize_repo(entry.get("repo") or "")
+    # The builtin model keeps honouring the global download-source preference
+    # (ModelScope / HuggingFace / custom mirror) from the 常规 settings page.
+    builtin_like = (
+        not entry
+        or entry_id == _DEFAULT_MODEL_ID
+        or entry_repo in (_DEFAULT_REPO_MODELSCOPE, _DEFAULT_REPO_HUGGINGFACE)
+    )
+    configured_source = str(data.get("model_download_source") or DEFAULT_MODEL_SOURCE).lower()
+    source = configured_source if builtin_like else str(entry.get("source") or "").lower()
+    if source not in (MODEL_SOURCE_MODELSCOPE, MODEL_SOURCE_HUGGINGFACE, MODEL_SOURCE_CUSTOM):
+        source = DEFAULT_MODEL_SOURCE
+    repo = entry_repo
+    filename = _normalize_model_file(entry.get("file") or "")
+    if builtin_like:
+        repo = (
+            _DEFAULT_REPO_HUGGINGFACE
+            if source in (MODEL_SOURCE_HUGGINGFACE, MODEL_SOURCE_CUSTOM)
+            else _DEFAULT_REPO_MODELSCOPE
+        )
+        filename = _DEFAULT_FILENAME
+    if not repo or not filename.lower().endswith(".gguf"):
+        repo = _DEFAULT_REPO_HUGGINGFACE if source == MODEL_SOURCE_HUGGINGFACE else _DEFAULT_REPO_MODELSCOPE
+        filename = _DEFAULT_FILENAME
+        builtin_like = True
+        legacy = True
+    else:
+        legacy = False
+    if builtin_like or legacy:
+        # Keep the historical folder so existing installs reuse their model.
+        dir_name = _DEFAULT_DIR
+    else:
+        dir_name = _sanitize_segment(entry.get("dir") or repo.replace("/", "-")) or _DEFAULT_DIR
+    try:
+        size = int(entry.get("size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    name = str(entry.get("name") or "").strip() or repo
+    local_file = _local_model_file(filename)
+    return {
+        "id": str(entry.get("id") or ""),
+        "name": name,
+        "source": source,
+        "repo": repo,
+        "hf_repo": _DEFAULT_REPO_HUGGINGFACE if builtin_like else repo,
+        "file": filename,
+        "local_file": local_file,
+        "dir": dir_name,
+        "size": size if size > 0 else DEFAULT_MODEL_SIZE,
+        "path": os.path.join(_BASE_DIR, "models", dir_name, *local_file.split("/")),
+    }
+
+
+_ACTIVE_MODEL = _active_model_spec()
+MODEL_ID = _ACTIVE_MODEL["repo"]
+MODEL_HF_ID = _ACTIVE_MODEL.get("hf_repo") or MODEL_ID
+MODELSCOPE_MODEL_ID = _ACTIVE_MODEL["repo"]
+MODEL_FILENAME = _ACTIVE_MODEL["file"]
+MODEL_DIR = os.path.dirname(_ACTIVE_MODEL["path"])
+MODEL_PATH = _ACTIVE_MODEL["path"]
+MODEL_SOURCE = _ACTIVE_MODEL["source"]
+MODEL_DISPLAY_NAME = _ACTIVE_MODEL["name"]
+MODEL_EXPECTED_SIZE = _ACTIVE_MODEL["size"]
+
+_MAX_MODEL_REDIRECTS = 5
+
+
+class UnsafeModelURLError(ValueError):
+    """Raised when a configured download URL points somewhere we refuse to fetch."""
 
 # 离线模式开关：设置环境变量 POPTRANS_OFFLINE=1 时禁止联网下载（其余情况本地缺模型即自动下载）。
 _OFFLINE_MODE = os.environ.get("POPTRANS_OFFLINE", "").strip() == "1"
@@ -233,6 +400,12 @@ LANG_ALIASES = {
 }
 
 
+# The shipped OCR engines cover Chinese, English, Japanese and Korean. Keep the
+# settings and API surface inside that capability instead of advertising
+# translation-only languages the OCR cannot read.
+SUPPORTED_LANGUAGE_CODES = ("zh", "en", "ja", "ko")
+
+
 def normalize_target_language(target_lang: Optional[str]) -> Optional[str]:
     """Return a supported ISO language code, or None for automatic mode."""
     if target_lang is None:
@@ -243,37 +416,242 @@ def normalize_target_language(target_lang: Optional[str]) -> Optional[str]:
         return None
 
     normalized = value.lower().replace("_", "-")
+    if normalized in ("auto", "none", "null"):
+        return None
+
+    candidate = None
     if normalized in LANG_NAMES:
-        return normalized
+        candidate = normalized
+    else:
+        language_code = normalized.split("-", 1)[0]
+        if language_code in LANG_NAMES:
+            candidate = language_code
+        else:
+            candidate = LANG_ALIASES.get(normalized) or LANG_ALIASES.get(value)
 
-    language_code = normalized.split("-", 1)[0]
-    if language_code in LANG_NAMES:
-        return language_code
+    if candidate in SUPPORTED_LANGUAGE_CODES:
+        return candidate
 
-    alias = LANG_ALIASES.get(normalized) or LANG_ALIASES.get(value)
-    if alias:
-        return alias
-
-    supported = ", ".join(sorted(LANG_NAMES))
+    supported = ", ".join(SUPPORTED_LANGUAGE_CODES)
     raise ValueError(
         f"不支持的目标语言: {value}，支持的语言代码: {supported}"
     )
+
+
+def normalize_source_language(source_lang) -> Optional[str]:
+    """Return a supported source language code, or None for automatic detection."""
+    if source_lang is None:
+        return None
+    value = str(source_lang).strip()
+    if not value or value.lower() == "auto":
+        return None
+    return normalize_target_language(value)
 
 
 # 翻译 prompt 模板
 PROMPT_TEMPLATE = (
     "Translate the following text into {target_lang}. Note that you should "
     "only output the translated result without any additional explanation:\n\n"
-    "{source_text}"
+    "{glossary}{source_text}"
+)
+PROMPT_TEMPLATE_WITH_SOURCE = (
+    "Translate the following {source_lang} text into {target_lang}. Note that "
+    "you should only output the translated result without any additional "
+    "explanation:\n\n{glossary}{source_text}"
 )
 
 
-def build_translation_prompt(target_lang: str, source_text: str) -> str:
-    """Build the official Hy-MT2 default-translation instruction."""
+def _term_present(term: str, text: str) -> bool:
+    if not term or not text:
+        return False
+    return term.casefold() in text.casefold()
+
+
+def _glossary_for_text(text: str, glossary) -> list[dict]:
+    return [entry for entry in (glossary or []) if _term_present(entry["term"], text)]
+
+
+def _glossary_signature(text: str, glossary) -> tuple:
+    entries = _glossary_for_text(text, glossary)
+    return tuple(sorted((entry["term"].casefold(), entry["translation"]) for entry in entries))
+
+
+def _glossary_section(entries: list[dict]) -> str:
+    if not entries:
+        return ""
+    lines = "\n".join(f"- {entry['term']} => {entry['translation']}" for entry in entries)
+    return "Use these glossary translations consistently:\n" + lines + "\n\n"
+
+
+def _glossary_hits(text: str, glossary) -> list[dict]:
+    return [
+        {
+            "term": entry["term"],
+            "translation": entry["translation"],
+            "source": entry.get("source", ""),
+            "note": entry.get("note", ""),
+        }
+        for entry in _glossary_for_text(text, glossary)
+    ]
+
+
+def build_translation_prompt(
+    target_lang: str,
+    source_text: str,
+    source_lang: Optional[str] = None,
+    glossary=None,
+) -> str:
+    """Build the Hy-MT2 translation instruction, optionally fixing the source."""
+    glossary_section = _glossary_section(_glossary_for_text(source_text, glossary))
+    if source_lang and source_lang in LANG_NAMES_EN:
+        return PROMPT_TEMPLATE_WITH_SOURCE.format(
+            source_lang=LANG_NAMES_EN[source_lang],
+            target_lang=LANG_NAMES_EN[target_lang],
+            glossary=glossary_section,
+            source_text=source_text,
+        )
     return PROMPT_TEMPLATE.format(
         target_lang=LANG_NAMES_EN[target_lang],
+        glossary=glossary_section,
         source_text=source_text,
     )
+
+
+# 截图覆盖层需要逐行译文与 OCR 行框一一对应。编号行让模型在一次推理里
+# 完成整屏翻译，避免每行一次调用带来的数十秒延迟。
+LINES_PROMPT_TEMPLATE = (
+    "Translate each numbered line below into {target_lang}.{math} "
+    "Keep exactly one output line per input line, in the same order, formatted "
+    "as \"[n] translated text\". Do not merge, split, omit or explain anything.\n\n"
+    "{glossary}{lines_block}"
+)
+LINES_PROMPT_TEMPLATE_WITH_SOURCE = (
+    "Translate each numbered line below from {source_lang} into {target_lang}.{math} "
+    "Keep exactly one output line per input line, in the same order, formatted "
+    "as \"[n] translated text\". Do not merge, split, omit or explain anything.\n\n"
+    "{glossary}{lines_block}"
+)
+
+# The plain variant drops the "[n] " markers from both input and output. The
+# markers cost 4-5 generated tokens per line (~20% of decode time on CPU), so
+# the live overlay uses this prompt first and only falls back to the numbered
+# prompt when the model changes the line count.
+LINES_PROMPT_PLAIN = (
+    "Translate each line below into {target_lang}.{math} "
+    "Output exactly {count} lines, one translation per input line, in the same "
+    "order. Do not merge, split, omit, number or explain anything.\n\n"
+    "{glossary}{lines_block}"
+)
+LINES_PROMPT_PLAIN_WITH_SOURCE = (
+    "Translate each line below from {source_lang} into {target_lang}.{math} "
+    "Output exactly {count} lines, one translation per input line, in the same "
+    "order. Do not merge, split, omit, number or explain anything.\n\n"
+    "{glossary}{lines_block}"
+)
+
+MATH_INSTRUCTION = (
+    " Keep mathematical formulas as LaTeX inline math ($...$), repair obvious "
+    "OCR errors, and do not translate variable names."
+)
+
+_MATH_SYMBOLS = set(
+    "=+-×÷*/^_{}[]<>∫∑√±≈≠≤≥∞∂∇·"
+    "παβγδεζηθλμνξοπρστυφχψωΩ"
+)
+_MATH_ASSIGN_RE = re.compile(r"[A-Za-z0-9)\]}]\s*[=^_]\s*[A-Za-z0-9({\[]")
+
+
+def _is_math_line(text: str) -> bool:
+    """Heuristic used to attach the LaTeX instruction to formula-heavy lines."""
+    value = str(text or "").strip()
+    if not value:
+        return False
+    if "\\" in value or _MATH_ASSIGN_RE.search(value):
+        return True
+    compact = [char for char in value if not char.isspace()]
+    if len(compact) < 4:
+        return False
+    math_chars = sum(
+        1 for char in compact if char in _MATH_SYMBOLS or char.isdigit()
+    )
+    return math_chars / len(compact) >= 0.3
+
+_LINE_MARKER_RE = re.compile(r"^\s*(?:\[(\d+)\]|(\d+)[.、:：])\s*(.*)$")
+
+
+def build_lines_prompt(
+    target_lang: str,
+    lines: list[str],
+    source_lang: Optional[str] = None,
+    glossary=None,
+    numbered: bool = True,
+    math: bool = False,
+) -> str:
+    """Build the OCR line translation prompt.
+
+    numbered=True prefixes each line with [n] and asks for the same markers;
+    numbered=False asks for one plain line per input, which decodes faster.
+    math=True adds a LaTeX instruction for formula-heavy batches.
+    """
+    if numbered:
+        block = "\n".join(
+            f"[{index + 1}] {line}" for index, line in enumerate(lines)
+        )
+    else:
+        block = "\n".join(lines)
+    glossary_section = _glossary_section(_glossary_for_text(block, glossary))
+    if numbered:
+        template = (
+            LINES_PROMPT_TEMPLATE_WITH_SOURCE
+            if source_lang and source_lang in LANG_NAMES_EN
+            else LINES_PROMPT_TEMPLATE
+        )
+    else:
+        template = (
+            LINES_PROMPT_PLAIN_WITH_SOURCE
+            if source_lang and source_lang in LANG_NAMES_EN
+            else LINES_PROMPT_PLAIN
+        )
+    values = {
+        "target_lang": LANG_NAMES_EN[target_lang],
+        "glossary": glossary_section,
+        "lines_block": block,
+        "count": len(lines),
+        "math": MATH_INSTRUCTION if math else "",
+    }
+    if source_lang and source_lang in LANG_NAMES_EN:
+        values["source_lang"] = LANG_NAMES_EN[source_lang]
+    return template.format(**values)
+
+
+def parse_numbered_translations(content: str, expected: int) -> Optional[list[str]]:
+    """Parse '[n] text' model output into a list in input order.
+
+    Returns None when the output does not look line-numbered at all; callers
+    then retry or fall back to per-line translation. Missing entries stay None.
+    """
+    if expected <= 0:
+        return []
+    results: list[Optional[str]] = [None] * expected
+    matched = 0
+    raw_lines = [line.strip() for line in (content or "").splitlines() if line.strip()]
+
+    for line in raw_lines:
+        marker = _LINE_MARKER_RE.match(line)
+        if not marker:
+            continue
+        index = int(marker.group(1) or marker.group(2))
+        text = marker.group(3).strip()
+        if 1 <= index <= expected and text:
+            results[index - 1] = text
+            matched += 1
+
+    if matched == 0:
+        # Some models drop the markers but still emit one line per input.
+        if len(raw_lines) == expected:
+            return raw_lines
+        return None
+    return results
 
 
 # ── 长文分块 ──────────────────────────────────────────────
@@ -355,6 +733,173 @@ def _split_long_text(text: str):
     return chunks, True
 
 
+def _is_http_url(value: str) -> bool:
+    try:
+        parts = urlsplit(value.strip())
+    except ValueError:
+        return False
+    return parts.scheme.lower() in ("http", "https") and bool(parts.hostname)
+
+
+def _read_model_download_config() -> tuple[str, str]:
+    """Read the configured download source, falling back to ModelScope.
+
+    Mirrors config.NormalizeModelDownloadSource in Go so a hand-edited or
+    legacy settings.json cannot break startup.
+    """
+    source = DEFAULT_MODEL_SOURCE
+    base_url = ""
+    try:
+        cfg_file = settings_path()
+        if cfg_file.is_file():
+            data = json.loads(cfg_file.read_text(encoding="utf-8"))
+            raw_source = str(data.get("model_download_source") or "").strip().lower()
+            if raw_source in MODEL_SOURCE_LABELS:
+                source = raw_source
+            base_url = str(data.get("model_download_base_url") or "").strip()
+    except Exception as e:
+        logger.warning("读取模型下载源配置失败，使用默认 %s: %s", DEFAULT_MODEL_SOURCE, e)
+
+    base_url = base_url.rstrip("/")
+    if source == MODEL_SOURCE_CUSTOM and not _is_http_url(base_url):
+        source = DEFAULT_MODEL_SOURCE
+        base_url = ""
+    return source, base_url
+
+
+def _resolve_model_url(source: str, base_url: str = "") -> str:
+    """Build the GGUF download URL for the configured source."""
+    filename = "/".join(quote(part, safe="") for part in MODEL_FILENAME.split("/"))
+    if source == MODEL_SOURCE_HUGGINGFACE:
+        return f"{HUGGINGFACE_ENDPOINT}/{MODEL_HF_ID}/resolve/main/{filename}"
+    if source == MODEL_SOURCE_CUSTOM:
+        candidate = (base_url or "").rstrip("/")
+        lowered = candidate.lower()
+        # Accept either a complete file URL or a HuggingFace-style mirror root.
+        if lowered.endswith(".gguf") or "/resolve/" in lowered:
+            return candidate
+        return f"{candidate}/{MODEL_HF_ID}/resolve/main/{filename}"
+    return f"{MODELSCOPE_ENDPOINT}/models/{MODELSCOPE_MODEL_ID}/resolve/master/{filename}"
+
+
+def _validate_model_url(url: str) -> str:
+    """Reject non-HTTP and local/private/reserved download targets.
+
+    This is a desktop app fetching a user-configurable URL, but the request is
+    still server-side: keep it out of loopback, LAN and cloud-metadata ranges.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError as error:
+        raise UnsafeModelURLError(f"无效的下载地址: {error}") from error
+
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise UnsafeModelURLError(f"仅支持 http/https 下载地址: {url}")
+
+    host = parts.hostname
+    if not host:
+        raise UnsafeModelURLError(f"下载地址缺少主机名: {url}")
+
+    lowered = host.lower()
+    if lowered == "localhost" or lowered.endswith(".localhost"):
+        raise UnsafeModelURLError(f"拒绝下载到本机地址: {host}")
+
+    addresses = []
+    try:
+        addresses = [ipaddress.ip_address(host)]
+    except ValueError:
+        try:
+            port = parts.port or (443 if scheme == "https" else 80)
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError as error:
+            raise UnsafeModelURLError(f"无法解析下载地址主机 {host}: {error}") from error
+        for info in infos:
+            raw = str(info[4][0]).split("%", 1)[0]
+            try:
+                addresses.append(ipaddress.ip_address(raw))
+            except ValueError:
+                continue
+
+    if not addresses:
+        raise UnsafeModelURLError(f"下载地址无法解析: {host}")
+
+    for address in addresses:
+        if (
+            address.is_loopback
+            or address.is_private
+            or address.is_link_local
+            or address.is_reserved
+            or address.is_multicast
+            or address.is_unspecified
+        ):
+            raise UnsafeModelURLError(f"下载地址 {host} 指向回环/内网/保留地址，已拒绝")
+
+    return url
+
+
+def _request_with_validated_redirects(session, method: str, url: str, **kwargs):
+    """Issue a request, validating every redirect hop before following it."""
+    current = url
+    for _ in range(_MAX_MODEL_REDIRECTS + 1):
+        _validate_model_url(current)
+        response = session.request(method, current, allow_redirects=False, **kwargs)
+        if response.status_code in (301, 302, 303, 307, 308):
+            location = response.headers.get("Location")
+            response.close()
+            if not location:
+                raise IOError("下载服务器返回了缺少 Location 的重定向")
+            current = urljoin(current, location)
+            continue
+        return response
+    raise IOError("模型下载重定向次数过多")
+
+
+def _read_cpu_threads() -> Optional[int]:
+    """Read the user's llama.cpp CPU thread count (0/auto -> None)."""
+    try:
+        cfg_file = settings_path()
+        if cfg_file.is_file():
+            data = json.loads(cfg_file.read_text(encoding="utf-8"))
+            threads = int(data.get("ai_threads", 0) or 0)
+            if threads > 0:
+                return min(threads, 256)
+    except Exception as e:
+        logger.warning("读取 CPU 线程配置失败，使用自动值: %s", e)
+    return None
+
+
+def _read_glossary() -> list[dict]:
+    """Read the user's glossary from settings.json (term/translation/source)."""
+    entries: list[dict] = []
+    try:
+        cfg_file = settings_path()
+        if cfg_file.is_file():
+            data = json.loads(cfg_file.read_text(encoding="utf-8"))
+            raw = data.get("glossary") or []
+            if isinstance(raw, list):
+                for item in raw:
+                    if not isinstance(item, dict):
+                        continue
+                    term = str(item.get("term") or "").strip()
+                    translation = str(item.get("translation") or "").strip()
+                    source = str(item.get("source") or "").strip()
+                    note = str(item.get("note") or "").strip()
+                    if not term or not translation:
+                        continue
+                    entries.append({
+                        "term": term[:100],
+                        "translation": translation[:200],
+                        "source": source[:300],
+                        "note": note[:300],
+                    })
+                    if len(entries) >= 500:
+                        break
+    except Exception as e:
+        logger.warning("读取词汇本失败: %s", e)
+    return entries
+
+
 def _read_acceleration_preference() -> str:
     """读取用户配置的推理硬件偏好（auto / gpu / cpu）"""
     try:
@@ -379,6 +924,10 @@ class Translator:
         self.ready = False
         self._model = None
         self._setup_lock = threading.Lock()
+        # llama.cpp contexts are not safe for concurrent inference; endpoints
+        # now run in the threadpool (to overlap OCR with the LLM), so serialize
+        # model calls explicitly.
+        self._infer_lock = threading.Lock()
         self._cache_lock = threading.Lock()
         self._translation_cache = OrderedDict()
         self._status_message = "翻译引擎未初始化"
@@ -453,22 +1002,43 @@ class Translator:
                     on_ready(False)
 
     def _download_model(self, update_status):
-        """从 HuggingFace 官网下载 Hy-MT2 GGUF 模型（支持断点续传、重试）"""
+        """按激活模型的下载源下载 GGUF 模型（支持断点续传、重试）"""
         import requests
-        from huggingface_hub import hf_hub_url
 
-        update_status("正在从 HuggingFace 官网下载模型...")
-        os.makedirs(MODEL_DIR, exist_ok=True)
+        # The model entry owns the source; the global preference only supplies a
+        # custom mirror base URL (and legacy fallbacks).
+        configured_source, base_url = _read_model_download_config()
+        source = MODEL_SOURCE
+        if source == MODEL_SOURCE_CUSTOM and not base_url:
+            source, base_url = configured_source, ""
+        if source == MODEL_SOURCE_CUSTOM and not base_url:
+            source = DEFAULT_MODEL_SOURCE
+        label = MODEL_SOURCE_LABELS.get(source, source)
+        url = _resolve_model_url(source, base_url)
+        try:
+            _validate_model_url(url)
+        except UnsafeModelURLError as e:
+            update_status(f"模型下载地址不安全，已拒绝: {e}")
+            raise RuntimeError(f"模型下载地址不安全，已拒绝: {e}") from e
 
-        # 走系统代理访问官网（默认 requests 行为），避免直连被网络阻断
+        logger.info("模型下载源: model=%s source=%s url=%s", MODEL_DISPLAY_NAME, source, url)
+        update_status(f"正在从{label}下载模型 {MODEL_DISPLAY_NAME}...")
+        os.makedirs(os.path.dirname(MODEL_PATH) or MODEL_DIR, exist_ok=True)
+
+        # 走系统代理访问下载源（默认 requests 行为），避免直连被网络阻断。
+        # 证书校验保持开启；如需企业 CA，请通过 REQUESTS_CA_BUNDLE 指定。
         session = requests.Session()
-        url = hf_hub_url(MODEL_ID, MODEL_FILENAME, repo_type="model")
 
         # 探测文件大小（最多重试 5 次）
-        total_size = 1133080448
+        total_size = MODEL_EXPECTED_SIZE
         for attempt in range(1, 6):
             try:
-                resp = session.head(url, verify=False, timeout=(15, 30), allow_redirects=True)
+                resp = _request_with_validated_redirects(
+                    session,
+                    "HEAD",
+                    url,
+                    timeout=(15, 30),
+                )
                 resp.raise_for_status()
                 try:
                     size = int(resp.headers.get("Content-Length", total_size))
@@ -476,13 +1046,17 @@ class Translator:
                     size = total_size
                 if size >= 1024 * 1024:
                     total_size = size
+                resp.close()
                 break
+            except UnsafeModelURLError as e:
+                update_status(f"模型下载地址不安全，已拒绝: {e}")
+                raise RuntimeError(f"模型下载地址不安全，已拒绝: {e}") from e
             except Exception as e:
                 logger.warning("探测模型大小第 %d/5 次失败: %s", attempt, e)
                 if attempt == 5:
                     update_status("无法获取模型大小，使用默认 1.13GB 继续下载")
                 else:
-                    update_status(f"连接官网失败，正在重试（{attempt}/5）...")
+                    update_status(f"连接下载源失败，正在重试（{attempt}/5）...")
                     time.sleep(1)
 
         part_path = MODEL_PATH + ".part"
@@ -505,13 +1079,13 @@ class Translator:
                 mode = "ab"
 
             try:
-                response = session.get(
+                response = _request_with_validated_redirects(
+                    session,
+                    "GET",
                     url,
                     stream=True,
                     headers=headers,
-                    verify=False,
                     timeout=(15, 300),
-                    allow_redirects=True,
                 )
 
                 # 200 表示服务器忽略 Range 要求从头传；206 才是断点续传
@@ -564,6 +1138,9 @@ class Translator:
                 # 走到这里说明连接被提前关闭，但已有数据已落盘，可续传
                 raise IOError(f"连接提前关闭：已下载 {downloaded} / {total_size} 字节")
 
+            except UnsafeModelURLError as e:
+                update_status(f"模型下载地址不安全，已拒绝: {e}")
+                raise RuntimeError(f"模型下载地址不安全，已拒绝: {e}") from e
             except Exception as e:
                 logger.warning("模型下载第 %d/%d 次失败: %s", attempt, max_retries, e)
                 if attempt < max_retries:
@@ -592,6 +1169,13 @@ class Translator:
 
         preference = _read_acceleration_preference()
         self._configured_device = preference
+        configured_threads = _read_cpu_threads()
+        threads = configured_threads or os.cpu_count() or 4
+        logger.info(
+            "llama.cpp CPU 线程: %d（%s）",
+            threads,
+            "用户指定" if configured_threads else "自动",
+        )
 
         can_gpu = False
         try:
@@ -611,7 +1195,7 @@ class Translator:
                 model_path=MODEL_PATH,
                 n_ctx=MODEL_N_CTX,
                 n_gpu_layers=0,
-                n_threads=os.cpu_count(),
+                n_threads=threads,
                 verbose=False,
             )
             self._actual_device = "cpu"
@@ -628,7 +1212,7 @@ class Translator:
                 model_path=MODEL_PATH,
                 n_ctx=MODEL_N_CTX,
                 n_gpu_layers=0,
-                n_threads=os.cpu_count(),
+                n_threads=threads,
                 verbose=False,
             )
             self._actual_device = "cpu"
@@ -643,7 +1227,7 @@ class Translator:
                 model_path=MODEL_PATH,
                 n_ctx=MODEL_N_CTX,
                 n_gpu_layers=-1,
-                n_threads=os.cpu_count(),
+                n_threads=threads,
                 verbose=False,
             )
             self._actual_device = "gpu"
@@ -656,7 +1240,7 @@ class Translator:
                 model_path=MODEL_PATH,
                 n_ctx=MODEL_N_CTX,
                 n_gpu_layers=0,
-                n_threads=os.cpu_count(),
+                n_threads=threads,
                 verbose=False,
             )
             self._actual_device = "cpu"
@@ -673,24 +1257,20 @@ class Translator:
             model.close()
     # ── 翻译 ──────────────────────────────────────────────
 
-    def _complete(self, source_text: str, target_code: str) -> Optional[str]:
-        """单次调用模型完成一段文本的翻译，按剩余上下文动态分配输出上限。
-
-        max_tokens 不再写死：短文本沿用接近 384 的默认，长文分块可获得更大
-        输出空间，同时不会超过 n_ctx 导致上下文溢出。
-        """
-        prompt = build_translation_prompt(target_code, source_text)
+    def _complete_prompt(self, prompt: str) -> Optional[str]:
+        """Run one chat completion with a context-aware output budget."""
         prompt_tokens = estimate_tokens(prompt)
         max_tokens = max(
             64,
             min(OUTPUT_MAX_TOKENS, MODEL_N_CTX - prompt_tokens - SAFETY_MARGIN_TOKENS),
         )
 
-        response = self._model.create_chat_completion(
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=max_tokens,
-            **GENERATION_CONFIG,
-        )
+        with self._infer_lock:
+            response = self._model.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                **GENERATION_CONFIG,
+            )
         if (
             response
             and "choices" in response
@@ -701,10 +1281,29 @@ class Translator:
                 return content.strip()
         return None
 
+    def _complete(
+        self,
+        source_text: str,
+        target_code: str,
+        source_code: Optional[str] = None,
+        glossary=None,
+    ) -> Optional[str]:
+        """单次调用模型完成一段文本的翻译，按剩余上下文动态分配输出上限。
+
+        max_tokens 不再写死：短文本沿用接近 384 的默认，长文分块可获得更大
+        输出空间，同时不会超过 n_ctx 导致上下文溢出。
+        """
+        return self._complete_prompt(
+            build_translation_prompt(
+                target_code, source_text, source_code, glossary
+            )
+        )
+
     def translate(
         self,
         text: str,
         target_lang: Optional[str] = None,
+        source_lang: Optional[str] = None,
     ) -> Tuple[Optional[str], Optional[str]]:
         """
         翻译文本。未指定目标语言时，自动进行中英文互译。
@@ -712,6 +1311,7 @@ class Translator:
         Args:
             text: 待翻译文本
             target_lang: 目标语言代码或名称，例如 vi、vi-VN、越南语
+            source_lang: 原文语言代码；为空/auto 时自动判断
 
         Returns:
             (翻译结果, 错误信息) — 成功时错误信息为 None
@@ -725,10 +1325,17 @@ class Translator:
 
         try:
             normalized_target = normalize_target_language(target_lang)
+            normalized_source = normalize_source_language(source_lang)
         except ValueError as error:
             return None, str(error)
 
-        cache_key = (text, normalized_target or "auto")
+        glossary = _read_glossary()
+        cache_key = (
+            text,
+            normalized_target or "auto",
+            normalized_source or "auto",
+            _glossary_signature(text, glossary),
+        )
         cached_result = self._get_cached_translation(cache_key)
         if cached_result is not None:
             logger.info(f"翻译缓存命中: {text[:30]}...")
@@ -739,9 +1346,21 @@ class Translator:
                 tgt_lang = LANG_NAMES[normalized_target]
                 direction = f"目标语言={tgt_lang}"
                 target_code = normalized_target
+            elif normalized_source:
+                if normalized_source in ("zh", "zh-hant", "yue"):
+                    target_code = "en"
+                else:
+                    target_code = "zh"
+                tgt_lang = LANG_NAMES[target_code]
+                direction = f"{LANG_NAMES[normalized_source]}→{tgt_lang}"
             else:
-                # 保留现有前端依赖的中英自动互译行为。
-                if self._is_chinese(text):
+                # 保留现有前端依赖的中英自动互译行为；日语假名/韩语谚文
+                # 必须优先判为非中文，否则汉字较多的日语句子会被当中文译成英文。
+                if self._contains_kana(text) or self._contains_hangul(text):
+                    tgt_lang = LANG_NAMES["zh"]
+                    direction = "日/韩→中"
+                    target_code = "zh"
+                elif self._is_chinese(text):
                     tgt_lang = LANG_NAMES["en"]
                     direction = "中→英"
                     target_code = "en"
@@ -756,13 +1375,17 @@ class Translator:
                 logger.info(f"翻译长文分块: chunks={len(chunks)}")
                 results = []
                 for chunk in chunks:
-                    part = self._complete(chunk, target_code)
+                    part = self._complete(
+                        chunk, target_code, normalized_source, glossary
+                    )
                     if part is None:
                         return None, "翻译分块失败（模型返回空结果）"
                     results.append(part)
                 result = "\n".join(results)
             else:
-                result = self._complete(text, target_code)
+                result = self._complete(
+                    text, target_code, normalized_source, glossary
+                )
 
             if result:
                 self._store_cached_translation(cache_key, result)
@@ -775,10 +1398,189 @@ class Translator:
             logger.exception(f"翻译失败: {text[:30]}...")
             return None, f"翻译出错: {e}"
 
+    def translate_lines(
+        self,
+        lines: list[str],
+        target_lang: Optional[str] = None,
+        source_lang: Optional[str] = None,
+        use_cache: bool = True,
+    ) -> Tuple[list[str], Optional[str]]:
+        """Translate OCR lines while keeping one result per input line.
+
+        Returns (translations, error). Untranslatable lines are returned as
+        empty strings so callers can fall back to the source text for that box.
+        use_cache=False forces a fresh model call for every line (the manual
+        refresh button), while still updating the cache with the new result.
+        """
+        if not self.ready:
+            return [], self._status_message
+
+        cleaned = [str(line).strip() for line in (lines or [])]
+        if not cleaned:
+            return [], None
+
+        try:
+            normalized_target = normalize_target_language(target_lang)
+            normalized_source = normalize_source_language(source_lang)
+        except ValueError as error:
+            return [], str(error)
+
+        joined = "\n".join(line for line in cleaned if line)
+        if normalized_target:
+            target_code = normalized_target
+        elif normalized_source:
+            target_code = (
+                "en" if normalized_source in ("zh", "zh-hant", "yue") else "zh"
+            )
+        else:
+            target_code = (
+                "en"
+                if self._is_chinese(joined)
+                and not (self._contains_kana(joined) or self._contains_hangul(joined))
+                else "zh"
+            )
+
+        glossary = _read_glossary()
+        results = ["" for _ in cleaned]
+        pending: list[int] = []
+        for index, line in enumerate(cleaned):
+            if not line:
+                continue
+            cached = None
+            if use_cache:
+                cached = self._get_cached_translation(
+                    (
+                        line,
+                        target_code,
+                        normalized_source or "auto",
+                        _glossary_signature(line, glossary),
+                    )
+                )
+            if cached is not None:
+                results[index] = cached
+            else:
+                pending.append(index)
+
+        if not pending:
+            return results, None
+
+        # Group uncached lines into batches that fit the context window.
+        batches: list[list[int]] = []
+        current: list[int] = []
+        current_tokens = 0
+        for index in pending:
+            cost = estimate_tokens(cleaned[index]) + 8
+            if current and current_tokens + cost > SOURCE_MAX_TOKENS:
+                batches.append(current)
+                current = []
+                current_tokens = 0
+            current.append(index)
+            current_tokens += cost
+        if current:
+            batches.append(current)
+
+        fallback_calls = 0
+        max_fallback_calls = 8
+
+        for batch in batches:
+            batch_texts = [cleaned[index] for index in batch]
+            batch_math = any(_is_math_line(text) for text in batch_texts)
+            # Plain one-line-per-input output avoids the "[n] " markers, which
+            # cost several generated tokens per line and dominate CPU decode
+            # time. If the model merges or splits lines, fall back to the
+            # numbered prompt so alignment stays exact.
+            plain_prompt = build_lines_prompt(
+                target_code,
+                batch_texts,
+                normalized_source,
+                glossary,
+                numbered=False,
+                math=batch_math,
+            )
+            content = self._complete_prompt(plain_prompt)
+            parsed = parse_numbered_translations(content or "", len(batch))
+            numbered_prompt = ""
+
+            if parsed is None or any(value is None for value in parsed):
+                numbered_prompt = build_lines_prompt(
+                    target_code,
+                    batch_texts,
+                    normalized_source,
+                    glossary,
+                    math=batch_math,
+                )
+                numbered_content = self._complete_prompt(numbered_prompt)
+                numbered_parsed = parse_numbered_translations(
+                    numbered_content or "", len(batch)
+                )
+                if numbered_parsed is not None:
+                    if parsed is None:
+                        parsed = numbered_parsed
+                    else:
+                        parsed = [
+                            old if old is not None else new
+                            for old, new in zip(parsed, numbered_parsed)
+                        ]
+
+            # One retry with the same strict instruction before per-line calls.
+            if parsed is None or any(value is None for value in parsed):
+                retry_content = self._complete_prompt(numbered_prompt)
+                retry_parsed = parse_numbered_translations(
+                    retry_content or "", len(batch)
+                )
+                if retry_parsed is not None:
+                    if parsed is None:
+                        parsed = retry_parsed
+                    else:
+                        parsed = [
+                            old if old is not None else new
+                            for old, new in zip(parsed, retry_parsed)
+                        ]
+
+            for local_index, source_index in enumerate(batch):
+                value = parsed[local_index] if parsed is not None else None
+                if value:
+                    results[source_index] = value
+                    self._store_cached_translation(
+                        (
+                            cleaned[source_index],
+                            target_code,
+                            normalized_source or "auto",
+                            _glossary_signature(
+                                cleaned[source_index], glossary
+                            ),
+                        ),
+                        value,
+                    )
+                elif fallback_calls < max_fallback_calls:
+                    fallback_calls += 1
+                    single = self._complete(
+                        cleaned[source_index],
+                        target_code,
+                        normalized_source,
+                        glossary,
+                    )
+                    if single:
+                        results[source_index] = single
+                        self._store_cached_translation(
+                            (
+                                cleaned[source_index],
+                                target_code,
+                                normalized_source or "auto",
+                                _glossary_signature(
+                                    cleaned[source_index], glossary
+                                ),
+                            ),
+                            single,
+                        )
+
+        return results, None
+
     def chat_completion_stream(
         self,
         text: str,
         target_lang: Optional[str] = None,
+        source_lang: Optional[str] = None,
     ):
         """流式输出翻译结果的生成器"""
         if not self.ready:
@@ -791,16 +1593,26 @@ class Translator:
 
         try:
             normalized_target = normalize_target_language(target_lang)
+            normalized_source = normalize_source_language(source_lang)
             if normalized_target:
                 target_code = normalized_target
+            elif normalized_source:
+                target_code = (
+                    "en"
+                    if normalized_source in ("zh", "zh-hant", "yue")
+                    else "zh"
+                )
             else:
                 target_code = "en" if self._is_chinese(text) else "zh"
 
+            glossary = _read_glossary()
             chunks, split = _split_long_text(text)
             for index, chunk in enumerate(chunks):
                 if split and index > 0:
                     yield "\n"
-                prompt = build_translation_prompt(target_code, chunk)
+                prompt = build_translation_prompt(
+                    target_code, chunk, normalized_source, glossary
+                )
                 prompt_tokens = estimate_tokens(prompt)
                 max_tokens = max(
                     64,
@@ -813,16 +1625,31 @@ class Translator:
                     **GENERATION_CONFIG,
                 )
 
-            for chunk in response_stream:
-                if "choices" in chunk and len(chunk["choices"]) > 0:
-                    delta = chunk["choices"][0].get("delta", {})
-                    content = delta.get("content")
-                    if content:
-                        yield content
+            with self._infer_lock:
+                for chunk in response_stream:
+                    if "choices" in chunk and len(chunk["choices"]) > 0:
+                        delta = chunk["choices"][0].get("delta", {})
+                        content = delta.get("content")
+                        if content:
+                            yield content
 
         except Exception as e:
             logger.exception(f"流式翻译失败: {text[:30]}...")
             yield f"\n[翻译出错: {e}]"
+
+    @staticmethod
+    def _contains_kana(text: str) -> bool:
+        return any(
+            "\u3040" <= char <= "\u30ff" or "\u31f0" <= char <= "\u31ff"
+            for char in str(text or "")
+        )
+
+    @staticmethod
+    def _contains_hangul(text: str) -> bool:
+        return any(
+            "\uac00" <= char <= "\ud7af" or "\u1100" <= char <= "\u11ff"
+            for char in str(text or "")
+        )
 
     def _is_chinese(self, text: str) -> bool:
         """

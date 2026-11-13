@@ -8,9 +8,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	win "translate-plugin/internal/platform/windows"
 )
 
 const (
@@ -20,6 +23,19 @@ const (
 	EventConfigSaved = 2
 	// EventUIExited is posted when the UI process exits unexpectedly.
 	EventUIExited = 3
+	// EventHotkeyPause/EventHotkeyResume bracket hotkey recording in the UI.
+	EventHotkeyPause  = 4
+	EventHotkeyResume = 5
+	// EventOverlayClosed is posted when the screenshot overlay window closes.
+	EventOverlayClosed = 6
+	// EventLivePause/EventLiveResume/EventLiveStop control the live loop.
+	EventLivePause  = 7
+	EventLiveResume = 8
+	EventLiveStop   = 9
+	// EventOverlayRefresh re-runs the current screenshot translation.
+	EventOverlayRefresh = 10
+	// EventLiveRefresh re-runs OCR + translation for the current live frame.
+	EventLiveRefresh = 11
 
 	processQueryLimitedInformation = 0x1000
 	stillActive                    = 259
@@ -30,9 +46,11 @@ type HostCallback func(event int)
 
 // Manager owns the single UI daemon process from the host side.
 type Manager struct {
-	baseDir   string
-	resolveUI func() string
-	onEvent   HostCallback
+	baseDir     string
+	endpointDir string
+	overlayMode bool
+	resolveUI   func() string
+	onEvent     HostCallback
 
 	mu          sync.Mutex
 	cmd         *exec.Cmd
@@ -47,10 +65,24 @@ type Manager struct {
 
 func NewManager(baseDir string, resolveUI func() string, onEvent HostCallback) *Manager {
 	return &Manager{
-		baseDir:   baseDir,
-		resolveUI: resolveUI,
-		onEvent:   onEvent,
+		baseDir:     baseDir,
+		endpointDir: baseDir,
+		resolveUI:   resolveUI,
+		onEvent:     onEvent,
 	}
+}
+
+// SetEndpointDir publishes this daemon's endpoint in a separate directory,
+// allowing an overlay/live UI process to coexist with the main window.
+func (m *Manager) SetEndpointDir(dir string) {
+	if dir != "" {
+		m.endpointDir = dir
+	}
+}
+
+// SetOverlayMode launches the UI as the screenshot/live overlay process.
+func (m *Manager) SetOverlayMode(enabled bool) {
+	m.overlayMode = enabled
 }
 
 func (m *Manager) EnsureReady(ctx context.Context) error {
@@ -120,6 +152,38 @@ func (m *Manager) ShowResult(ctx context.Context, payload ResultPayload) error {
 	return client.ShowResult(ctx, payload)
 }
 
+func (m *Manager) ShowOverlay(ctx context.Context, payload OverlayPayload) error {
+	if err := m.EnsureReady(ctx); err != nil {
+		return err
+	}
+	client, err := m.currentClient()
+	if err != nil {
+		return err
+	}
+	return client.ShowOverlay(ctx, payload)
+}
+
+func (m *Manager) ShowLive(ctx context.Context, payload LivePayload) error {
+	if err := m.EnsureReady(ctx); err != nil {
+		return err
+	}
+	client, err := m.currentClient()
+	if err != nil {
+		return err
+	}
+	return client.ShowLive(ctx, payload)
+}
+
+// SetCaptureGuard briefly excludes the overlay from screen capture around the
+// host's live frame grab. The panel stays capturable the rest of the time.
+func (m *Manager) SetCaptureGuard(ctx context.Context, exclude bool) error {
+	client, err := m.currentClient()
+	if err != nil {
+		return err
+	}
+	return client.SetCaptureGuard(ctx, exclude)
+}
+
 func (m *Manager) Hide(ctx context.Context) error {
 	client, err := m.currentClient()
 	if err != nil {
@@ -171,7 +235,7 @@ func (m *Manager) Stop() {
 	m.mu.Lock()
 	m.resetLocked()
 	m.mu.Unlock()
-	RemoveEndpoint(m.baseDir)
+	RemoveEndpoint(m.endpointDir)
 }
 
 func (m *Manager) ensureCallback() error {
@@ -216,7 +280,7 @@ func (m *Manager) currentClient() (*Client, error) {
 }
 
 func (m *Manager) killStaleDaemon() {
-	endpoint, err := ReadEndpoint(m.baseDir)
+	endpoint, err := ReadEndpoint(m.endpointDir)
 	if err != nil {
 		return
 	}
@@ -227,13 +291,13 @@ func (m *Manager) killStaleDaemon() {
 			time.Sleep(150 * time.Millisecond)
 		}
 	}
-	RemoveEndpoint(m.baseDir)
+	RemoveEndpoint(m.endpointDir)
 }
 
 func (m *Manager) startProcess(ctx context.Context) error {
-	exePath := m.resolveUI()
-	if exePath == "" {
-		return errors.New("translate-ui.exe not found")
+	exePath, err := win.TrustedExecutable(m.resolveUI(), "translate-ui.exe")
+	if err != nil {
+		return err
 	}
 
 	m.mu.Lock()
@@ -244,14 +308,20 @@ func (m *Manager) startProcess(ctx context.Context) error {
 		return errors.New("ui callback server not ready")
 	}
 
-	RemoveEndpoint(m.baseDir)
-	cmd := exec.Command(
-		exePath,
-		"--daemon",
-		"--callback-url", callbackURL,
-		"--callback-token", callbackTok,
-	)
+	RemoveEndpoint(m.endpointDir)
+	// Launch settings travel through the environment: command-line arguments are
+	// visible to other processes, and the callback token must not be.
+	cmd := &exec.Cmd{Path: exePath, Args: []string{exePath}}
 	cmd.Dir = filepath.Dir(exePath)
+	env := environmentWith(os.Environ(), "POPTRANS_BASE_DIR", m.baseDir)
+	env = environmentWith(env, "POPTRANS_UI_DAEMON", "1")
+	if m.overlayMode {
+		env = environmentWith(env, "POPTRANS_UI_OVERLAY", "1")
+	}
+	env = environmentWith(env, "POPTRANS_UI_ENDPOINT_DIR", m.endpointDir)
+	env = environmentWith(env, "POPTRANS_UI_CALLBACK_URL", callbackURL)
+	env = environmentWith(env, "POPTRANS_UI_CALLBACK_TOKEN", callbackTok)
+	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,
 		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
@@ -280,7 +350,7 @@ func (m *Manager) startProcess(ctx context.Context) error {
 			m.waitCh = nil
 		}
 		m.mu.Unlock()
-		RemoveEndpoint(m.baseDir)
+		RemoveEndpoint(m.endpointDir)
 		log.Printf("ui daemon process exited: pid=%d err=%v", cmd.Process.Pid, err)
 		if m.onEvent != nil {
 			m.onEvent(EventUIExited)
@@ -315,7 +385,7 @@ func (m *Manager) waitUntilReady(ctx context.Context) error {
 			}
 		}
 
-		endpoint, err := ReadEndpoint(m.baseDir)
+		endpoint, err := ReadEndpoint(m.endpointDir)
 		if err == nil {
 			client := NewClient(endpoint)
 			if status, healthErr := client.Health(ctx); healthErr == nil && status.Ready {
@@ -347,6 +417,18 @@ func (m *Manager) resetLocked() {
 	m.callbackTok = ""
 	m.owned = false
 	m.waitCh = nil
+}
+
+func environmentWith(environ []string, key, value string) []string {
+	prefix := key + "="
+	result := make([]string, 0, len(environ)+1)
+	for _, entry := range environ {
+		if strings.HasPrefix(strings.ToUpper(entry), strings.ToUpper(prefix)) {
+			continue
+		}
+		result = append(result, entry)
+	}
+	return append(result, prefix+value)
 }
 
 func processExists(pid int) bool {

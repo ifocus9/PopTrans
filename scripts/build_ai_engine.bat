@@ -51,6 +51,38 @@ if errorlevel 1 (
   popd
   exit /b 1
 )
+copy /Y "%ROOT%\assets\rapidocr\korean_PP-OCRv3_rec_infer.onnx" "%ROOT%\dist-go\models\rapidocr\" >nul
+if errorlevel 1 (
+  echo Failed to copy the Korean RapidOCR model.
+  echo.
+  pause
+  popd
+  exit /b 1
+)
+copy /Y "%ROOT%\assets\rapidocr\korean_dict.txt" "%ROOT%\dist-go\models\rapidocr\" >nul
+if errorlevel 1 (
+  echo Failed to copy the Korean OCR dictionary.
+  echo.
+  pause
+  popd
+  exit /b 1
+)
+copy /Y "%ROOT%\assets\rapidocr\japanese_PP-OCRv3_rec_infer.onnx" "%ROOT%\dist-go\models\rapidocr\" >nul
+if errorlevel 1 (
+  echo Failed to copy the Japanese RapidOCR model.
+  echo.
+  pause
+  popd
+  exit /b 1
+)
+copy /Y "%ROOT%\assets\rapidocr\japanese_dict.txt" "%ROOT%\dist-go\models\rapidocr\" >nul
+if errorlevel 1 (
+  echo Failed to copy the Japanese OCR dictionary.
+  echo.
+  pause
+  popd
+  exit /b 1
+)
 
 echo [4/4] Assembling AI engine...
 if not exist "%ROOT%\dist-go" mkdir "%ROOT%\dist-go"

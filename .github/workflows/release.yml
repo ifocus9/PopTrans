@@ -40,16 +40,24 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
+          # PyPI only ships the llama-cpp-python source distribution, which takes
+          # tens of minutes to compile on a Windows runner. Use the official
+          # prebuilt CPU wheel so requirements.txt sees it as already satisfied.
+          pip install "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.19/llama_cpp_python-0.3.19-cp312-cp312-win_amd64.whl"
           pip install -r backend/requirements-build.txt
 
       # 2. 编译各核心模块
-      - name: Build Wails UI (translate-ui.exe)
+      - name: Build UI (translate-ui.exe)
         shell: pwsh
         run: |
-          go install github.com/wailsapp/wails/v2/cmd/wails@v2.13.0
-          if (-not (Test-Path "build\windows")) { New-Item -ItemType Directory -Path "build\windows" -Force }
-          Copy-Item "assets\icon.ico" "build\windows\icon.ico" -Force
-          wails build -clean
+          Push-Location frontend
+          npm ci
+          npm run build
+          Pop-Location
+          if (-not (Test-Path "build\bin")) { New-Item -ItemType Directory -Path "build\bin" -Force }
+          go run ./tools/winres -icon "assets/icon.ico" -output "translate-ui-res.syso" -arch amd64
+          go build -tags desktop,production -ldflags "-H windowsgui" -o "build/bin/translate-ui.exe" .
+          if (Test-Path "translate-ui-res.syso") { Remove-Item "translate-ui-res.syso" -Force }
 
       - name: Build AI Engine (ai_engine.exe)
         shell: pwsh
@@ -58,13 +66,19 @@ jobs:
           # 导出 RapidOCR 内置模型到发布目录
           if (-not (Test-Path "dist-go\models\rapidocr")) { New-Item -ItemType Directory -Path "dist-go\models\rapidocr" -Force }
           python -c "from pathlib import Path; import shutil, rapidocr_onnxruntime; src=Path(rapidocr_onnxruntime.__file__).resolve().parent/'models'; dst=Path('dist-go')/'models'/'rapidocr'; [shutil.copy2(src/name, dst/name) for name in ('ch_PP-OCRv4_det_infer.onnx','ch_PP-OCRv4_rec_infer.onnx','ch_ppocr_mobile_v2.0_cls_infer.onnx')]"
+          # 韩语识别模型与字典随包发布
+          Copy-Item "assets\rapidocr\*" "dist-go\models\rapidocr\" -Force
 
       - name: Build Go Host Core (PopTrans.exe)
         shell: pwsh
         run: |
+          if (-not (Test-Path "internal/runtimebundle/assets")) { New-Item -ItemType Directory -Path "internal/runtimebundle/assets" -Force }
+          Copy-Item "build/bin/translate-ui.exe" "internal/runtimebundle/assets/translate-ui.exe" -Force
+          Copy-Item "dist-ai/ai_engine.exe" "internal/runtimebundle/assets/ai_engine.exe" -Force
+          $buildId = Get-Date -Format "yyyyMMddHHmmss"
           go run ./tools/winres -icon "assets/icon.ico" -output "cmd/translate-go/translate-go-res.syso" -arch amd64
           if (-not (Test-Path "dist-go")) { New-Item -ItemType Directory -Path "dist-go" -Force }
-          go build -ldflags "-s -w -H windowsgui" -o "dist-go/PopTrans.exe" ./cmd/translate-go
+          go build -tags bundle -ldflags "-s -w -H windowsgui -X translate-plugin/internal/runtimebundle.buildID=$buildId" -o "dist-go/PopTrans.exe" ./cmd/translate-go
           if (Test-Path "cmd/translate-go/translate-go-res.syso") { Remove-Item "cmd/translate-go/translate-go-res.syso" -Force }
 
       # 3. 组装待签名的二进制文件集合
@@ -89,8 +103,13 @@ jobs:
           name: unsigned-binaries
           path: binaries-to-sign/*
 
-      # 4. 提交 SignPath 代码签名
+      # 4. 提交 SignPath 代码签名（未配置签名密钥时跳过，仍发布未签名包）
       - name: Submit signing request to SignPath
+        if: ${{ env.SIGNPATH_API_TOKEN != '' && env.SIGNPATH_ORGANIZATION_ID != '' }}
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORGANIZATION_ID: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+        continue-on-error: true
         uses: signpath/github-action-submit-signing-request@v3
         with:
           api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
@@ -107,13 +126,21 @@ jobs:
       - name: Package Final Signed Release
         shell: pwsh
         run: |
-          Write-Host "Replacing signed executables in dist-go..."
-          $zipFile = Get-ChildItem -Path signed-binaries -Filter "*.zip" -Recurse | Select-Object -First 1
-          if ($zipFile) {
-            Expand-Archive -Path $zipFile.FullName -DestinationPath signed-extracted -Force
-            Copy-Item -Path signed-extracted\*.exe -Destination dist-go\ -Force
+          Write-Host "Replacing signed executables in dist-go (if available)..."
+          $signedDir = $null
+          if (Test-Path "signed-binaries") {
+            $zipFile = Get-ChildItem -Path signed-binaries -Filter "*.zip" -Recurse | Select-Object -First 1
+            if ($zipFile) {
+              Expand-Archive -Path $zipFile.FullName -DestinationPath signed-extracted -Force
+              $signedDir = "signed-extracted"
+            } else {
+              $signedDir = "signed-binaries"
+            }
+          }
+          if ($signedDir) {
+            Copy-Item -Path "$signedDir\*.exe" -Destination dist-go\ -Force
           } else {
-            Copy-Item -Path signed-binaries\*.exe -Destination dist-go\ -Force
+            Write-Host "No signed binaries available (SignPath not configured); packaging the unsigned build."
           }
 
           # 验证签名状态

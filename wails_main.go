@@ -3,7 +3,6 @@ package main
 import (
 	"embed"
 	"log"
-	"os"
 	"path/filepath"
 
 	"github.com/wailsapp/wails/v2"
@@ -26,7 +25,13 @@ func main() {
 	baseDir := config.ResolveBaseDir()
 	configureWailsLogging(baseDir)
 
-	daemonMode := hasArg(os.Args, "--daemon")
+	launch := wailsui.LaunchOptionsFromEnv()
+	daemonMode := launch.Daemon
+	overlayMode := launch.Overlay
+	windowTitle := "选中翻译"
+	if overlayMode {
+		windowTitle = "选中翻译浮层"
+	}
 	background := &options.RGBA{A: 0}
 
 	cfg, err := config.Load(baseDir)
@@ -49,16 +54,40 @@ func main() {
 		WindowIsTranslucent:  true,
 		BackdropType:         wailswindows.Acrylic,
 	}
-	app := wailsui.NewApp(baseDir, os.Args)
+	if overlayMode {
+		// Overlay/live windows get their shape from a window region computed by
+		// the page, so everything outside the toolbar and chips is see-through
+		// and click-through without acrylic blur or layered-color-key limits.
+		background = &options.RGBA{R: 0, G: 0, B: 0, A: 255}
+		windowsOptions = &wailswindows.Options{
+			Theme:                             winTheme,
+			WebviewIsTransparent:              true,
+			WindowIsTranslucent:               false,
+			BackdropType:                      wailswindows.None,
+			DisableFramelessWindowDecorations: true,
+		}
+	}
+	app := wailsui.NewApp(baseDir, launch)
+
+	// The workbench needs a usable minimum; screenshot/live overlays must be
+	// allowed to match a selection smaller than that. The runtime minimum is
+	// switched per overlay mode (screenshot 56x1, live 120x48) in WM_GETMINMAXINFO;
+	// this value is only the initial floor.
+	minWidth, minHeight := 420, 560
+	if overlayMode {
+		minWidth, minHeight = 56, 1
+	}
 
 	err = wails.Run(&options.App{
-		Title:         "选中翻译",
-		Width:         458,
-		Height:        640,
+		Title:         windowTitle,
+		Width:         520,
+		Height:        720,
+		MinWidth:      minWidth,
+		MinHeight:     minHeight,
 		StartHidden:   true,
-		DisableResize: true,
+		DisableResize: overlayMode,
 		Frameless:     true,
-		AlwaysOnTop:   false,
+		AlwaysOnTop:   overlayMode,
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},
@@ -76,15 +105,6 @@ func main() {
 	if daemonMode {
 		log.Printf("translate-ui daemon exited")
 	}
-}
-
-func hasArg(args []string, name string) bool {
-	for _, arg := range args {
-		if arg == name {
-			return true
-		}
-	}
-	return false
 }
 
 func configureWailsLogging(baseDir string) {

@@ -15,8 +15,10 @@ AI 引擎（`ai_engine.exe` / `backend/api_server.py`）基于 FastAPI 提供本
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/health` | 健康检查，查询模型加载状态 |
-| `POST` | `/api/v1/ocr` | 图片 OCR 文字识别 |
+| `POST` | `/api/v1/ocr` | 图片 OCR 文字识别（可返回行框） |
 | `POST` | `/api/v1/ocr_translate` | 图片 OCR 识别并翻译 |
+| `POST` | `/api/v1/ocr_translate_blocks` | 图片 OCR + 逐行翻译（截图悬浮层） |
+| `POST` | `/api/v1/translate_blocks` | 翻译已识别的行框（实时翻译） |
 | `POST` | `/v1/chat/completions` | OpenAI 兼容的翻译接口（支持流式） |
 
 ---
@@ -37,6 +39,9 @@ AI 引擎（`ai_engine.exe` / `backend/api_server.py`）基于 FastAPI 提供本
 | `translator_ready` | bool | 翻译模型是否加载完成、可以翻译 |
 | `translator_status` | string | 翻译模型当前状态描述文本（如加载进度/下载提示） |
 | `ocr_loaded` | bool | OCR 引擎是否已加载（懒加载，首次识别后为 `true`） |
+| `model_name` | string | 当前激活模型的显示名称 |
+| `model_path` | string | 当前加载的 GGUF 文件绝对路径 |
+| `model_source` | string | 当前模型的下载来源（`modelscope` / `huggingface` / `custom`） |
 
 ### 返回示例
 
@@ -45,7 +50,10 @@ AI 引擎（`ai_engine.exe` / `backend/api_server.py`）基于 FastAPI 提供本
   "status": "ok",
   "translator_ready": true,
   "translator_status": "模型已就绪",
-  "ocr_loaded": false
+  "ocr_loaded": false,
+  "model_name": "Tencent-Hunyuan/Hy-MT2-1.8B-GGUF",
+  "model_path": "C:\\PopTrans\\models\\Hy-MT2-1.8B-GGUF\\Hy-MT2-1.8B-Q4_K_M.gguf",
+  "model_source": "modelscope"
 }
 ```
 
@@ -68,7 +76,8 @@ curl http://127.0.0.1:8989/health
 | 参数 | 位置 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- | --- |
 | `file` | form-data | file | 是 | 图片文件，`Content-Type` 必须以 `image/` 开头 |
-| `target_lang` | form-data | string | 否 | 目标语言代码或名称；不传时保持中英文自动互译 |
+| `allow_retry` | form-data | bool | 否 | 默认 `true`。识别质量偏低时会再放大识别一次；实时翻译传 `false` 跳过第二轮，下一帧会重新识别 |
+| `source_lang` | form-data | string | 否 | 原文语言；传 `ko`/`ko-KR` 时使用韩语识别模型；省略或 `auto` 时先跑默认模型，无有效文字再自动尝试韩语模型 |
 
 ### 返回参数
 
@@ -76,7 +85,12 @@ curl http://127.0.0.1:8989/health
 | --- | --- | --- |
 | `text` | string | 识别出的完整文本，多行以 `\n` 拼接 |
 | `lines` | string[] | 按行分组后的文本，每个元素为一行 |
+| `line_boxes` | object[] | 每个 OCR 行的文本、置信度与像素坐标（含倾斜行几何） |
+| `line_boxes[].angle` | number | 文本行角度（度）；负值表示向右上倾斜 |
+| `line_boxes[].cx/cy` | number | 旋转行框中心点 |
+| `line_boxes[].line_width/line_height` | number | 旋转行框沿文字方向/法线方向的长度 |
 | `scale` | number | 识别时实际采用的图像缩放系数 |
+| `image_width/image_height` | number | 图片像素尺寸 |
 
 ### 返回示例
 
@@ -153,6 +167,97 @@ curl -X POST http://127.0.0.1:8989/api/v1/ocr \
 curl -X POST http://127.0.0.1:8989/api/v1/ocr_translate \
   -F "file=@screenshot.png" \
   -F "target_lang=vi"
+```
+
+---
+
+## POST /api/v1/ocr_translate_blocks
+
+上传一张图片，按 OCR 行返回逐行翻译与行框坐标，用于截图翻译悬浮层。
+
+### 请求
+
+- **Content-Type**：`multipart/form-data`
+
+| 参数 | 位置 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- | --- |
+| `file` | form-data | file | 是 | 图片文件，`Content-Type` 必须以 `image/` 开头 |
+| `target_lang` | form-data | string | 否 | 目标语言代码/名称；省略或 `auto` 时中英自动互译 |
+| `source_lang` | form-data | string | 否 | 原文语言代码；省略或 `auto` 时自动判断 |
+
+### 返回参数
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `source_text` | string | OCR 识别出的完整原文 |
+| `translation` | string | 逐行译文拼接（`\n` 分隔）；逐行翻译失败时回退为整段译文 |
+| `blocks` | object[] | 每个 OCR 行的文本、译文与坐标 |
+| `blocks[].text` | string | 该行原文 |
+| `blocks[].translation` | string | 该行译文；无法翻译时为空字符串 |
+| `blocks[].x/y/w/h` | number | 该行在原图像素坐标系中的左上角与宽高 |
+| `blocks[].score` | number | OCR 置信度 |
+| `blocks[].angle/cx/cy` | number | 倾斜文本行的角度与旋转框中心 |
+| `blocks[].line_width/line_height` | number | 旋转行框沿文字方向/法线方向的长度 |
+| `blocks[].glossary_hits` | object[] | 该行命中的词汇本条目：`term` / `translation` / `source` |
+| `image_width/image_height` | number | 上传图片的像素尺寸 |
+| `scale` | number | 坐标已还原到原图像素，固定为 `1.0` |
+
+> 词汇本从 `settings.json` 的 `glossary` 字段读取，词条会加入翻译提示词并要求模型使用指定译法。
+
+### 返回示例
+
+```json
+{
+  "source_text": "Hello World\nSecond line",
+  "translation": "你好世界\n第二行",
+  "blocks": [
+    {"text": "Hello World", "translation": "你好世界", "x": 12, "y": 20, "w": 140, "h": 18, "score": 0.97},
+    {"text": "Second line", "translation": "第二行", "x": 12, "y": 44, "w": 120, "h": 17, "score": 0.95}
+  ],
+  "image_width": 800,
+  "image_height": 600,
+  "scale": 1.5
+}
+```
+
+### 请求示例
+
+```bash
+curl -X POST http://127.0.0.1:8989/api/v1/ocr_translate_blocks \
+  -F "file=@screenshot.png"
+```
+
+---
+
+## POST /api/v1/translate_blocks
+
+翻译已经识别好的 OCR 行框，不再做 OCR。实时翻译先调用 `/api/v1/ocr` 拿到行框，再调用本接口；逐行结果命中翻译缓存时不会触发模型推理。
+
+### 请求
+
+- **Content-Type**：`application/json`
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `lines` | object[] | 否 | `/api/v1/ocr` 返回的 `line_boxes` 原样传入 |
+| `source_text` | string | 否 | 完整原文；`lines` 为空时按整段翻译 |
+| `image_width/image_height` | number | 否 | 图片尺寸，原样回传 |
+| `source_lang` | string | 否 | 原文语言；省略或 `auto` 时自动判断 |
+| `target_lang` | string | 否 | 目标语言；省略时中英自动互译 |
+| `force` | bool | 否 | `true` 时跳过逐行翻译缓存，强制重新推理（供手动刷新按钮使用） |
+
+`lines` 最多 300 行。
+
+### 返回参数
+
+与 `/api/v1/ocr_translate_blocks` 相同：`source_text`、`translation`、`blocks`（含逐行译文与行框）、`image_width/image_height`、`scale`。
+
+### 请求示例
+
+```bash
+curl -X POST http://127.0.0.1:8989/api/v1/translate_blocks \
+  -H "Content-Type: application/json" \
+  -d '{"lines":[{"text":"Hello World","x":12,"y":20,"w":140,"h":18}],"source_text":"Hello World"}'
 ```
 
 ---

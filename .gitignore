@@ -67,10 +67,17 @@ dist-ai/
 .icon-probe/
 frontend/node_modules/
 translate-go.exe
+*.syso
+translate-ui-icon.png
 PopTrans.exe
 
 # WorkBuddy workspace
 .workbuddy/
+
+# Local agent/tooling workspaces
+.zcode/
+.mimosa/
+.tmp-*/
 
 # UI daemon runtime discovery
 translate-ui-endpoint.json

@@ -38,14 +38,10 @@ if exist "%ROOT%\dist-go\*.log" del /Q "%ROOT%\dist-go\*.log"
 if exist "%ROOT%\dist-go\__pycache__" rmdir /S /Q "%ROOT%\dist-go\__pycache__"
 if exist "%ROOT%\dist-go\translate-wails.exe" del /Q "%ROOT%\dist-go\translate-wails.exe"
 
-copy /Y "%ROOT%\build\bin\translate-ui.exe" "%ROOT%\dist-go\translate-ui.exe" >nul
-if errorlevel 1 (
-  echo Failed to assemble Wails UI in dist-go.
-  echo.
-  pause
-  popd
-  exit /b 1
-)
+rem Single-exe release: build_go.bat embeds both of these into PopTrans.exe,
+rem so remove the loose copies to avoid confusing users.
+if exist "%ROOT%\dist-go\ai_engine.exe" del /Q "%ROOT%\dist-go\ai_engine.exe"
+if exist "%ROOT%\dist-go\translate-ui.exe" del /Q "%ROOT%\dist-go\translate-ui.exe"
 
 for %%F in (
   icon.ico

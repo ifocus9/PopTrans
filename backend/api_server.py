@@ -12,7 +12,16 @@ from PIL import Image
 from backend.ocr_service import OCRService
 from backend.runtime_paths import log_path, settings_path
 from backend.server_config import server_port
-from backend.translator import Translator, normalize_target_language
+from backend.translator import (
+    MODEL_DISPLAY_NAME,
+    MODEL_PATH,
+    MODEL_SOURCE,
+    Translator,
+    _glossary_hits,
+    _read_glossary,
+    normalize_source_language,
+    normalize_target_language,
+)
 
 
 def configure_logging():
@@ -75,22 +84,35 @@ def health_check():
         "translator_status": translator_engine.status,
         "device_info": translator_engine.device_info,
         "ocr_loaded": ocr_engine.is_loaded(),
+        "model_name": MODEL_DISPLAY_NAME,
+        "model_path": MODEL_PATH,
+        "model_source": MODEL_SOURCE,
     }
 
 @app.post("/api/v1/ocr")
-async def recognize_ocr(file: UploadFile = File(...)):
-    """接收图片并进行 OCR 识别"""
-    if not file.content_type.startswith("image/"):
+def recognize_ocr(
+    file: UploadFile = File(...),
+    allow_retry: bool = Form(True),
+    source_lang: Optional[str] = Form(None),
+):
+    """接收图片并进行 OCR 识别（source_lang=ko 时使用韩语识别模型）"""
+    if not (file.content_type or "").startswith("image/"):
         raise HTTPException(status_code=400, detail="Must be an image file")
+    try:
+        normalize_source_language(source_lang)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
 
     try:
-        content = await file.read()
+        content = file.file.read()
         image = Image.open(io.BytesIO(content))
         # 确保图片格式正确，且不受限于 RGBA 问题
         if image.mode not in ("L", "RGB", "RGBA"):
             image = image.convert("RGB")
             
-        result = ocr_engine.recognize_image(image)
+        result = ocr_engine.recognize_image(
+            image, allow_retry=allow_retry, source_lang=source_lang
+        )
         return result
     except Exception as e:
         logger.exception("OCR 处理异常")
@@ -100,12 +122,14 @@ async def recognize_ocr(file: UploadFile = File(...)):
 async def recognize_and_translate_ocr(
     file: UploadFile = File(...),
     target_lang: Optional[str] = Form(None),
+    source_lang: Optional[str] = Form(None),
 ):
     """接收图片，OCR 识别后直接翻译并返回。"""
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Must be an image file")
     try:
         normalize_target_language(target_lang)
+        normalize_source_language(source_lang)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error))
     if not translator_engine.ready:
@@ -117,7 +141,7 @@ async def recognize_and_translate_ocr(
         if image.mode not in ("L", "RGB", "RGBA"):
             image = image.convert("RGB")
 
-        ocr_result = ocr_engine.recognize_image(image)
+        ocr_result = ocr_engine.recognize_image(image, source_lang=source_lang)
         source_text = (ocr_result.get("text") or "").strip()
         if not source_text:
             return {
@@ -127,7 +151,9 @@ async def recognize_and_translate_ocr(
                 "scale": ocr_result.get("scale"),
             }
 
-        translation, error = translator_engine.translate(source_text, target_lang)
+        translation, error = translator_engine.translate(
+            source_text, target_lang, source_lang
+        )
         if error:
             raise HTTPException(status_code=500, detail=error)
 
@@ -143,6 +169,160 @@ async def recognize_and_translate_ocr(
         logger.exception("OCR 翻译处理异常")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+def _translate_line_boxes(
+    line_boxes: List[dict],
+    source_text: str,
+    image_width: int,
+    image_height: int,
+    target_lang: Optional[str],
+    source_lang: Optional[str],
+    force: bool = False,
+) -> dict:
+    """Translate OCR line boxes and return the overlay block payload."""
+    translations: list[str] = []
+    if line_boxes:
+        translations, error = translator_engine.translate_lines(
+            [block.get("text", "") for block in line_boxes],
+            target_lang,
+            source_lang,
+            use_cache=not force,
+        )
+        if error:
+            raise HTTPException(status_code=500, detail=error)
+    elif source_text:
+        translated, error = translator_engine.translate(
+            source_text, target_lang, source_lang
+        )
+        if error:
+            raise HTTPException(status_code=500, detail=error)
+        translations = [translated or ""]
+
+    glossary = _read_glossary()
+    blocks = []
+    for index, block in enumerate(line_boxes):
+        translation = translations[index] if index < len(translations) else ""
+        block_text = block.get("text", "")
+        blocks.append({
+            "text": block_text,
+            "translation": translation or "",
+            "x": block.get("x", 0),
+            "y": block.get("y", 0),
+            "w": block.get("w", 0),
+            "h": block.get("h", 0),
+            "score": block.get("score", 0),
+            "angle": block.get("angle", 0),
+            "cx": block.get("cx", 0),
+            "cy": block.get("cy", 0),
+            "line_width": block.get("line_width", 0),
+            "line_height": block.get("line_height", 0),
+            "glossary_hits": _glossary_hits(block_text, glossary),
+        })
+
+    full_translation = "\n".join(
+        block["translation"] for block in blocks if block["translation"]
+    ).strip()
+
+    # If per-line translation produced nothing (model returned unusable
+    # numbering), fall back to translating the whole text at once.
+    if source_text and not full_translation:
+        fallback, fallback_error = translator_engine.translate(
+            source_text, target_lang, source_lang
+        )
+        if fallback_error:
+            raise HTTPException(status_code=500, detail=fallback_error)
+        full_translation = (fallback or "").strip()
+
+    return {
+        "source_text": source_text,
+        "translation": full_translation,
+        "blocks": blocks,
+        "image_width": image_width,
+        "image_height": image_height,
+        "scale": 1.0,
+    }
+
+
+@app.post("/api/v1/ocr_translate_blocks")
+def recognize_and_translate_blocks(
+    file: UploadFile = File(...),
+    target_lang: Optional[str] = Form(None),
+    source_lang: Optional[str] = Form(None),
+):
+    """OCR + per-line translation with bounding boxes for the screenshot overlay."""
+    if not (file.content_type or "").startswith("image/"):
+        raise HTTPException(status_code=400, detail="Must be an image file")
+    try:
+        normalize_target_language(target_lang)
+        normalize_source_language(source_lang)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    if not translator_engine.ready:
+        raise HTTPException(status_code=503, detail="Translator model is loading or not ready.")
+
+    try:
+        content = file.file.read()
+        image = Image.open(io.BytesIO(content))
+        if image.mode not in ("L", "RGB", "RGBA"):
+            image = image.convert("RGB")
+
+        ocr_result = ocr_engine.recognize_image(image, source_lang=source_lang)
+        return _translate_line_boxes(
+            ocr_result.get("line_boxes") or [],
+            (ocr_result.get("text") or "").strip(),
+            ocr_result.get("image_width") or image.size[0],
+            ocr_result.get("image_height") or image.size[1],
+            target_lang,
+            source_lang,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("OCR 分块翻译处理异常")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class TranslateBlocksBody(BaseModel):
+    lines: Optional[List[dict]] = None
+    source_text: str = ""
+    image_width: int = 0
+    image_height: int = 0
+    source_lang: Optional[str] = None
+    target_lang: Optional[str] = None
+    # force=True bypasses the line cache so the manual refresh button gets a
+    # fresh model result even when the OCR text is unchanged.
+    force: bool = False
+
+
+@app.post("/api/v1/translate_blocks")
+def translate_blocks(body: TranslateBlocksBody):
+    """Translate already-recognized line boxes (used to pipeline OCR + LLM)."""
+    try:
+        normalize_target_language(body.target_lang)
+        normalize_source_language(body.source_lang)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    if not translator_engine.ready:
+        raise HTTPException(status_code=503, detail="Translator model is loading or not ready.")
+    lines = [block for block in (body.lines or []) if isinstance(block, dict)]
+    if len(lines) > 300:
+        raise HTTPException(status_code=400, detail="Too many lines")
+    try:
+        return _translate_line_boxes(
+            lines,
+            (body.source_text or "").strip(),
+            body.image_width,
+            body.image_height,
+            body.target_lang,
+            body.source_lang,
+            force=body.force,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("分块翻译处理异常")
+        raise HTTPException(status_code=500, detail=str(e))
+
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -151,6 +331,7 @@ class ChatCompletionRequest(BaseModel):
     messages: List[ChatMessage]
     stream: Optional[bool] = False
     target_lang: Optional[str] = None
+    source_lang: Optional[str] = None
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
@@ -168,6 +349,7 @@ async def chat_completions(req: ChatCompletionRequest):
 
     try:
         normalize_target_language(req.target_lang)
+        normalize_source_language(req.source_lang)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error))
 
@@ -177,6 +359,7 @@ async def chat_completions(req: ChatCompletionRequest):
             generator = translator_engine.chat_completion_stream(
                 user_msg,
                 req.target_lang,
+                req.source_lang,
             )
             
             def stream_openai_format():
@@ -192,7 +375,9 @@ async def chat_completions(req: ChatCompletionRequest):
             raise HTTPException(status_code=501, detail="Streaming not implemented in translator")
     else:
         # 普通翻译
-        result, error = translator_engine.translate(user_msg, req.target_lang)
+        result, error = translator_engine.translate(
+            user_msg, req.target_lang, req.source_lang
+        )
         if error:
             raise HTTPException(status_code=500, detail=error)
             

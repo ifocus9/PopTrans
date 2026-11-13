@@ -18,7 +18,9 @@ type Client struct {
 
 func NewClient(endpoint Endpoint) *Client {
 	return &Client{
-		httpClient: &http.Client{Timeout: 3 * time.Second},
+		// Overlay updates carry a compressed screenshot, so allow a little more
+		// than the tiny control-plane requests need.
+		httpClient: &http.Client{Timeout: 10 * time.Second},
 		endpoint:   endpoint,
 	}
 }
@@ -45,6 +47,19 @@ func (c *Client) ShowTranslate(ctx context.Context) error {
 
 func (c *Client) ShowResult(ctx context.Context, payload ResultPayload) error {
 	return c.do(ctx, http.MethodPost, EndpointShowResult, payload, nil)
+}
+
+func (c *Client) ShowOverlay(ctx context.Context, payload OverlayPayload) error {
+	return c.do(ctx, http.MethodPost, EndpointShowOverlay, payload, nil)
+}
+
+func (c *Client) ShowLive(ctx context.Context, payload LivePayload) error {
+	return c.do(ctx, http.MethodPost, EndpointShowLive, payload, nil)
+}
+
+// SetCaptureGuard briefly excludes or re-allows the overlay in screen capture.
+func (c *Client) SetCaptureGuard(ctx context.Context, exclude bool) error {
+	return c.do(ctx, http.MethodPost, EndpointCaptureGuard, CaptureGuardPayload{Exclude: exclude}, nil)
 }
 
 func (c *Client) Hide(ctx context.Context) error {

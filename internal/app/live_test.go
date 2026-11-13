@@ -1,0 +1,224 @@
+package app
+
+import (
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"translate-plugin/internal/backend"
+	"translate-plugin/internal/config"
+	win "translate-plugin/internal/platform/windows"
+)
+
+func TestTranslateLiveFrameUsesSplitBlocksEndpoint(t *testing.T) {
+	var received struct {
+		Lines       []backend.OCRLine `json:"lines"`
+		SourceText  string            `json:"source_text"`
+		ImageWidth  int               `json:"image_width"`
+		ImageHeight int               `json:"image_height"`
+		Force       bool              `json:"force"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/translate_blocks" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(backend.OCRTranslateBlocksResult{
+			SourceText:  "Hello\nWorld",
+			Translation: "你好\n世界",
+			Blocks: []backend.OCRBlock{
+				{Text: "Hello", Translation: "你好", X: 1, Y: 2, W: 30, H: 12},
+				{Text: "World", Translation: "世界", X: 1, Y: 20, W: 30, H: 12},
+			},
+			ImageWidth:  640,
+			ImageHeight: 480,
+		})
+	}))
+	defer server.Close()
+
+	app := &App{client: backend.NewClient(server.URL), cfg: config.Config{}}
+	ocr := backend.OCRBlocksResult{
+		Text:       "Hello\nWorld",
+		LineBoxes:  []backend.OCRLine{{Text: "Hello", X: 1, Y: 2, W: 30, H: 12}, {Text: "World", X: 1, Y: 20, W: 30, H: 12}},
+		ImageWidth: 640, ImageHeight: 480,
+	}
+
+	result, err := app.translateOCRResult(t.Context(), ocr, true)
+	if err != nil {
+		t.Fatalf("translateOCRResult: %v", err)
+	}
+	if len(result.Blocks) != 2 || result.Translation != "你好\n世界" {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	if len(received.Lines) != 2 || received.SourceText != "Hello\nWorld" {
+		t.Fatalf("unexpected request: %+v", received)
+	}
+	if received.ImageWidth != 640 || received.ImageHeight != 480 {
+		t.Fatalf("image size not forwarded: %+v", received)
+	}
+	if !received.Force {
+		t.Fatal("force refresh flag was not forwarded")
+	}
+}
+
+func TestTranslateLiveFrameFallsBackToWholeText(t *testing.T) {
+	chatCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/translate_blocks":
+			http.NotFound(w, r)
+		case "/v1/chat/completions":
+			chatCalls++
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{
+					"message": map[string]string{"content": "整段译文"},
+				}},
+			})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	app := &App{client: backend.NewClient(server.URL), cfg: config.Config{}}
+	result, err := app.translateOCRResult(t.Context(), backend.OCRBlocksResult{
+		Text:      "Hello\nWorld",
+		LineBoxes: []backend.OCRLine{{Text: "Hello"}},
+	}, false)
+	if err != nil {
+		t.Fatalf("translateOCRResult fallback: %v", err)
+	}
+	if chatCalls != 1 || result.Translation != "整段译文" || result.SourceText != "Hello\nWorld" {
+		t.Fatalf("unexpected fallback result: %+v chats=%d", result, chatCalls)
+	}
+}
+
+func TestTranslateLiveFrameBlankRegionIsQuiet(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		http.Error(w, "should not be called", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	app := &App{client: backend.NewClient(server.URL), cfg: config.Config{}}
+	result, err := app.translateOCRResult(t.Context(), backend.OCRBlocksResult{}, false)
+	if err != nil {
+		t.Fatalf("blank region returned error: %v", err)
+	}
+	if result.SourceText != "" || result.Translation != "" || len(result.Blocks) != 0 {
+		t.Fatalf("blank region returned content: %+v", result)
+	}
+	if calls != 0 {
+		t.Fatalf("blank region hit the backend %d times", calls)
+	}
+}
+
+func TestLiveCaptureRectRemovesToolbarAndGutter(t *testing.T) {
+	window := win.Rect{Left: 500, Top: 360, Right: 700, Bottom: 500}
+	capture, ok := liveCaptureRect(window, "top", 0, 40)
+	if !ok {
+		t.Fatal("top capture rejected")
+	}
+	if capture != (win.Rect{Left: 500, Top: 400, Right: 700, Bottom: 500}) {
+		t.Fatalf("top capture = %+v", capture)
+	}
+
+	// A 50px image inside a 56px toolbar window: the 6px gutter is split
+	// evenly, and the captured image keeps its 50px width.
+	narrow := win.Rect{Left: 500, Top: 360, Right: 556, Bottom: 460}
+	capture, ok = liveCaptureRect(narrow, "top", 6, 40)
+	if !ok {
+		t.Fatal("narrow capture rejected")
+	}
+	if capture != (win.Rect{Left: 503, Top: 400, Right: 553, Bottom: 460}) {
+		t.Fatalf("narrow capture = %+v", capture)
+	}
+
+	capture, ok = liveCaptureRect(window, "bottom", 0, 40)
+	if !ok || capture != (win.Rect{Left: 500, Top: 360, Right: 700, Bottom: 460}) {
+		t.Fatalf("bottom capture = %+v ok=%v", capture, ok)
+	}
+}
+
+func TestLivePayloadReportsProgress(t *testing.T) {
+	app := &App{cfg: config.Config{}}
+	anchor := win.Rect{Left: 10, Top: 20, Right: 310, Bottom: 220}
+	window := win.Rect{Left: 8, Top: 0, Right: 312, Bottom: 260}
+	result := backend.OCRTranslateBlocksResult{
+		SourceText:  "Hello",
+		Translation: "你好",
+		Blocks:      []backend.OCRBlock{{Text: "Hello", Translation: "你好", W: 80, H: 20}},
+	}
+
+	payload := app.livePayloadFrom(anchor, window, "top", nil, result, nil)
+	if payload.Stage != "done" || payload.Progress != 100 || payload.Lines != 1 {
+		t.Fatalf("success payload progress = %+v", payload)
+	}
+
+	failed := app.livePayloadFrom(anchor, window, "top", nil, backend.OCRTranslateBlocksResult{}, errors.New("boom"))
+	if failed.Stage != "error" || failed.Progress != 0 {
+		t.Fatalf("error payload progress = %+v", failed)
+	}
+}
+
+func TestTranslateOCRProgressiveBatches(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Lines []backend.OCRLine `json:"lines"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		calls++
+		blocks := make([]backend.OCRBlock, 0, len(request.Lines))
+		for _, line := range request.Lines {
+			blocks = append(blocks, backend.OCRBlock{
+				Text:        line.Text,
+				Translation: "t" + line.Text,
+				X:           line.X,
+				Y:           line.Y,
+				W:           line.W,
+				H:           line.H,
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(backend.OCRTranslateBlocksResult{
+			Blocks:      blocks,
+			ImageWidth:  800,
+			ImageHeight: 400,
+		})
+	}))
+	defer server.Close()
+
+	ocr := backend.OCRBlocksResult{Text: "line", ImageWidth: 800, ImageHeight: 400}
+	for index := 0; index < 10; index++ {
+		ocr.LineBoxes = append(ocr.LineBoxes, backend.OCRLine{
+			Text: "line", X: float64(index), Y: 0, W: 10, H: 10,
+		})
+	}
+	app := &App{client: backend.NewClient(server.URL), cfg: config.Config{}}
+	var progress []int
+	result, err := app.translateOCRProgressive(t.Context(), ocr, false, func(_ backend.OCRTranslateBlocksResult, done, total int) {
+		progress = append(progress, done)
+	})
+	if err != nil {
+		t.Fatalf("progressive translate: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("calls = %d, want 3", calls)
+	}
+	if len(progress) != 3 || progress[0] != 4 || progress[1] != 8 || progress[2] != 10 {
+		t.Fatalf("progress = %v", progress)
+	}
+	if len(result.Blocks) != 10 || result.Translation == "" {
+		t.Fatalf("result = %+v", result)
+	}
+}
