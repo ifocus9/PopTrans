@@ -371,6 +371,12 @@ function bindStateEvents() {
       previous.rect?.width !== payload.rect?.width ||
       previous.rect?.height !== payload.rect?.height
     state.overlay = payload
+    if (payload.loading) {
+      // Every screenshot starts in translation-only mode, even when the new
+      // selection has exactly the same rectangle as the previous one.
+      state.overlayOriginal = false
+      state.overlayBlockOriginal = new Set()
+    }
     if (rectChanged) {
       state.overlayOriginal = false
       state.overlayBlockOriginal = new Set()
@@ -395,6 +401,15 @@ function bindStateEvents() {
       previous.window_rect?.width !== payload.window_rect?.width ||
       previous.window_rect?.height !== payload.window_rect?.height
     state.live = payload
+    const startingSession =
+      payload.status === "translating" &&
+      (!previous ||
+        (previous.status !== "translating" &&
+          !(previous.blocks && previous.blocks.length)))
+    if (startingSession) {
+      state.liveOriginal = false
+      state.liveBlockOriginal = new Set()
+    }
     if (rectChanged) {
       state.livePinned = true
       state.liveOriginal = false
@@ -859,8 +874,8 @@ function fitOverlayBlockText({
 }) {
   const geometry = geometries[index]
   const boxWidth = (geometry.width / 100) * imageAreaW
-  let boxHeight = (geometry.height / 100) * imageAreaH
-  let fontPx = fitOverlayFontSize(
+  const boxHeight = (geometry.height / 100) * imageAreaH
+  const fontPx = fitOverlayFontSize(
     text,
     boxWidth,
     boxHeight,
@@ -868,70 +883,9 @@ function fitOverlayBlockText({
     fontFamily,
     fontWeight,
   )
-  // Extremely long translations may not fit even at the minimum size. Grow the
-  // chip downward into free space (never over another chip) so no text is lost.
-  if (Math.abs(geometry.angle) <= 3 && fontPx <= 6.6) {
-    const font = `${fontWeight} ${fontPx}px ${fontFamily}`
-    const lines = wrapOverlayText(text, Math.max(8, boxWidth - 8), font)
-    const neededHeight = lines.length * fontPx * 1.16 + 2
-    if (neededHeight > boxHeight + 0.5) {
-      let limitTop = 100
-      for (let otherIndex = 0; otherIndex < geometries.length; otherIndex++) {
-        if (otherIndex === index) continue
-        const other = geometries[otherIndex]
-        if (other.top <= geometry.top + 0.05) continue
-        const horizontalOverlap =
-          Math.min(
-            geometry.left + geometry.width,
-            other.left + other.width,
-          ) - Math.max(geometry.left, other.left)
-        if (horizontalOverlap <= 0) continue
-        limitTop = Math.min(limitTop, other.top - (2 / imageAreaH) * 100)
-      }
-      const maxHeight = Math.max(
-        boxHeight,
-        ((limitTop - geometry.top) / 100) * imageAreaH,
-      )
-      // Use the free space to pick a larger readable size, then size the chip
-      // to exactly the height that size needs (never past the next chip).
-      const expandedFont = fitOverlayFontSize(
-        text,
-        boxWidth,
-        maxHeight,
-        geometry.fontPx,
-        fontFamily,
-        fontWeight,
-      )
-      if (expandedFont > fontPx) {
-        const expandedFontSpec = `${fontWeight} ${expandedFont}px ${fontFamily}`
-        const expandedLines = wrapOverlayText(
-          text,
-          Math.max(8, boxWidth - 8),
-          expandedFontSpec,
-        )
-        boxHeight = Math.min(
-          maxHeight,
-          Math.max(
-            boxHeight,
-            expandedLines.length * expandedFont * 1.16 + 2,
-          ),
-        )
-        fontPx = fitOverlayFontSize(
-          text,
-          boxWidth,
-          boxHeight,
-          geometry.fontPx,
-          fontFamily,
-          fontWeight,
-        )
-      }
-    }
-  }
-  return {
-    ...geometry,
-    fontPx,
-    height: (boxHeight / imageAreaH) * 100,
-  }
+  // Keep the OCR line box exactly where the original text is. Long translations
+  // only shrink the font; the chip never grows outside the selected image area.
+  return { ...geometry, fontPx }
 }
 
 function overlayBlockGeometry(block, imageW, imageH, areaHeight) {
@@ -1006,6 +960,13 @@ function unicodeMathToLatex(text) {
   return result
 }
 
+function isUnchangedMathLine(source, translated) {
+  const src = String(source || "").trim()
+  const dst = String(translated || "").trim()
+  if (!src || dst !== src) return false
+  return /[0-9=^_\\+\-*/<>∫∑√±≈≠≤≥∞∂∇·×÷]/.test(src)
+}
+
 // Convert one translated OCR line to Markdown, wrapping formula-like spans in
 // inline math so a Markdown renderer displays the equations.
 function markdownMathLine(line) {
@@ -1031,6 +992,11 @@ function markdownMathLine(line) {
 
 function markdownFromBlocks(blocks, fallback) {
   const lines = (blocks || [])
+    .filter((block) => {
+      const source = String(block.text || "").trim()
+      const translated = String(block.translation || "").trim()
+      return translated && !isUnchangedMathLine(source, translated)
+    })
     .map((block) => String(block.translation || "").trim())
     .filter(Boolean)
   if (!lines.length) return String(fallback || "").trim()
@@ -1079,6 +1045,9 @@ function renderOverlay() {
       if (!showSource && !translated) return ""
       const text = showSource ? source : translated
       if (!text) return ""
+      // Formula lines that the translator left untouched are better left as the
+      // original screen content than covered by garbled OCR text.
+      if (!showSource && isUnchangedMathLine(source, translated)) return ""
       const { left, top, width, height, fontPx, angle } =
         fitOverlayBlockText({
           text,
@@ -1663,6 +1632,9 @@ function renderLive() {
       if (!showSource && !translated) return ""
       const text = showSource ? source : translated
       if (!text) return ""
+      // Formula lines that the translator left untouched are better left as the
+      // original screen content than covered by garbled OCR text.
+      if (!showSource && isUnchangedMathLine(source, translated)) return ""
       const { left, top, width, height, fontPx, angle } =
         fitOverlayBlockText({
           text,
@@ -2188,6 +2160,7 @@ function renderTranslateViewHTML() {
             <span>译文</span>
           </div>
           <div class="card-actions">
+            <span class="translation-latency" id="manualLatency"></span>
             <span id="manualCopyStatus" class="result-copy-status" aria-live="polite"></span>
             <button
               class="icon-button result-copy-button"
@@ -2234,11 +2207,7 @@ function renderResultBoxContent() {
   }
 
   if (translatedText && translatedText.trim()) {
-    const latency =
-      Number(latencyMs) > 0
-        ? `<div class="translation-latency">耗时 ${(Number(latencyMs) / 1000).toFixed(1)}s</div>`
-        : ""
-    return `<div class="result-text translated-text manual-translated-text" tabindex="0">${escapeHtml(translatedText.trim())}</div>${latency}`
+    return `<div class="result-text translated-text manual-translated-text" tabindex="0">${escapeHtml(translatedText.trim())}</div>`
   }
 
   return `
@@ -2518,6 +2487,12 @@ function updateManualResultBox() {
     document
       .querySelector("#manualRetryBtn")
       ?.addEventListener("click", handleManualTranslate)
+  }
+
+  const latency = document.querySelector("#manualLatency")
+  if (latency) {
+    const value = Number(state.manualTranslate.latencyMs) || 0
+    latency.textContent = value > 0 ? `耗时 ${(value / 1000).toFixed(1)}s` : ""
   }
 
   const copyBtn = document.querySelector("#manualCopyBtn")

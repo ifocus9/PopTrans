@@ -14,7 +14,9 @@ import (
 
 const (
 	blurBackgroundPad    = 5
-	blurBackgroundRadius = 7
+	// A strong blur removes the source glyph shapes from the chip background, so
+	// only the translated text is readable over the original line.
+	blurBackgroundRadius = 14
 )
 
 // attachBlurredBackgrounds crops the captured screen behind every translated

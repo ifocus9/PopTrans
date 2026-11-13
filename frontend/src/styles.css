@@ -1344,6 +1344,12 @@ p {
   height: 13px;
 }
 
+.translation-latency {
+  color: var(--muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
 .result-copy-status {
   max-width: 70px;
   overflow: hidden;
@@ -2858,11 +2864,21 @@ html[data-theme="light"] .text-input {
 
 .shot-frame-border {
   position: absolute;
-  inset: 0;
+  /* Outline only the selected image area; the toolbar lives outside it and must
+     not make the selection look larger than the user's drag rectangle. */
+  left: 2px;
+  right: 2px;
+  top: 46px;
+  bottom: 2px;
   z-index: 26;
   border: 2px solid var(--accent);
   border-radius: 6px;
   pointer-events: none;
+}
+
+.bar-bottom .shot-frame-border {
+  top: 2px;
+  bottom: 46px;
 }
 
 .live-window .shot-frame-border {
