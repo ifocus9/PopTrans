@@ -134,75 +134,65 @@ type ResultView struct {
 	LatencyMs int64  `json:"latency_ms"`
 }
 
-func NewApp(baseDir string, args []string) *App {
+// LaunchOptions are the launch settings for the UI process. The host passes
+// them through the environment so paths and the callback token never appear on
+// the process command line.
+type LaunchOptions struct {
+	Daemon        bool
+	Overlay       bool
+	EndpointDir   string
+	CallbackURL   string
+	CallbackToken string
+}
+
+// LaunchOptionsFromEnv reads and validates the UI process environment. Only an
+// absolute endpoint directory and a loopback callback URL are accepted.
+func LaunchOptionsFromEnv() LaunchOptions {
+	var opts LaunchOptions
+	opts.Daemon = os.Getenv("POPTRANS_UI_DAEMON") == "1"
+	opts.Overlay = os.Getenv("POPTRANS_UI_OVERLAY") == "1"
+	if dir := strings.TrimSpace(os.Getenv("POPTRANS_UI_ENDPOINT_DIR")); dir != "" {
+		if cleaned := filepath.Clean(dir); filepath.IsAbs(cleaned) {
+			opts.EndpointDir = cleaned
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("POPTRANS_UI_CALLBACK_URL")); isLoopbackHTTPURL(raw) {
+		opts.CallbackURL = raw
+	}
+	if token := strings.TrimSpace(os.Getenv("POPTRANS_UI_CALLBACK_TOKEN")); token != "" && len(token) <= 256 {
+		opts.CallbackToken = token
+	}
+	return opts
+}
+
+func NewApp(baseDir string, launch LaunchOptions) *App {
 	cfg, err := config.Load(baseDir)
 	if err != nil {
 		cfg = config.Default
 	}
 	client := backend.NewClient(config.BackendURL(cfg.ServerPort))
+	mode := "settings"
+	if launch.Overlay {
+		mode = "overlay"
+	}
 	app := &App{
 		baseDir:       baseDir,
 		client:        client,
 		supervisor:    backend.NewSupervisor(baseDir, client),
-		endpointDir:   baseDir,
+		endpointDir:   launch.EndpointDir,
 		windowTitle:   "选中翻译",
-		mode:          "settings",
-		visible:       false,
+		mode:          mode,
+		daemonMode:    launch.Daemon,
+		overlayMode:   launch.Overlay,
+		callbackURL:   launch.CallbackURL,
+		callbackToken: launch.CallbackToken,
 		idleTimeout:   cfg.UIIdleTimeout(),
 		startupStatus: "正在启动本地服务...",
 		overlayPinned: true,
 	}
-
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--daemon":
-			app.daemonMode = true
-		case "--overlay":
-			app.overlayMode = true
-			app.mode = "overlay"
-		case "--endpoint-dir":
-			if i+1 < len(args) {
-				// The host only publishes the endpoint inside its own directory;
-				// ignore anything that is not an absolute path.
-				if dir := filepath.Clean(args[i+1]); filepath.IsAbs(dir) {
-					app.endpointDir = dir
-				}
-				i++
-			}
-		case "--callback-url":
-			if i+1 < len(args) {
-				// Callback events are posted to the host's loopback server; never
-				// accept a remote URL from the command line.
-				if isLoopbackHTTPURL(args[i+1]) {
-					app.callbackURL = args[i+1]
-				}
-				i++
-			}
-		case "--callback-token":
-			if i+1 < len(args) {
-				app.callbackToken = args[i+1]
-				i++
-			}
-		case "--settings":
-			// Backward-compatible launch mode: open settings once.
-			app.mode = "settings"
-			app.visible = true
-			app.settingsOpen = true
-		case "--translate":
-			app.mode = "translate"
-			app.visible = true
-			app.settingsOpen = true
-		case "--result":
-			// Legacy one-shot result mode is no longer used by the host.
-			// Keep parsing so old shortcuts do not crash.
-			app.mode = "result"
-			app.visible = true
-			if i+1 < len(args) {
-				i++
-			}
-		}
+	if app.mode == "" {
+		app.mode = "settings"
 	}
-
 	if app.overlayMode {
 		app.windowTitle = "选中翻译浮层"
 	}

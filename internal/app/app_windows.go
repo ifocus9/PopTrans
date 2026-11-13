@@ -162,7 +162,7 @@ func New() (*App, error) {
 	}
 	app.overlayUI = uidaemon.NewManager(baseDir, app.resolveWailsExe, app.handleUIDaemonEvent)
 	app.overlayUI.SetEndpointDir(overlayDir)
-	app.overlayUI.SetExtraArgs([]string{"--overlay", "--endpoint-dir", overlayDir})
+	app.overlayUI.SetOverlayMode(true)
 	return app, nil
 }
 

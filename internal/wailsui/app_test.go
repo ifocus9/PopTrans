@@ -12,7 +12,7 @@ import (
 )
 
 func TestDaemonShowResultUpdatesState(t *testing.T) {
-	app := NewApp(t.TempDir(), []string{"translate-ui.exe", "--daemon"})
+	app := NewApp(t.TempDir(), LaunchOptions{Daemon: true})
 	app.ready = true
 	if err := app.ShowResult(uidaemon.ResultPayload{
 		Source:  "hello",
@@ -49,7 +49,7 @@ func TestDaemonShowResultUpdatesState(t *testing.T) {
 }
 
 func TestSaveConfigRejectsInvalidServerPort(t *testing.T) {
-	app := NewApp(t.TempDir(), []string{"translate-ui.exe", "--daemon"})
+	app := NewApp(t.TempDir(), LaunchOptions{Daemon: true})
 	cfg := config.Default
 	cfg.ServerPort = 80
 
@@ -60,7 +60,7 @@ func TestSaveConfigRejectsInvalidServerPort(t *testing.T) {
 }
 
 func TestDaemonStatusDefaults(t *testing.T) {
-	app := NewApp(t.TempDir(), []string{"translate-ui.exe", "--daemon"})
+	app := NewApp(t.TempDir(), LaunchOptions{Daemon: true})
 	status := app.Status()
 	if status.Mode != "settings" {
 		t.Fatalf("expected settings mode, got %q", status.Mode)
@@ -77,7 +77,7 @@ func TestIdleTimeoutDisabledWhenZero(t *testing.T) {
 	if err := config.Save(dir, cfg); err != nil {
 		t.Fatal(err)
 	}
-	app := NewApp(dir, []string{"translate-ui.exe", "--daemon"})
+	app := NewApp(dir, LaunchOptions{Daemon: true})
 	if app.idleTimeout != 0 {
 		t.Fatalf("idleTimeout = %s, want 0", app.idleTimeout)
 	}
@@ -97,19 +97,19 @@ func TestIdleTimeoutUsesConfig(t *testing.T) {
 	if err := config.Save(dir, cfg); err != nil {
 		t.Fatal(err)
 	}
-	app := NewApp(dir, []string{"translate-ui.exe", "--daemon"})
+	app := NewApp(dir, LaunchOptions{Daemon: true})
 	if app.idleTimeout != time.Minute {
 		t.Fatalf("idleTimeout = %s, want 1m", app.idleTimeout)
 	}
 }
 
-func TestTranslateModeFlag(t *testing.T) {
-	app := NewApp(t.TempDir(), []string{"translate-ui.exe", "--translate"})
-	if app.mode != "translate" {
-		t.Fatalf("expected translate mode, got %q", app.mode)
+func TestOverlayModeLaunchOption(t *testing.T) {
+	app := NewApp(t.TempDir(), LaunchOptions{Overlay: true})
+	if app.mode != "overlay" {
+		t.Fatalf("expected overlay mode, got %q", app.mode)
 	}
-	if !app.visible || !app.settingsOpen {
-		t.Fatal("expected visible and settingsOpen to be true")
+	if app.windowTitle != "选中翻译浮层" {
+		t.Fatalf("unexpected overlay title %q", app.windowTitle)
 	}
 }
 
@@ -164,5 +164,32 @@ func TestLoopbackCallbackURLCheck(t *testing.T) {
 		if isLoopbackHTTPURL(raw) {
 			t.Fatalf("expected %q to be rejected", raw)
 		}
+	}
+}
+
+func TestLaunchOptionsFromEnvValidatesValues(t *testing.T) {
+	t.Setenv("POPTRANS_UI_DAEMON", "1")
+	t.Setenv("POPTRANS_UI_OVERLAY", "1")
+	t.Setenv("POPTRANS_UI_ENDPOINT_DIR", "relative-dir")
+	t.Setenv("POPTRANS_UI_CALLBACK_URL", "http://example.com/callback")
+	t.Setenv("POPTRANS_UI_CALLBACK_TOKEN", "token")
+
+	opts := LaunchOptionsFromEnv()
+	if !opts.Daemon || !opts.Overlay {
+		t.Fatalf("daemon/overlay flags were lost: %+v", opts)
+	}
+	if opts.EndpointDir != "" || opts.CallbackURL != "" {
+		t.Fatalf("unsafe values were accepted: %+v", opts)
+	}
+}
+
+func TestLaunchOptionsFromEnvAcceptsSafeValues(t *testing.T) {
+	t.Setenv("POPTRANS_UI_ENDPOINT_DIR", `C:\temp\endpoints`)
+	t.Setenv("POPTRANS_UI_CALLBACK_URL", "http://127.0.0.1:32145")
+	t.Setenv("POPTRANS_UI_CALLBACK_TOKEN", "token")
+
+	opts := LaunchOptionsFromEnv()
+	if opts.EndpointDir == "" || opts.CallbackURL == "" || opts.CallbackToken != "token" {
+		t.Fatalf("safe values were rejected: %+v", opts)
 	}
 }

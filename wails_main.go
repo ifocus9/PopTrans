@@ -3,7 +3,6 @@ package main
 import (
 	"embed"
 	"log"
-	"os"
 	"path/filepath"
 
 	"github.com/wailsapp/wails/v2"
@@ -26,8 +25,9 @@ func main() {
 	baseDir := config.ResolveBaseDir()
 	configureWailsLogging(baseDir)
 
-	daemonMode := hasArg(os.Args, "--daemon")
-	overlayMode := hasArg(os.Args, "--overlay")
+	launch := wailsui.LaunchOptionsFromEnv()
+	daemonMode := launch.Daemon
+	overlayMode := launch.Overlay
 	windowTitle := "选中翻译"
 	if overlayMode {
 		windowTitle = "选中翻译浮层"
@@ -66,7 +66,7 @@ func main() {
 			BackdropType:         wailswindows.None,
 		}
 	}
-	app := wailsui.NewApp(baseDir, os.Args)
+	app := wailsui.NewApp(baseDir, launch)
 
 	err = wails.Run(&options.App{
 		Title:         windowTitle,
@@ -93,15 +93,6 @@ func main() {
 	if daemonMode {
 		log.Printf("translate-ui daemon exited")
 	}
-}
-
-func hasArg(args []string, name string) bool {
-	for _, arg := range args {
-		if arg == name {
-			return true
-		}
-	}
-	return false
 }
 
 func configureWailsLogging(baseDir string) {

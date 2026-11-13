@@ -44,7 +44,7 @@ type HostCallback func(event int)
 type Manager struct {
 	baseDir     string
 	endpointDir string
-	extraArgs   []string
+	overlayMode bool
 	resolveUI   func() string
 	onEvent     HostCallback
 
@@ -76,9 +76,9 @@ func (m *Manager) SetEndpointDir(dir string) {
 	}
 }
 
-// SetExtraArgs appends launch arguments for the UI process (e.g. --overlay).
-func (m *Manager) SetExtraArgs(args []string) {
-	m.extraArgs = args
+// SetOverlayMode launches the UI as the screenshot/live overlay process.
+func (m *Manager) SetOverlayMode(enabled bool) {
+	m.overlayMode = enabled
 }
 
 func (m *Manager) EnsureReady(ctx context.Context) error {
@@ -301,20 +301,19 @@ func (m *Manager) startProcess(ctx context.Context) error {
 	}
 
 	RemoveEndpoint(m.endpointDir)
-	// Arguments are passed as a fixed argv list (never through a shell); the
-	// executable itself was validated against the bundled UI binary name.
-	args := []string{
-		exePath,
-		"--daemon",
-		"--callback-url", callbackURL,
-		"--callback-token", callbackTok,
-	}
-	args = append(args, m.extraArgs...)
-	cmd := &exec.Cmd{Path: exePath, Args: args}
+	// Launch settings travel through the environment: command-line arguments are
+	// visible to other processes, and the callback token must not be.
+	cmd := &exec.Cmd{Path: exePath, Args: []string{exePath}}
 	cmd.Dir = filepath.Dir(exePath)
-	// The extracted UI lives in <baseDir>/runtime; it must still read settings
-	// and models from the real application directory.
-	cmd.Env = environmentWith(os.Environ(), "POPTRANS_BASE_DIR", m.baseDir)
+	env := environmentWith(os.Environ(), "POPTRANS_BASE_DIR", m.baseDir)
+	env = environmentWith(env, "POPTRANS_UI_DAEMON", "1")
+	if m.overlayMode {
+		env = environmentWith(env, "POPTRANS_UI_OVERLAY", "1")
+	}
+	env = environmentWith(env, "POPTRANS_UI_ENDPOINT_DIR", m.endpointDir)
+	env = environmentWith(env, "POPTRANS_UI_CALLBACK_URL", callbackURL)
+	env = environmentWith(env, "POPTRANS_UI_CALLBACK_TOKEN", callbackTok)
+	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,
 		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
