@@ -97,8 +97,9 @@ jobs:
           name: unsigned-binaries
           path: binaries-to-sign/*
 
-      # 4. 提交 SignPath 代码签名
+      # 4. 提交 SignPath 代码签名（未配置签名密钥时跳过，仍发布未签名包）
       - name: Submit signing request to SignPath
+        continue-on-error: true
         uses: signpath/github-action-submit-signing-request@v3
         with:
           api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
@@ -115,13 +116,21 @@ jobs:
       - name: Package Final Signed Release
         shell: pwsh
         run: |
-          Write-Host "Replacing signed executables in dist-go..."
-          $zipFile = Get-ChildItem -Path signed-binaries -Filter "*.zip" -Recurse | Select-Object -First 1
-          if ($zipFile) {
-            Expand-Archive -Path $zipFile.FullName -DestinationPath signed-extracted -Force
-            Copy-Item -Path signed-extracted\*.exe -Destination dist-go\ -Force
+          Write-Host "Replacing signed executables in dist-go (if available)..."
+          $signedDir = $null
+          if (Test-Path "signed-binaries") {
+            $zipFile = Get-ChildItem -Path signed-binaries -Filter "*.zip" -Recurse | Select-Object -First 1
+            if ($zipFile) {
+              Expand-Archive -Path $zipFile.FullName -DestinationPath signed-extracted -Force
+              $signedDir = "signed-extracted"
+            } else {
+              $signedDir = "signed-binaries"
+            }
+          }
+          if ($signedDir) {
+            Copy-Item -Path "$signedDir\*.exe" -Destination dist-go\ -Force
           } else {
-            Copy-Item -Path signed-binaries\*.exe -Destination dist-go\ -Force
+            Write-Host "No signed binaries available (SignPath not configured); packaging the unsigned build."
           }
 
           # 验证签名状态
