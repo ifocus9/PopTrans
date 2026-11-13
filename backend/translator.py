@@ -400,6 +400,12 @@ LANG_ALIASES = {
 }
 
 
+# The shipped OCR engines cover Chinese, English, Japanese and Korean. Keep the
+# settings and API surface inside that capability instead of advertising
+# translation-only languages the OCR cannot read.
+SUPPORTED_LANGUAGE_CODES = ("zh", "en", "ja", "ko")
+
+
 def normalize_target_language(target_lang: Optional[str]) -> Optional[str]:
     """Return a supported ISO language code, or None for automatic mode."""
     if target_lang is None:
@@ -412,18 +418,21 @@ def normalize_target_language(target_lang: Optional[str]) -> Optional[str]:
     normalized = value.lower().replace("_", "-")
     if normalized in ("auto", "none", "null"):
         return None
+
+    candidate = None
     if normalized in LANG_NAMES:
-        return normalized
+        candidate = normalized
+    else:
+        language_code = normalized.split("-", 1)[0]
+        if language_code in LANG_NAMES:
+            candidate = language_code
+        else:
+            candidate = LANG_ALIASES.get(normalized) or LANG_ALIASES.get(value)
 
-    language_code = normalized.split("-", 1)[0]
-    if language_code in LANG_NAMES:
-        return language_code
+    if candidate in SUPPORTED_LANGUAGE_CODES:
+        return candidate
 
-    alias = LANG_ALIASES.get(normalized) or LANG_ALIASES.get(value)
-    if alias:
-        return alias
-
-    supported = ", ".join(sorted(LANG_NAMES))
+    supported = ", ".join(SUPPORTED_LANGUAGE_CODES)
     raise ValueError(
         f"不支持的目标语言: {value}，支持的语言代码: {supported}"
     )
@@ -1345,8 +1354,13 @@ class Translator:
                 tgt_lang = LANG_NAMES[target_code]
                 direction = f"{LANG_NAMES[normalized_source]}→{tgt_lang}"
             else:
-                # 保留现有前端依赖的中英自动互译行为。
-                if self._is_chinese(text):
+                # 保留现有前端依赖的中英自动互译行为；日语假名/韩语谚文
+                # 必须优先判为非中文，否则汉字较多的日语句子会被当中文译成英文。
+                if self._contains_kana(text) or self._contains_hangul(text):
+                    tgt_lang = LANG_NAMES["zh"]
+                    direction = "日/韩→中"
+                    target_code = "zh"
+                elif self._is_chinese(text):
                     tgt_lang = LANG_NAMES["en"]
                     direction = "中→英"
                     target_code = "en"
@@ -1419,7 +1433,12 @@ class Translator:
                 "en" if normalized_source in ("zh", "zh-hant", "yue") else "zh"
             )
         else:
-            target_code = "en" if self._is_chinese(joined) else "zh"
+            target_code = (
+                "en"
+                if self._is_chinese(joined)
+                and not (self._contains_kana(joined) or self._contains_hangul(joined))
+                else "zh"
+            )
 
         glossary = _read_glossary()
         results = ["" for _ in cleaned]
@@ -1617,6 +1636,20 @@ class Translator:
         except Exception as e:
             logger.exception(f"流式翻译失败: {text[:30]}...")
             yield f"\n[翻译出错: {e}]"
+
+    @staticmethod
+    def _contains_kana(text: str) -> bool:
+        return any(
+            "\u3040" <= char <= "\u30ff" or "\u31f0" <= char <= "\u31ff"
+            for char in str(text or "")
+        )
+
+    @staticmethod
+    def _contains_hangul(text: str) -> bool:
+        return any(
+            "\uac00" <= char <= "\ud7af" or "\u1100" <= char <= "\u11ff"
+            for char in str(text or "")
+        )
 
     def _is_chinese(self, text: str) -> bool:
         """

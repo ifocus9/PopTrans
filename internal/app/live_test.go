@@ -120,6 +120,33 @@ func TestTranslateLiveFrameBlankRegionIsQuiet(t *testing.T) {
 	}
 }
 
+func TestLiveCaptureRectRemovesToolbarAndGutter(t *testing.T) {
+	window := win.Rect{Left: 500, Top: 360, Right: 700, Bottom: 500}
+	capture, ok := liveCaptureRect(window, "top", 0, 40)
+	if !ok {
+		t.Fatal("top capture rejected")
+	}
+	if capture != (win.Rect{Left: 500, Top: 400, Right: 700, Bottom: 500}) {
+		t.Fatalf("top capture = %+v", capture)
+	}
+
+	// A 50px image inside a 56px toolbar window: the 6px gutter is split
+	// evenly, and the captured image keeps its 50px width.
+	narrow := win.Rect{Left: 500, Top: 360, Right: 556, Bottom: 460}
+	capture, ok = liveCaptureRect(narrow, "top", 6, 40)
+	if !ok {
+		t.Fatal("narrow capture rejected")
+	}
+	if capture != (win.Rect{Left: 503, Top: 400, Right: 553, Bottom: 460}) {
+		t.Fatalf("narrow capture = %+v", capture)
+	}
+
+	capture, ok = liveCaptureRect(window, "bottom", 0, 40)
+	if !ok || capture != (win.Rect{Left: 500, Top: 360, Right: 700, Bottom: 460}) {
+		t.Fatalf("bottom capture = %+v ok=%v", capture, ok)
+	}
+}
+
 func TestLivePayloadReportsProgress(t *testing.T) {
 	app := &App{cfg: config.Config{}}
 	anchor := win.Rect{Left: 10, Top: 20, Right: 310, Bottom: 220}

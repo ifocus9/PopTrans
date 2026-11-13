@@ -149,12 +149,10 @@ var Default = Config{
 	OverlayFontWeight:    500,
 }
 
-// SupportedLanguages mirrors backend/translator.py's LANG_NAMES keys.
-var SupportedLanguages = []string{
-	"zh", "en", "zh-hant", "yue", "vi", "ja", "ko", "th", "it", "id", "ms", "tl",
-	"hi", "fr", "es", "de", "pt", "ru", "ar", "pl", "cs", "nl", "km", "my", "fa",
-	"gu", "ur", "te", "mr", "he", "bn", "ta", "uk", "bo", "kk", "mn", "ug",
-}
+// SupportedLanguages mirrors the OCR/translation capability shipped with the
+// app: Chinese, English, Japanese and Korean. Settings must not advertise
+// translation-only languages the OCR cannot read.
+var SupportedLanguages = []string{"zh", "en", "ja", "ko"}
 
 // NormalizeLanguage returns "auto" or a supported ISO code.
 func NormalizeLanguage(value string) string {

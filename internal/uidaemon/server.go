@@ -35,6 +35,7 @@ type Handler interface {
 	ShowResult(payload ResultPayload) error
 	ShowOverlay(payload OverlayPayload) error
 	ShowLive(payload LivePayload) error
+	SetCaptureGuard(exclude bool) error
 	Hide() error
 	Quit() error
 	OnHidden()
@@ -84,6 +85,7 @@ func (s *Server) Start() (Endpoint, error) {
 	mux.HandleFunc(EndpointShowResult, s.withAuth(s.handleShowResult))
 	mux.HandleFunc(EndpointShowOverlay, s.withAuth(s.handleShowOverlay))
 	mux.HandleFunc(EndpointShowLive, s.withAuth(s.handleShowLive))
+	mux.HandleFunc(EndpointCaptureGuard, s.withAuth(s.handleCaptureGuard))
 	mux.HandleFunc(EndpointHide, s.withAuth(s.handleHide))
 	mux.HandleFunc(EndpointShutdown, s.withAuth(s.handleShutdown))
 	mux.HandleFunc(EndpointNotifyHidden, s.withAuth(s.handleNotifyHidden))
@@ -229,6 +231,23 @@ func (s *Server) handleShowLive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.handler.ShowLive(payload); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func (s *Server) handleCaptureGuard(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var payload CaptureGuardPayload
+	if err := jsonDecode(r, &payload); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.handler.SetCaptureGuard(payload.Exclude); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

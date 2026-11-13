@@ -6,6 +6,7 @@ import {
   ArrowRightLeft,
   Check,
   CheckCheck,
+  CircleAlert,
   Clipboard,
   Cpu,
   Download,
@@ -14,6 +15,7 @@ import {
   ImagePlus,
   Keyboard,
   Languages,
+  Loader,
   Monitor,
   MonitorUp,
   Moon,
@@ -24,6 +26,7 @@ import {
   PinOff,
   Play,
   RotateCcw,
+  ScanText,
   Search,
   Sliders,
   Sparkles,
@@ -46,7 +49,6 @@ import {
   SaveConfig,
   SearchModels,
   SetHotkeyRecording,
-  SetOverlayMenu,
   SetOverlayPinned,
   SetOverlayRegion,
   SetOverlayWindowRect,
@@ -72,6 +74,7 @@ const icons = {
   ArrowRightLeft,
   Check,
   CheckCheck,
+  CircleAlert,
   Clipboard,
   Cpu,
   Download,
@@ -80,6 +83,7 @@ const icons = {
   ImagePlus,
   Keyboard,
   Languages,
+  Loader,
   Monitor,
   MonitorUp,
   Moon,
@@ -90,6 +94,7 @@ const icons = {
   PinOff,
   Play,
   RotateCcw,
+  ScanText,
   Search,
   Sliders,
   Sparkles,
@@ -102,41 +107,8 @@ const icons = {
 const LANGUAGE_OPTIONS = [
   ["zh", "中文"],
   ["en", "英语"],
-  ["zh-hant", "繁体中文"],
-  ["yue", "粤语"],
-  ["vi", "越南语"],
   ["ja", "日语"],
   ["ko", "韩语"],
-  ["th", "泰语"],
-  ["it", "意大利语"],
-  ["id", "印度尼西亚语"],
-  ["ms", "马来语"],
-  ["tl", "菲律宾语"],
-  ["hi", "印地语"],
-  ["fr", "法语"],
-  ["es", "西班牙语"],
-  ["de", "德语"],
-  ["pt", "葡萄牙语"],
-  ["ru", "俄语"],
-  ["ar", "阿拉伯语"],
-  ["pl", "波兰语"],
-  ["cs", "捷克语"],
-  ["nl", "荷兰语"],
-  ["km", "高棉语"],
-  ["my", "缅甸语"],
-  ["fa", "波斯语"],
-  ["gu", "古吉拉特语"],
-  ["ur", "乌尔都语"],
-  ["te", "泰卢固语"],
-  ["mr", "马拉地语"],
-  ["he", "希伯来语"],
-  ["bn", "孟加拉语"],
-  ["ta", "泰米尔语"],
-  ["uk", "乌克兰语"],
-  ["bo", "藏语"],
-  ["kk", "哈萨克语"],
-  ["mn", "蒙古语"],
-  ["ug", "维吾尔语"],
 ]
 
 function languageOptions(selected, autoLabel) {
@@ -265,6 +237,7 @@ function bindStateEvents() {
     const prevSignature = resultSignature
     const prevStartupLoading = Boolean(state.startup_loading)
     const prevStartupStatus = state.startup_status
+    const prevStartupError = state.startup_error
     const nextMode = next.mode || state.mode
 
     // When startup finishes or user manually opens settings/translate tab, clear dismissed status
@@ -326,7 +299,8 @@ function bindStateEvents() {
 
     if (
       prevStartupLoading !== state.startup_loading ||
-      prevStartupStatus !== state.startup_status
+      prevStartupStatus !== state.startup_status ||
+      prevStartupError !== state.startup_error
     ) {
       const showingStartupPage =
         state.startup_loading &&
@@ -336,7 +310,9 @@ function bindStateEvents() {
       // download progress: it would steal focus from settings inputs.
       if (!windowShown || showingStartupPage) {
         render({ forceShow: false })
+        return
       }
+      updateEngineIndicators()
       return
     }
 
@@ -349,16 +325,24 @@ function bindStateEvents() {
     }
 
     // Main window (translate/settings) can refresh engine badge without full rerender
-    const node = document.querySelector("#engineState")
-    const textNode = document.querySelector("#engineText")
-    if (!node || !textNode) {
+    if (!document.querySelector("#engineState")) {
       render({ forceShow: false })
       return
     }
-    const ready = Boolean(state.health?.translator_ready)
-    node.classList.toggle("is-ready", ready)
-    node.classList.toggle("is-loading", !ready)
-    textNode.textContent = ready ? "引擎就绪" : "正在启动"
+    updateEngineIndicators()
+  })
+
+  // The banner is re-rendered on engine status changes, so bind it at the
+  // document level: a click anywhere in the banner opens the model settings.
+  document.addEventListener("click", (event) => {
+    if (!event.target.closest?.("#engineBanner")) return
+    if (state.overlayOnly || state.mode === "overlay" || state.mode === "live") return
+    prepareGlossaryDraft()
+    state.glossaryPrepared = true
+    state.settingsTab = "models"
+    state.modelStatusesLoaded = false
+    state.active_tab = "settings"
+    render()
   })
 
   EventsOn("ui:overlay", (payload) => {
@@ -371,6 +355,7 @@ function bindStateEvents() {
       previous.rect?.width !== payload.rect?.width ||
       previous.rect?.height !== payload.rect?.height
     state.overlay = payload
+    if (payload.theme) applyTheme(payload.theme)
     if (payload.loading) {
       // Every screenshot starts in translation-only mode, even when the new
       // selection has exactly the same rectangle as the previous one.
@@ -401,6 +386,7 @@ function bindStateEvents() {
       previous.window_rect?.width !== payload.window_rect?.width ||
       previous.window_rect?.height !== payload.window_rect?.height
     state.live = payload
+    if (payload.theme) applyTheme(payload.theme)
     const startingSession =
       payload.status === "translating" &&
       (!previous ||
@@ -418,7 +404,7 @@ function bindStateEvents() {
     if (state.mode !== "live") {
       state.mode = "live"
       windowShown = false
-      render({ forceShow: true })
+      renderLive()
       return
     }
     renderLive()
@@ -450,10 +436,19 @@ async function loadState() {
   if (window.go?.wailsui?.App?.IsOverlayProcess) {
     try {
       if (await IsOverlayProcess()) {
-        // Dedicated overlay/live process: never build the workbench UI.
+        // Dedicated overlay/live process: never build the workbench UI, but keep
+        // the live/overlay event subscriptions from bindStateEvents().
         state.overlayOnly = true
         state.mode = "none"
-        render()
+        bindStateEvents()
+        try {
+          const theme = await window.go?.wailsui?.App?.OverlayTheme?.()
+          if (theme) applyTheme(theme)
+        } catch {
+          // Keep the cached theme.
+        }
+        startOverlayThemePoll()
+        app.innerHTML = ""
         return
       }
     } catch {
@@ -485,6 +480,21 @@ async function loadState() {
 
   applyTheme(state.config?.theme)
   render()
+}
+
+let overlayLayoutTimer = 0
+function scheduleOverlayLayout() {
+  clearTimeout(overlayLayoutTimer)
+  overlayLayoutTimer = setTimeout(() => {
+    if (state.mode === "overlay") renderOverlay()
+    else if (state.mode === "live") renderLive()
+  }, 40)
+}
+if (typeof window !== "undefined") {
+  window.addEventListener("resize", scheduleOverlayLayout)
+  if (typeof ResizeObserver !== "undefined") {
+    new ResizeObserver(scheduleOverlayLayout).observe(document.documentElement)
+  }
 }
 
 function previewState() {
@@ -694,15 +704,10 @@ function render(options = {}) {
     renderLive()
   } else if (state.mode === "result") {
     renderResult()
-  } else if (
-    state.startup_loading &&
-    state.mode === "settings" &&
-    !state.settings_open
-  ) {
-    // Cold-start loading page only before the host opens the workbench.
-    // Once the workbench is shown it stays usable while the model loads.
-    renderStartup()
   } else {
+    // The workbench is always available immediately. Engine/model startup is
+    // shown as a non-blocking banner so settings (including the model download
+    // source) remain reachable even when the default mirror is offline.
     renderMainWindow()
     createIcons({ icons, attrs: { "stroke-width": 1.8 } })
   }
@@ -888,6 +893,130 @@ function fitOverlayBlockText({
   return { ...geometry, fontPx }
 }
 
+function clampNumber(value, min, max, fallback) {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return fallback
+  return Math.min(max, Math.max(min, parsed))
+}
+
+function renderGlossaryText(text, hits, field) {
+  const value = String(text || "")
+  if (!value || !Array.isArray(hits) || !hits.length) {
+    return escapeHtml(value)
+  }
+
+  const matches = []
+  const lowerValue = value.toLowerCase()
+  for (const hit of hits) {
+    const needle = String(
+      field === "source" ? hit.term || "" : hit.translation || "",
+    )
+    if (!needle) continue
+    const lowerNeedle = needle.toLowerCase()
+    let from = 0
+    while (from <= lowerValue.length) {
+      const index = lowerValue.indexOf(lowerNeedle, from)
+      if (index < 0) break
+      matches.push({
+        start: index,
+        end: index + lowerNeedle.length,
+        hit,
+      })
+      from = index + Math.max(1, lowerNeedle.length)
+    }
+  }
+  if (!matches.length) return escapeHtml(value)
+
+  matches.sort(
+    (a, b) =>
+      b.end - b.start - (a.end - a.start) || a.start - b.start,
+  )
+  const chosen = []
+  for (const match of matches) {
+    if (chosen.some((other) => match.start < other.end && match.end > other.start)) {
+      continue
+    }
+    chosen.push(match)
+  }
+  chosen.sort((a, b) => a.start - b.start)
+
+  let html = ""
+  let cursor = 0
+  for (const match of chosen) {
+    if (match.start < cursor) continue
+    const tip = `${match.hit.term} → ${match.hit.translation}${
+      match.hit.source ? ` · ${match.hit.source}` : ""
+    }${match.hit.note ? ` · ${match.hit.note}` : ""}`
+    html += escapeHtml(value.slice(cursor, match.start))
+    html += `<span class="glossary-hit" title="${escapeHtml(tip)}">${escapeHtml(
+      value.slice(match.start, match.end),
+    )}</span>`
+    cursor = match.end
+  }
+  html += escapeHtml(value.slice(cursor))
+  return html
+}
+
+function translatedJoin(blocks) {
+  return (blocks || [])
+    .map((block) => block.translation || "")
+    .filter(Boolean)
+    .join("\n")
+}
+
+function sourceJoin(blocks) {
+  return (blocks || [])
+    .map((block) => block.text || "")
+    .filter(Boolean)
+    .join("\n")
+}
+
+function copyShotText(text, message) {
+  if (!text) return
+  const done = () => showShotToast(message)
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(done)
+    return
+  }
+  done()
+}
+
+// The overlay has a single copy button. It copies whatever is currently shown
+// (translation or original) and falls back to the other one when that side is
+// empty. Shift-click copies the Markdown version of the translation.
+function copyCurrentOverlayText({ markdown, showOriginal, source, translation, markdownText }) {
+  if (markdown) {
+    if (markdownText) {
+      copyShotText(markdownText, "已复制 Markdown 译文")
+      return
+    }
+    showShotToast("没有可复制的译文")
+    return
+  }
+  if (showOriginal) {
+    if (source) copyShotText(source, "已复制原文")
+    else if (translation) copyShotText(translation, "已复制译文")
+    else showShotToast("没有可复制的文字")
+    return
+  }
+  if (translation) copyShotText(translation, "已复制译文")
+  else if (source) copyShotText(source, "已复制原文")
+  else showShotToast("没有可复制的文字")
+}
+
+function showShotToast(message) {
+  const toast = document.querySelector("#shotToast")
+  if (!toast) return
+  toast.textContent = message
+  toast.classList.add("is-visible")
+  syncOverlayRegion()
+  clearTimeout(showShotToast.timer)
+  showShotToast.timer = setTimeout(() => {
+    toast.classList.remove("is-visible")
+    syncOverlayRegion()
+  }, 1400)
+}
+
 function overlayBlockGeometry(block, imageW, imageH, areaHeight) {
   const angle = Number(block.angle) || 0
   const lineW = Number(block.line_width) || 0
@@ -915,6 +1044,200 @@ function overlayBlockGeometry(block, imageW, imageH, areaHeight) {
   }
   const fontPx = Math.max(8, (sourceHeight / imageH) * areaHeight * 0.82)
   return { left, top, width, height, fontPx, angle }
+}
+
+function renderOverlayBlocks(blocks, scope, { imgW, imgH, imageAreaW, fontFamily, fontWeight }) {
+  const geometries = blocks.map((block) =>
+    overlayBlockGeometry(block, imgW, imgH, imageAreaW),
+  )
+  return blocks
+    .map((block, index) => {
+      const source = String(block.text || "")
+      const translated = String(block.translation || "")
+      const blockOriginal =
+        scope === "live" ? state.liveBlockOriginal : state.overlayBlockOriginal
+      const showOriginal =
+        scope === "live" ? state.liveOriginal : state.overlayOriginal
+      const showSource = Boolean(showOriginal) || (blockOriginal || new Set()).has(index)
+      if (showSource || !translated) return ""
+      if (isUnchangedMathLine(source, translated)) return ""
+      const { left, top, width, height, fontPx, angle } = fitOverlayBlockText({
+        text: translated,
+        index,
+        geometries,
+        imageAreaW,
+        imageAreaH: imgH,
+        fontFamily,
+        fontWeight,
+      })
+      const textHtml = renderGlossaryText(translated, block.glossary_hits, "translation")
+      const { textColor, backgroundStyle, textShadow } = overlayTextAppearance(block)
+      const title = `${translated} · 单击显示原文，双击复制`
+      return `<div class="shot-block" data-block-index="${index}" data-block-scope="${scope}"
+        data-rect="${left},${top},${width},${height}" data-angle="${angle}"
+        style="left:${left}%;top:${top}%;width:${width}%;height:${height}%;transform:rotate(${angle}deg);font-size:${fontPx}px;color:${textColor};${backgroundStyle}text-shadow:${textShadow};"
+        title="${escapeHtml(title)}">${textHtml}</div>`
+    })
+    .join("")
+}
+
+function overlayRootHtml({ mode, barSide, imageLayout, toolbar, imageInner, toast = true }) {
+  return `<div class="shot-window ${mode === "live" ? "live-window" : ""} bar-${barSide}"
+      id="${mode === "live" ? "liveWindow" : "shotWindow"}">
+    ${toolbar}
+    <div class="shot-image-wrap" style="left:${imageLayout.left}px;top:${imageLayout.top}px;width:${imageLayout.width}px;height:${imageLayout.height}px">
+      ${imageInner}
+      <div class="shot-frame-border" aria-hidden="true"></div>
+    </div>
+    ${toast ? `<div class="shot-toast" id="shotToast" aria-live="polite"></div>` : ""}
+  </div>`
+}
+
+function bindOverlayBlocks(scope) {
+  document
+    .querySelectorAll(`.shot-block[data-block-scope="${scope}"]`)
+    .forEach((node) => {
+      const index = Number(node.dataset.blockIndex)
+      node.addEventListener("click", (event) => {
+        if (event.detail > 1) return
+        const key = scope === "live" ? "liveBlockOriginal" : "overlayBlockOriginal"
+        if (!state[key]) state[key] = new Set()
+        if (state[key].has(index)) state[key].delete(index)
+        else state[key].add(index)
+        if (scope === "live") renderLive()
+        else renderOverlay()
+      })
+      node.addEventListener("dblclick", (event) => {
+        event.preventDefault()
+        const list = (scope === "live" ? state.live : state.overlay)?.blocks || []
+        const block = list[index] || {}
+        copyShotText(block.translation || block.text || "", "已复制该句译文")
+      })
+    })
+}
+
+// Shape the window to exactly what is drawn: the toolbar strip, the captured
+// image and (when no frame exists) the chips/edges. The outline is pure CSS so
+// it can never be clipped by the region.
+function syncOverlayRegion() {
+  if (!window.go?.wailsui?.App?.SetOverlayRegion) return
+  const dpr = window.devicePixelRatio || 1
+  const rects = []
+  const polys = []
+  const push = (rect, pad = 1) => {
+    if (!rect || rect.width < 1 || rect.height < 1) return
+    rects.push({
+      x: Math.round(rect.left * dpr) - pad,
+      y: Math.round(rect.top * dpr) - pad,
+      w: Math.round(rect.width * dpr) + pad * 2,
+      h: Math.round(rect.height * dpr) + pad * 2,
+    })
+  }
+  const barRect = document.querySelector(".ov-bar")?.getBoundingClientRect()
+  const imageRect = document.querySelector(".shot-image-wrap")?.getBoundingClientRect()
+  const hasFrame = Boolean(state.overlay?.image_data_url || state.live?.image_data_url)
+  if (barRect) push(barRect)
+  if (hasFrame) {
+    if (imageRect) push(imageRect)
+    SetOverlayRegion(JSON.stringify({ rects, polys: [] })).catch(() => {})
+    return
+  }
+  const wrapRect = imageRect
+  document
+    .querySelectorAll(".shot-block, .shot-pill, .shot-fulltext, .shot-toast.is-visible")
+    .forEach((node) => {
+      if (node.classList.contains("shot-block")) {
+        const angle = Number(node.dataset.angle) || 0
+        const parts = String(node.dataset.rect || "")
+          .split(",")
+          .map(Number)
+        if (
+          Math.abs(angle) > 0.5 &&
+          wrapRect &&
+          parts.length === 4 &&
+          parts.every(Number.isFinite)
+        ) {
+          const [leftPct, topPct, widthPct, heightPct] = parts
+          const x = wrapRect.left + (wrapRect.width * leftPct) / 100
+          const y = wrapRect.top + (wrapRect.height * topPct) / 100
+          const boxW = (wrapRect.width * widthPct) / 100
+          const boxH = (wrapRect.height * heightPct) / 100
+          const centerX = x + boxW / 2
+          const centerY = y + boxH / 2
+          const radians = (angle * Math.PI) / 180
+          const cos = Math.cos(radians)
+          const sin = Math.sin(radians)
+          polys.push(
+            [
+              [x, y],
+              [x + boxW, y],
+              [x + boxW, y + boxH],
+              [x, y + boxH],
+            ].map(([px, py]) => {
+              const dx = px - centerX
+              const dy = py - centerY
+              return [
+                Math.round((centerX + dx * cos - dy * sin) * dpr),
+                Math.round((centerY + dx * sin + dy * cos) * dpr),
+              ]
+            }),
+          )
+          return
+        }
+      }
+      push(node.getBoundingClientRect())
+    })
+  if (wrapRect) push(wrapRect)
+  SetOverlayRegion(JSON.stringify({ rects, polys })).catch(() => {})
+}
+
+// Edge strips resize the live region. Widths/heights here are CSS pixels; the
+// host scales them with the monitor DPI before applying them natively.
+function bindOverlayResize() {
+  if (!window.go?.wailsui?.App?.SetOverlayWindowRect) return
+  document.querySelectorAll(".shot-edge").forEach((edge) => {
+    edge.addEventListener("pointerdown", (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      const dir = edge.dataset.edge || ""
+      const startX = event.screenX
+      const startY = event.screenY
+      const start = {
+        x: window.screenX,
+        y: window.screenY,
+        w: window.outerWidth,
+        h: window.outerHeight,
+      }
+      const minW = 160
+      const minH = 140
+      const onMove = (move) => {
+        const dx = move.screenX - startX
+        const dy = move.screenY - startY
+        let { x, y, w, h } = start
+        if (dir === "e") w = Math.max(minW, start.w + dx)
+        else if (dir === "w") {
+          w = Math.max(minW, start.w - dx)
+          x = start.x + (start.w - w)
+        } else if (dir === "s") h = Math.max(minH, start.h + dy)
+        else if (dir === "n") {
+          h = Math.max(minH, start.h - dy)
+          y = start.y + (start.h - h)
+        }
+        SetOverlayWindowRect(
+          Math.round(x),
+          Math.round(y),
+          Math.round(w),
+          Math.round(h),
+        ).catch(() => {})
+      }
+      const onUp = () => {
+        window.removeEventListener("pointermove", onMove)
+        window.removeEventListener("pointerup", onUp)
+      }
+      window.addEventListener("pointermove", onMove)
+      window.addEventListener("pointerup", onUp, { once: true })
+    })
+  })
 }
 
 const MARKDOWN_SUPERSCRIPTS = {
@@ -1005,30 +1328,424 @@ function markdownFromBlocks(blocks, fallback) {
 
 function overlayProgressHtml(active, progress) {
   return `<div class="shot-progress ${active ? "is-active" : ""}" aria-hidden="true">
-    <span class="shot-progress-fill" style="width:${progress}%"></span>
+    <span class="shot-progress-fill" style="width:${clampNumber(progress, 0, 100, 0)}%"></span>
   </div>`
 }
 
-let overlayBarHideTimer = null
-
-// The toolbar now floats inside the selected image. Hide it after a short idle
-// period so it does not cover the top line, and reveal it on pointer movement.
-function bindOverlayBarAutoHide(loading, status) {
-  const win = document.querySelector(".shot-window")
-  if (!win) return
-  const keepVisible = Boolean(loading) || status === "translating"
-  const reveal = () => {
-    win.classList.remove("bar-hidden")
-    clearTimeout(overlayBarHideTimer)
-    if (!keepVisible) {
-      overlayBarHideTimer = setTimeout(() => {
-        win.classList.add("bar-hidden")
-      }, 2600)
+function overlayStatusView({
+  loading,
+  error,
+  empty,
+  ok,
+  progress,
+  stage,
+  lines,
+  latencyText,
+  paused,
+  listening,
+}) {
+  if (error) {
+    return { kind: "error", label: "失败", title: error, percent: 0 }
+  }
+  if (loading) {
+    const pct = clampNumber(progress, 0, 100, 0)
+    const stageLabel =
+      stage === "ocr" ? "识别文字" : stage === "translate" ? "翻译中" : "处理中"
+    const detail = stage === "translate" && lines > 0 ? ` · ${lines} 句` : ""
+    return {
+      kind: "loading",
+      label: `${stageLabel}${pct > 0 ? ` ${pct}%` : ""}`,
+      title: `${stageLabel}${detail}${pct > 0 ? ` · ${pct}%` : ""}`,
+      percent: pct,
     }
   }
-  win.addEventListener("pointermove", reveal, { passive: true })
-  win.addEventListener("pointerdown", reveal, { passive: true })
-  reveal()
+  if (empty) {
+    // B plan: the toolbar shows only a warning icon; the full sentence lives in
+    // the tooltip and the "…" menu so a tiny selection never shows a text blob.
+    return {
+      kind: "empty",
+      label: "",
+      title: "没有识别到文字",
+      percent: 0,
+    }
+  }
+  if (paused) {
+    return {
+      kind: "paused",
+      label: "已暂停",
+      title: "实时翻译已暂停；窗口仍可被其它截图工具捕获",
+      percent: 0,
+    }
+  }
+  if (ok) {
+    return {
+      kind: "ok",
+      label: `成功${latencyText ? ` · ${latencyText}` : ""}`,
+      title: `翻译完成${latencyText ? `，耗时 ${latencyText}` : ""}`,
+      percent: 100,
+    }
+  }
+  if (listening) {
+    return {
+      kind: "listening",
+      label: "监听中",
+      title: "画面变化后自动识别并翻译",
+      percent: 0,
+    }
+  }
+  return { kind: "warn", label: "未翻译", title: "未翻译", percent: 0 }
+}
+
+const OVERLAY_STATUS_ICONS = {
+  loading: "loader",
+  ok: "check",
+  empty: "circle-alert",
+  error: "circle-alert",
+  paused: "pause",
+  listening: "monitor",
+  warn: "circle-alert",
+}
+
+function overlayStatusHtml(view) {
+  const icon = OVERLAY_STATUS_ICONS[view.kind] || "circle-alert"
+  const label = String(view.label || "").trim()
+  return `<span class="ov-status is-${view.kind}" title="${escapeHtml(view.title)}">
+    <i data-lucide="${icon}" class="ov-status-icon"></i>
+    ${label ? `<span class="ov-status-label">${escapeHtml(label)}</span>` : ""}
+  </span>`
+}
+
+// One action list drives both the persistent toolbar buttons and the overflow
+// menu, so a narrow window never loses a command: it only moves it into "…".
+function overlayActions({ mode, showOriginal, pinned, paused }) {
+  const live = mode === "live"
+  const actions = [
+    {
+      id: "toggle",
+      icon: "arrow-right-left",
+      label: showOriginal ? "显示译文" : "显示原文",
+      shortcut: "H",
+    },
+  ]
+  if (live) {
+    actions.push({
+      id: "pause",
+      icon: paused ? "play" : "pause",
+      label: paused ? "继续实时翻译" : "暂停实时翻译",
+      active: paused,
+      primary: true,
+    })
+  }
+  actions.push({
+    id: "copy",
+    icon: "clipboard",
+    label: "复制当前显示内容",
+    shortcut: "Ctrl+C",
+    primary: true,
+  })
+  actions.push({
+    id: "copy-markdown",
+    icon: "file-code-2",
+    label: "复制 Markdown 译文",
+    menuOnly: true,
+  })
+  actions.push({
+    id: "refresh",
+    icon: "rotate-ccw",
+    label: "刷新译文",
+  })
+  actions.push({
+    id: "pin",
+    icon: pinned ? "pin" : "pin-off",
+    label: pinned ? "取消置顶" : "置顶",
+    active: pinned,
+  })
+  return actions
+}
+
+// Shared toolbar: a status dot is always visible, the badge and status text
+// collapse first, secondary actions move into "…", but "…" and close never
+// leave the bar. The progress line lives at the bar's bottom edge.
+function overlayToolbarHtml({ mode, view, showOriginal, pinned, paused, actions }) {
+  const live = mode === "live"
+  const buttons = actions
+    .filter((action) => !action.menuOnly)
+    .map(
+      (action) => `<button class="ov-btn ${action.active ? "is-active" : ""}"
+        data-action="${action.id}"
+        data-priority="${action.primary ? "primary" : "secondary"}"
+        type="button"
+        title="${escapeHtml(action.label)}${action.shortcut ? ` (${action.shortcut})` : ""}">
+        <i data-lucide="${action.icon}"></i>
+      </button>`,
+    )
+    .join("")
+  const progressActive =
+    view.kind === "loading" && view.percent > 0 && view.percent < 100
+  return `<div class="ov-bar" data-mode="${mode}" data-kind="${view.kind}" style="--wails-draggable: drag">
+    <span class="ov-dot is-${view.kind}" title="${escapeHtml(view.title)}"></span>
+    <span class="ov-badge" title="${live ? "实时翻译" : "截图翻译"}">
+      <i data-lucide="${live ? "scan-text" : "monitor-up"}"></i>
+      <span class="ov-badge-text">${live ? "实时翻译" : "截图翻译"}</span>
+    </span>
+    ${overlayStatusHtml(view)}
+    <span class="ov-spacer"></span>
+    <div class="ov-actions">${buttons}</div>
+    <button class="ov-btn ov-more" data-action="menu" type="button" title="更多操作（菜单）">
+      <i data-lucide="more-horizontal"></i>
+    </button>
+    <button class="ov-btn ov-close" data-action="close" type="button" title="关闭 (Esc)">
+      <i data-lucide="x"></i>
+    </button>
+    ${overlayProgressHtml(progressActive, view.percent)}
+  </div>`
+}
+
+function overlayMenuEntries(ctx) {
+  const entries = []
+  let id = 1
+  if (
+    ctx.view.kind === "empty" ||
+    ctx.view.kind === "error" ||
+    ctx.view.kind === "loading"
+  ) {
+    entries.push({
+      id: 101,
+      label:
+        ctx.view.kind === "empty"
+          ? "没有识别到文字"
+          : ctx.view.kind === "error"
+            ? "翻译失败"
+            : ctx.view.label,
+      icon: ctx.view.kind === "loading" ? "info" : "warning",
+      disabled: true,
+    })
+  }
+  const actions = overlayActions({
+    mode: ctx.scope,
+    showOriginal: ctx.showOriginal,
+    pinned: ctx.scope === "live" ? state.livePinned : state.overlayPinned,
+    paused: ctx.paused,
+  })
+  const iconName = (action) => {
+    switch (action.id) {
+      case "toggle":
+        return "toggle"
+      case "copy":
+        return "copy"
+      case "copy-markdown":
+        return "markdown"
+      case "refresh":
+        return "refresh"
+      case "pin":
+        return action.icon === "pin-off" ? "unpin" : "pin"
+      case "close":
+        return "close"
+      default:
+        return action.icon
+    }
+  }
+  const shortLabel = (action) => {
+    switch (action.id) {
+      case "toggle":
+        return ctx.showOriginal ? "显示译文" : "显示原文"
+      case "pause":
+        return ctx.paused ? "继续翻译" : "暂停翻译"
+      case "copy":
+        return "复制当前内容"
+      case "copy-markdown":
+        return "复制 Markdown"
+      case "refresh":
+        return "刷新译文"
+      case "pin":
+        return ctx.scope === "live"
+          ? state.livePinned
+            ? "取消置顶"
+            : "置顶"
+          : state.overlayPinned
+            ? "取消置顶"
+            : "置顶"
+      default:
+        return action.label
+    }
+  }
+  for (const action of actions) {
+    entries.push({
+      id: id++,
+      action: action.id,
+      label: shortLabel(action),
+      icon: iconName(action),
+      shortcut: action.shortcut || "",
+      checked: Boolean(action.active),
+      disabled: false,
+      danger: false,
+    })
+  }
+  entries.push({ id: 0, separator: true, disabled: true })
+  entries.push({
+    id: id++,
+    action: "close",
+    label: "关闭",
+    icon: "close",
+    shortcut: "Esc",
+    danger: true,
+  })
+  return entries
+}
+
+async function openOverlayMenu(ctx) {
+  const button = document.querySelector(".ov-more")
+  const bridge = window.go?.wailsui?.App
+  if (!button || !bridge?.ShowOverlayMenu) return
+  const entries = overlayMenuEntries(ctx)
+  const rect = button.getBoundingClientRect()
+  const barRect = document.querySelector(".ov-bar")?.getBoundingClientRect()
+  // Align the popup's right edge with the toolbar's right edge so it stays
+  // visually inside a normal selection instead of hanging off the "…" button.
+  const anchorRight = (barRect?.right || rect.right) - 5
+  const dpr = window.devicePixelRatio || 1
+  const below = !document
+    .querySelector(".shot-window")
+    ?.classList.contains("bar-bottom")
+  let selected = 0
+  try {
+    selected = await bridge.ShowOverlayMenu(
+      entries.map(({ action, ...entry }) => entry),
+      Math.round(anchorRight * dpr),
+      Math.round((below ? rect.bottom : rect.top) * dpr),
+      below,
+    )
+  } catch {
+    return
+  }
+  const entry = entries.find((item) => item.id === Number(selected))
+  if (entry?.action) runOverlayAction(entry.action, ctx)
+}
+
+function overlayActionContext(scope, view, blocks) {
+  const payload = scope === "live" ? state.live : state.overlay
+  return {
+    scope,
+    view,
+    blocks,
+    payload: payload || {},
+    showOriginal:
+      scope === "live" ? Boolean(state.liveOriginal) : Boolean(state.overlayOriginal),
+    paused: scope === "live" && payload?.status === "paused",
+    source: payload?.source || sourceJoin(blocks),
+    translation: payload?.translation || translatedJoin(blocks),
+    markdownText: markdownFromBlocks(blocks, payload?.translation),
+  }
+}
+
+function runOverlayAction(action, ctx, event) {
+  if (action === "close") {
+    closeWindow()
+    return
+  }
+  switch (action) {
+    case "toggle":
+      if (ctx.scope === "live") {
+        state.liveOriginal = !state.liveOriginal
+        state.liveBlockOriginal = new Set()
+      } else {
+        state.overlayOriginal = !state.overlayOriginal
+        state.overlayBlockOriginal = new Set()
+      }
+      break
+    case "pause": {
+      const next = !ctx.paused
+      window.go?.wailsui?.App?.LiveControl?.(next ? "pause" : "resume").catch(() => {})
+      state.live = {
+        ...state.live,
+        status: next ? "paused" : "listening",
+        stage: "",
+        progress: 0,
+        lines: 0,
+      }
+      break
+    }
+    case "copy": {
+      const payload = ctx.scope === "live" ? state.live : state.overlay
+      const fresh = overlayActionContext(ctx.scope, ctx.view, payload?.blocks || [])
+      copyCurrentOverlayText({
+        markdown: Boolean(event?.shiftKey),
+        showOriginal: fresh.showOriginal,
+        source: fresh.source,
+        translation: fresh.translation,
+        markdownText: fresh.markdownText,
+      })
+      break
+    }
+    case "copy-markdown": {
+      const payload = ctx.scope === "live" ? state.live : state.overlay
+      const fresh = overlayActionContext(ctx.scope, ctx.view, payload?.blocks || [])
+      copyCurrentOverlayText({
+        markdown: true,
+        showOriginal: fresh.showOriginal,
+        source: fresh.source,
+        translation: fresh.translation,
+        markdownText: fresh.markdownText,
+      })
+      break
+    }
+    case "refresh":
+      if (ctx.scope === "live") {
+        window.go?.wailsui?.App?.LiveControl?.("refresh").catch(() => {})
+        showShotToast("正在刷新实时译文...")
+      } else {
+        window.go?.wailsui?.App?.RefreshOverlay?.().catch(() => {})
+        showShotToast("正在刷新译文...")
+      }
+      break
+    case "pin": {
+      const key = ctx.scope === "live" ? "livePinned" : "overlayPinned"
+      state[key] = !state[key]
+      if (window.runtime?.WindowSetAlwaysOnTop) WindowSetAlwaysOnTop(state[key])
+      if (window.go?.wailsui?.App?.SetOverlayPinned) {
+        SetOverlayPinned(state[key]).catch(() => {})
+      }
+      break
+    }
+    default:
+      return
+  }
+  if (ctx.scope === "live") renderLive()
+  else renderOverlay()
+}
+
+function bindOverlayActions(scope, ctx) {
+  document.querySelectorAll(".ov-btn[data-action]").forEach((node) => {
+    node.addEventListener("click", (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      const action = node.dataset.action || ""
+      if (action === "menu") {
+        openOverlayMenu(ctx)
+        return
+      }
+      runOverlayAction(action, ctx, event)
+    })
+  })
+}
+
+function overlayImageLayout(area, windowRect) {
+  const winW = Number(windowRect?.width) || 1
+  const winH = Number(windowRect?.height) || 1
+  const viewW = Math.max(1, window.innerWidth || 1)
+  const viewH = Math.max(1, window.innerHeight || 1)
+  const areaX = Number(area?.x) || 0
+  const areaY = Number(area?.y) || 0
+  const areaW = Number(area?.width) || Number(area?.w) || winW
+  const areaH = Number(area?.height) || Number(area?.h) || winH
+  const winX = Number(windowRect?.x) || 0
+  const winY = Number(windowRect?.y) || 0
+  return {
+    left: Math.max(0, ((areaX - winX) / winW) * viewW),
+    top: Math.max(0, ((areaY - winY) / winH) * viewH),
+    width: Math.max(1, (areaW / winW) * viewW),
+    height: Math.max(1, (areaH / winH) * viewH),
+  }
 }
 
 function renderOverlay() {
@@ -1037,7 +1754,6 @@ function renderOverlay() {
   const loading = Boolean(overlay.loading)
   const error = overlay.error || ""
   const showOriginal = Boolean(state.overlayOriginal)
-  const blockOriginal = state.overlayBlockOriginal || new Set()
   const imgW = Number(overlay.image_width) || 1
   const imgH = Number(overlay.image_height) || 1
   const cfg = state.config || {}
@@ -1052,836 +1768,170 @@ function renderOverlay() {
     500,
   )
   const barSide = overlay.bar_side === "bottom" ? "bottom" : "top"
-  const imageAreaH = Math.max(80, window.innerHeight || 600)
-  const imageAreaW = Math.max(80, window.innerWidth || 800)
-  const geometries = blocks.map((block) =>
-    overlayBlockGeometry(block, imgW, imgH, imageAreaH),
-  )
-
-  const renderedBlocks = blocks
-    .map((block, index) => {
-      const source = String(block.text || "")
-      const translated = String(block.translation || "")
-      const showSource = showOriginal || blockOriginal.has(index)
-      // Showing the original means revealing the captured frame underneath:
-      // simply omit the chip instead of re-rendering the source text.
-      if (showSource) return ""
-      if (!translated) return ""
-      const text = translated
-      const { left, top, width, height, fontPx, angle } =
-        fitOverlayBlockText({
-          text,
-          index,
-          geometries,
-          imageAreaW,
-          imageAreaH,
-          fontFamily: overlayFont,
-          fontWeight: overlayWeight,
-        })
-      const classes = [
-        "shot-block",
-        showSource ? "is-original" : "",
-        translated ? "" : "is-untranslated",
-      ]
-        .filter(Boolean)
-        .join(" ")
-      // Keep the translation inside the original OCR line box so neighbouring
-      // lines are never covered. Long text is clipped and available via the
-      // title/hover tooltip and the copy buttons.
-      const sizeStyle = `width:${width}%;height:${height}%;`
-      const textHtml = renderGlossaryText(
-        text,
-        block.glossary_hits,
-        showSource ? "source" : "translation",
-      )
-      const { textColor, backgroundStyle, textShadow } =
-        overlayTextAppearance(block)
-      const title = `${showSource ? source : translated} · 单击切换原文/译文，双击复制`
-      return `<div class="${classes}" data-shot-index="${index}"
-        data-rect="${left},${top},${width},${height}" data-angle="${angle}"
-        style="left:${left}%;top:${top}%;${sizeStyle}transform:rotate(${angle}deg);font-size:${fontPx}px;color:${textColor};${backgroundStyle}text-shadow:${textShadow};"
-        title="${escapeHtml(title)}">${textHtml}</div>`
-    })
-    .join("")
-
-  const fullText =
-    !loading && !blocks.length && overlay.translation
-      ? `<div class="shot-fulltext" title="整段译文">${escapeHtml(overlay.translation)}</div>`
-      : ""
+  const area = overlay.rect || { x: 0, y: 0, width: imgW, height: imgH }
+  const windowRect = overlay.window_rect || area
+  const imageLayout = overlayImageLayout(area, windowRect)
   const latencyMs = Number(overlay.latency_ms) || 0
   const latencyText = latencyMs > 0 ? `${(latencyMs / 1000).toFixed(1)}s` : ""
-  const progress = clampNumber(Number(overlay.progress) || 0, 0, 100, 0)
-  const stage = String(overlay.stage || "")
-  const lines = Number(overlay.lines) || 0
-  const progressStage =
-    stage === "ocr" ? "识别文字" : stage === "translate" ? "翻译中" : "处理中"
-  const progressDetail = stage === "translate" && lines > 0 ? ` · ${lines} 行` : ""
-  const progressLabel = `${progressStage}${progressDetail}${
-    progress > 0 ? ` · ${progress}%` : ""
-  }`
-  const progressActive = loading && progress > 0 && progress < 100
+  const isEmpty =
+    !loading &&
+    !error &&
+    !String(overlay.source || "").trim() &&
+    !blocks.length &&
+    !String(overlay.translation || "").trim()
   const translatedOk =
     !loading &&
     !error &&
     (blocks.some((block) => String(block.translation || "").trim()) ||
       Boolean(overlay.translation))
-  const statusBubble = loading
-    ? `<span class="trans-status is-neutral">${escapeHtml(progressLabel)}</span>`
-    : `<span class="trans-status ${translatedOk ? "is-ok" : "is-warn"}">${
-        translatedOk ? "成功" : "未翻译"
-      }${latencyText ? ` · ${latencyText}` : ""}</span>`
+  const view = overlayStatusView({
+    loading,
+    error,
+    empty: isEmpty,
+    ok: translatedOk,
+    progress: overlay.progress,
+    stage: overlay.stage,
+    lines: overlay.lines,
+    latencyText,
+  })
+  const actions = overlayActions({
+    mode: "overlay",
+    showOriginal,
+    pinned: state.overlayPinned,
+    paused: false,
+  })
+  const ctx = overlayActionContext("overlay", view, blocks)
+  const renderedBlocks = renderOverlayBlocks(blocks, "overlay", {
+    imgW,
+    imgH,
+    imageAreaW: imageLayout.width,
+    fontFamily: overlayFont,
+    fontWeight: overlayWeight,
+  })
+  const fullText =
+    !loading && !blocks.length && overlay.translation
+      ? `<div class="shot-fulltext" title="整段译文">${escapeHtml(overlay.translation)}</div>`
+      : ""
+  const imageInner = `
+    ${overlay.image_data_url ? `<img class="shot-image" src="${overlay.image_data_url}" alt="" draggable="false">` : ""}
+    <div class="shot-blocks" style="--shot-font:${overlayFont};--shot-weight:${overlayWeight}">${renderedBlocks}</div>
+    ${error ? `<div class="shot-pill is-error" title="${escapeHtml(error)}">${escapeHtml(error)}</div>` : ""}
+    ${fullText}`
 
-  app.innerHTML = `
-    <div class="shot-window bar-${barSide}" id="shotWindow"
-      style="--shot-font:${overlayFont};--shot-weight:${overlayWeight}">
-      <div class="shot-bar" style="--wails-draggable: drag">
-        <span class="shot-badge"><i data-lucide="monitor-up"></i><span>截图翻译</span></span>
-        ${statusBubble}
-        <button class="shot-btn ${showOriginal ? "is-active" : ""}" id="shotToggleBtn" type="button" title="切换原文/译文 (H)">
-          <i data-lucide="arrow-right-left"></i><span>${showOriginal ? "显示译文" : "显示原文"}</span>
-        </button>
-        <button class="shot-btn" id="shotCopySourceBtn" type="button" title="复制原文">
-          <i data-lucide="file-text"></i><span>原文</span>
-        </button>
-        <button class="shot-btn" id="shotCopyTargetBtn" type="button" title="复制译文 (Ctrl+C)">
-          <i data-lucide="languages"></i><span>译文</span>
-        </button>
-        <button class="shot-btn" id="shotCopyMarkdownBtn" type="button" title="复制 Markdown 译文（公式为 LaTeX）">
-          <i data-lucide="file-code-2"></i><span>MD</span>
-        </button>
-        <button class="shot-btn" id="shotRefreshBtn" type="button" title="刷新译文">
-          <i data-lucide="rotate-ccw"></i><span>刷新</span>
-        </button>
-        <button class="shot-btn" id="shotPinBtn" type="button" title="${state.overlayPinned ? "取消置顶" : "置顶"}">
-          <i data-lucide="${state.overlayPinned ? "pin" : "pin-off"}"></i>
-        </button>
-        <button class="shot-btn shot-more" id="shotMoreBtn" type="button" title="更多功能">
-          <i data-lucide="more-horizontal"></i>
-        </button>
-        <button class="shot-btn shot-close" id="shotCloseBtn" type="button" title="关闭 (Esc)">
-          <i data-lucide="x"></i>
-        </button>
-        ${overlayProgressHtml(progressActive, progress)}
-      </div>
-      <div class="shot-menu-scrim" id="shotMenuScrim" hidden></div>
-      <div class="shot-menu" id="shotMenu" role="menu">
-        <button class="shot-menu-item" type="button" data-target="shotToggleBtn">
-          <i data-lucide="arrow-right-left"></i><span>${showOriginal ? "显示译文" : "显示原文"}</span>
-        </button>
-        <button class="shot-menu-item" type="button" data-target="shotCopySourceBtn">
-          <i data-lucide="file-text"></i><span>复制原文</span>
-        </button>
-        <button class="shot-menu-item" type="button" data-target="shotCopyTargetBtn">
-          <i data-lucide="languages"></i><span>复制译文</span>
-        </button>
-        <button class="shot-menu-item" type="button" data-target="shotCopyMarkdownBtn">
-          <i data-lucide="file-code-2"></i><span>复制 Markdown 译文</span>
-        </button>
-        <button class="shot-menu-item" type="button" data-target="shotRefreshBtn">
-          <i data-lucide="rotate-ccw"></i><span>刷新译文</span>
-        </button>
-        <button class="shot-menu-item" type="button" data-target="shotPinBtn">
-          <i data-lucide="${state.overlayPinned ? "pin-off" : "pin"}"></i><span>${state.overlayPinned ? "取消置顶" : "置顶"}</span>
-        </button>
-        <button class="shot-menu-item" type="button" data-target="shotCloseBtn">
-          <i data-lucide="x"></i><span>关闭</span>
-        </button>
-      </div>
-      <div class="shot-image-wrap">
-        ${overlay.image_data_url ? `<img class="shot-image" src="${overlay.image_data_url}" alt="" draggable="false">` : ""}
-        <div class="shot-blocks">${renderedBlocks}</div>
-        ${error ? `<div class="shot-pill is-error" title="${escapeHtml(error)}">${escapeHtml(error)}</div>` : ""}
-        ${fullText}
-      </div>
-      <div class="shot-frame-border" aria-hidden="true"></div>
-      <div class="shot-toast" id="shotToast" aria-live="polite"></div>
-    </div>
-  `
-
+  app.innerHTML = overlayRootHtml({
+    mode: "overlay",
+    barSide,
+    imageLayout,
+    toolbar: overlayToolbarHtml({
+      mode: "overlay",
+      view,
+      showOriginal,
+      pinned: state.overlayPinned,
+      paused: false,
+      actions,
+    }),
+    imageInner,
+  })
   createIcons({ icons, attrs: { "stroke-width": 1.8 } })
 
-  document
-    .querySelector("#shotToggleBtn")
-    ?.addEventListener("click", () => {
-      state.overlayOriginal = !state.overlayOriginal
-      renderOverlay()
-    })
-  document
-    .querySelector("#shotCopySourceBtn")
-    ?.addEventListener("click", () =>
-      copyShotText(overlay.source || "", "已复制原文"),
-    )
-  document
-    .querySelector("#shotCopyTargetBtn")
-    ?.addEventListener("click", () =>
-      copyShotText(
-        overlay.translation || translatedJoin(blocks),
-        "已复制译文",
-      ),
-    )
-  document
-    .querySelector("#shotRefreshBtn")
-    ?.addEventListener("click", () => {
-      if (window.go?.wailsui?.App?.RefreshOverlay) {
-        RefreshOverlay().catch(() => {})
-        showShotToast("正在刷新译文...")
-      }
-    })
-  document
-    .querySelector("#shotCopyMarkdownBtn")
-    ?.addEventListener("click", () =>
-      copyShotText(
-        markdownFromBlocks(blocks, overlay.translation),
-        "已复制 Markdown 译文",
-      ),
-    )
-  document.querySelector("#shotPinBtn")?.addEventListener("click", () => {
-    state.overlayPinned = !state.overlayPinned
-    if (window.runtime?.WindowSetAlwaysOnTop) {
-      WindowSetAlwaysOnTop(state.overlayPinned)
-    }
-    if (window.go?.wailsui?.App?.SetOverlayPinned) {
-      SetOverlayPinned(state.overlayPinned).catch(() => {})
-    }
-    renderOverlay()
-  })
-  document
-    .querySelector("#shotCloseBtn")
-    ?.addEventListener("click", closeWindow)
-
-  document.querySelectorAll(".shot-block").forEach((node) => {
-    const index = Number(node.dataset.shotIndex)
-    node.addEventListener("click", (event) => {
-      if (event.detail > 1) return
-      if (!state.overlayBlockOriginal) state.overlayBlockOriginal = new Set()
-      if (state.overlayBlockOriginal.has(index)) {
-        state.overlayBlockOriginal.delete(index)
-      } else {
-        state.overlayBlockOriginal.add(index)
-      }
-      renderOverlay()
-    })
-    node.addEventListener("dblclick", (event) => {
-      event.preventDefault()
-      const block = blocks[index] || {}
-      copyShotText(
-        block.translation || block.text || "",
-        "已复制该行译文",
-      )
-    })
-  })
-  bindShotMenu("shotMoreBtn", "shotMenu", "shotMenuScrim")
+  bindOverlayActions("overlay", ctx)
+  bindOverlayBlocks("overlay")
   bindOverlayResize()
   syncOverlayRegion()
-  bindOverlayBarAutoHide(loading, "")
-}
-
-// In very narrow overlay windows the toolbar collapses to a single "…" button.
-// The dropdown lives outside the bar (over the image area), so the host must
-// stop treating that area as click-through while the menu is open.
-// The overlay window is shaped to the rendered toolbar + chips, so everything
-// else shows the real desktop with no blur. Recompute after every render.
-function syncOverlayRegion() {
-  if (!window.go?.wailsui?.App?.SetOverlayRegion) return
-  const dpr = window.devicePixelRatio || 1
-  // With a captured frame the whole window is covered by the image; shape it
-  // as a plain rectangle so the selection stays exactly the drag rectangle.
-  const hasFrame = Boolean(
-    state.overlay?.image_data_url || state.live?.image_data_url,
-  )
-  if (hasFrame) {
-    SetOverlayRegion(
-      JSON.stringify({
-        rects: [
-          {
-            x: 0,
-            y: 0,
-            w: Math.round((window.innerWidth || 1) * dpr),
-            h: Math.round((window.innerHeight || 1) * dpr),
-          },
-        ],
-        polys: [],
-      }),
-    )
-    return
-  }
-  const rects = []
-  const polys = []
-  const push = (rect, pad = 1) => {
-    if (!rect || rect.width < 1 || rect.height < 1) return
-    rects.push({
-      x: Math.round(rect.left * dpr) - pad,
-      y: Math.round(rect.top * dpr) - pad,
-      w: Math.round(rect.width * dpr) + pad * 2,
-      h: Math.round(rect.height * dpr) + pad * 2,
-    })
-  }
-  const wrapEl = document.querySelector(".shot-image-wrap")
-  const wrapRect = wrapEl?.getBoundingClientRect()
-  document
-    .querySelectorAll(
-      ".shot-bar, .shot-block, .shot-pill, .shot-fulltext, .shot-menu.is-open, .shot-edge, .shot-toast.is-visible",
-    )
-    .forEach((node) => {
-      if (node.classList.contains("shot-block")) {
-        const angle = Number(node.dataset.angle) || 0
-        const parts = String(node.dataset.rect || "")
-          .split(",")
-          .map(Number)
-        if (
-          Math.abs(angle) > 0.5 &&
-          wrapRect &&
-          parts.length === 4 &&
-          parts.every(Number.isFinite)
-        ) {
-          // Rotated chips: the DOM bounding rect is the axis-aligned box, which
-          // would show black wedges around tilted text. Send the exact rotated
-          // quad so the window region follows the text.
-          const [leftPct, topPct, widthPct, heightPct] = parts
-          const x = wrapRect.left + (wrapRect.width * leftPct) / 100
-          const y = wrapRect.top + (wrapRect.height * topPct) / 100
-          const boxW = (wrapRect.width * widthPct) / 100
-          const boxH = (wrapRect.height * heightPct) / 100
-          const centerX = x + boxW / 2
-          const centerY = y + boxH / 2
-          const radians = (angle * Math.PI) / 180
-          const cos = Math.cos(radians)
-          const sin = Math.sin(radians)
-          const corners = [
-            [x, y],
-            [x + boxW, y],
-            [x + boxW, y + boxH],
-            [x, y + boxH],
-          ].map(([px, py]) => {
-            const dx = px - centerX
-            const dy = py - centerY
-            return [
-              Math.round((centerX + dx * cos - dy * sin) * dpr),
-              Math.round((centerY + dx * sin + dy * cos) * dpr),
-            ]
-          })
-          polys.push(corners)
-          return
-        }
-      }
-      push(node.getBoundingClientRect())
-    })
-  // Keep the accent frame visible: four thin strips along the window edges.
-  const winEl = document.querySelector(".shot-window")
-  if (winEl) {
-    const r = winEl.getBoundingClientRect()
-    const thickness = Math.max(2, Math.round(2 * dpr))
-    push({ left: r.left, top: r.top, width: r.width, height: thickness })
-    push({
-      left: r.left,
-      top: r.bottom - thickness,
-      width: r.width,
-      height: thickness,
-    })
-    push({ left: r.left, top: r.top, width: thickness, height: r.height })
-    push({
-      left: r.right - thickness,
-      top: r.top,
-      width: thickness,
-      height: r.height,
-    })
-  }
-  SetOverlayRegion(JSON.stringify({ rects, polys })).catch(() => {})
-}
-
-function bindOverlayResize() {
-  if (!window.go?.wailsui?.App?.SetOverlayWindowRect) return
-  document.querySelectorAll(".shot-edge").forEach((edge) => {
-    edge.addEventListener("pointerdown", (event) => {
-      event.preventDefault()
-      event.stopPropagation()
-      const dir = edge.dataset.edge || ""
-      const startX = event.screenX
-      const startY = event.screenY
-      const start = {
-        x: window.screenX,
-        y: window.screenY,
-        w: window.outerWidth,
-        h: window.outerHeight,
-      }
-      const onMove = (move) => {
-        const dx = move.screenX - startX
-        const dy = move.screenY - startY
-        let { x, y, w, h } = start
-        if (dir === "e") {
-          w = Math.max(200, start.w + dx)
-        } else if (dir === "w") {
-          w = Math.max(200, start.w - dx)
-          x = start.x + (start.w - w)
-        } else if (dir === "s") {
-          h = Math.max(120, start.h + dy)
-        } else if (dir === "n") {
-          h = Math.max(120, start.h - dy)
-          y = start.y + (start.h - h)
-        }
-        SetOverlayWindowRect(
-          Math.round(x),
-          Math.round(y),
-          Math.round(w),
-          Math.round(h),
-        ).catch(() => {})
-      }
-      const onUp = () => {
-        window.removeEventListener("pointermove", onMove)
-        window.removeEventListener("pointerup", onUp)
-      }
-      window.addEventListener("pointermove", onMove)
-      window.addEventListener("pointerup", onUp, { once: true })
-    })
-  })
-}
-
-function bindShotMenu(moreId, menuId, scrimId) {
-  const more = document.querySelector(`#${moreId}`)
-  const menu = document.querySelector(`#${menuId}`)
-  const scrim = document.querySelector(`#${scrimId}`)
-  if (!more || !menu) return
-  const win = document.querySelector(".shot-window")
-
-  // Anchor the dropdown to the "…" button itself, flipping above/below and
-  // clamping inside the overlay window so it can never leave the screen.
-  const positionMenu = () => {
-    if (!win || !menu.classList.contains("is-open")) return
-    const winRect = win.getBoundingClientRect()
-    const winStyle = getComputedStyle(win)
-    const borderLeft = parseFloat(winStyle.borderLeftWidth) || 0
-    const borderTop = parseFloat(winStyle.borderTopWidth) || 0
-    const originX = winRect.left + borderLeft
-    const originY = winRect.top + borderTop
-    const winWidth = winRect.width - borderLeft * 2
-    const winHeight = winRect.height - borderTop * 2
-    const buttonRect = more.getBoundingClientRect()
-    menu.style.right = "auto"
-    menu.style.bottom = "auto"
-    menu.style.maxHeight = ""
-    const menuRect = menu.getBoundingClientRect()
-    const gap = 4
-    const edge = 4
-    const belowTop = buttonRect.bottom - originY + gap
-    const aboveTop = buttonRect.top - originY - menuRect.height - gap
-    const spaceBelow = winHeight - belowTop - edge
-    const spaceAbove = buttonRect.top - originY - gap - edge
-    let top = belowTop
-    if (spaceBelow < menuRect.height && spaceAbove > spaceBelow) {
-      top = aboveTop
-      menu.style.maxHeight = `${Math.max(72, spaceAbove)}px`
-    } else {
-      menu.style.maxHeight = `${Math.max(72, spaceBelow)}px`
-    }
-    const maxLeft = winWidth - menuRect.width - edge
-    const left = Math.min(
-      Math.max(edge, buttonRect.left - originX),
-      Math.max(edge, maxLeft),
-    )
-    menu.style.left = `${left}px`
-    menu.style.top = `${Math.max(edge, top)}px`
-  }
-
-  const setOpen = (open) => {
-    menu.classList.toggle("is-open", open)
-    if (scrim) scrim.hidden = !open
-    if (open) positionMenu()
-    if (window.go?.wailsui?.App?.SetOverlayMenu) {
-      SetOverlayMenu(open).catch(() => {})
-    }
-    syncOverlayRegion()
-  }
-  more.addEventListener("click", () => {
-    setOpen(!menu.classList.contains("is-open"))
-  })
-  scrim?.addEventListener("click", () => setOpen(false))
-  menu.querySelectorAll("[data-target]").forEach((item) => {
-    item.addEventListener("click", () => {
-      setOpen(false)
-      document.querySelector(`#${item.dataset.target}`)?.click()
-    })
-  })
-  // Clicks that land on the shaped window (bar/chips) close the menu; clicks
-  // on the transparent desktop pass through to the app underneath instead.
-  if (window.__shotMenuDocHandler) {
-    document.removeEventListener("pointerdown", window.__shotMenuDocHandler, true)
-  }
-  window.__shotMenuDocHandler = (event) => {
-    if (!menu.classList.contains("is-open")) return
-    if (menu.contains(event.target) || more.contains(event.target)) return
-    setOpen(false)
-  }
-  document.addEventListener("pointerdown", window.__shotMenuDocHandler, true)
-}
-
-function clampNumber(value, min, max, fallback) {
-  const parsed = Number(value)
-  if (!Number.isFinite(parsed)) return fallback
-  return Math.min(max, Math.max(min, parsed))
-}
-
-function renderGlossaryText(text, hits, field) {
-  const value = String(text || "")
-  if (!value || !Array.isArray(hits) || !hits.length) {
-    return escapeHtml(value)
-  }
-
-  const matches = []
-  const lowerValue = value.toLowerCase()
-  for (const hit of hits) {
-    const needle = String(
-      field === "source" ? hit.term || "" : hit.translation || "",
-    )
-    if (!needle) continue
-    const lowerNeedle = needle.toLowerCase()
-    let from = 0
-    while (from <= lowerValue.length) {
-      const index = lowerValue.indexOf(lowerNeedle, from)
-      if (index < 0) break
-      matches.push({
-        start: index,
-        end: index + lowerNeedle.length,
-        hit,
-      })
-      from = index + Math.max(1, lowerNeedle.length)
-    }
-  }
-  if (!matches.length) return escapeHtml(value)
-
-  matches.sort(
-    (a, b) =>
-      b.end - b.start - (a.end - a.start) || a.start - b.start,
-  )
-  const chosen = []
-  for (const match of matches) {
-    if (chosen.some((other) => match.start < other.end && match.end > other.start)) {
-      continue
-    }
-    chosen.push(match)
-  }
-  chosen.sort((a, b) => a.start - b.start)
-
-  let html = ""
-  let cursor = 0
-  for (const match of chosen) {
-    if (match.start < cursor) continue
-    const tip = `${match.hit.term} → ${match.hit.translation}${
-      match.hit.source ? ` · ${match.hit.source}` : ""
-    }${match.hit.note ? ` · ${match.hit.note}` : ""}`
-    html += escapeHtml(value.slice(cursor, match.start))
-    html += `<span class="glossary-hit" title="${escapeHtml(tip)}">${escapeHtml(
-      value.slice(match.start, match.end),
-    )}</span>`
-    cursor = match.end
-  }
-  html += escapeHtml(value.slice(cursor))
-  return html
-}
-
-function translatedJoin(blocks) {
-  return (blocks || [])
-    .map((block) => block.translation || "")
-    .filter(Boolean)
-    .join("\n")
-}
-
-function sourceJoin(blocks) {
-  return (blocks || [])
-    .map((block) => block.text || "")
-    .filter(Boolean)
-    .join("\n")
-}
-
-function copyShotText(text, message) {
-  if (!text) return
-  const done = () => showShotToast(message)
-  if (navigator.clipboard?.writeText) {
-    navigator.clipboard.writeText(text).then(done).catch(done)
-    return
-  }
-  done()
-}
-
-function showShotToast(message) {
-  const toast = document.querySelector("#shotToast")
-  if (!toast) return
-  toast.textContent = message
-  toast.classList.add("is-visible")
-  syncOverlayRegion()
-  clearTimeout(showShotToast.timer)
-  showShotToast.timer = setTimeout(() => {
-    toast.classList.remove("is-visible")
-    syncOverlayRegion()
-  }, 1400)
 }
 
 function renderLive() {
-  const live = state.live || {}
+  const live = state.live
+  // Never paint the live view from a stale or empty payload: wait for the
+  // host's first ShowLive (it carries the anchor and the captured frame).
+  if (!live || !live.anchor) return
+  if (state.overlayOnly) windowShown = true
   const blocks = Array.isArray(live.blocks) ? live.blocks : []
   const status = live.status || "listening"
   const paused = status === "paused"
+  const loading = status === "translating"
+  const error = live.error || ""
   const latencyMs = Number(live.latency_ms) || 0
   const latencyText = latencyMs > 0 ? `${(latencyMs / 1000).toFixed(1)}s` : ""
-  const progress = clampNumber(Number(live.progress) || 0, 0, 100, 0)
-  const stage = String(live.stage || "")
-  const lines = Number(live.lines) || 0
-  const progressActive = status === "translating" && progress > 0 && progress < 100
-  const statusTitle = lines > 0 ? `${lines} 行` : ""
+  const isEmpty =
+    !loading &&
+    !error &&
+    !String(live.source || "").trim() &&
+    !blocks.length &&
+    !String(live.translation || "").trim()
   const translatedOk =
     blocks.some((block) => String(block.translation || "").trim()) ||
     Boolean(live.translation)
-  let bubbleText = "监听中"
-  let bubbleClass = "is-neutral"
-  if (status === "translating") {
-    const stageLabel = stage === "ocr" ? "识别中" : "翻译中"
-    bubbleText = `${stageLabel}${progress > 0 ? ` · ${progress}%` : ""}`
-  } else if (status === "paused") {
-    bubbleText = "已暂停"
-  } else if (status === "error" || (latencyMs > 0 && !translatedOk)) {
-    bubbleText = `未翻译${latencyText ? ` · ${latencyText}` : ""}`
-    bubbleClass = "is-warn"
-  } else if (latencyMs > 0) {
-    bubbleText = `成功 · ${latencyText}`
-    bubbleClass = "is-ok"
-  }
+  const view = overlayStatusView({
+    loading,
+    error,
+    empty: isEmpty,
+    ok: translatedOk,
+    progress: live.progress,
+    stage: live.stage,
+    lines: live.lines,
+    latencyText,
+    paused,
+    listening: true,
+  })
   const cfg = state.config || {}
   const style = live.style || {}
-  const overlayFont = overlayFontStack(
-    style.font_family || cfg.overlay_font_family,
-  )
-  const overlayWeight = clampNumber(
-    style.font_weight ?? cfg.overlay_font_weight,
-    300,
-    800,
-    500,
-  )
+  const overlayFont = overlayFontStack(style.font_family || cfg.overlay_font_family)
+  const overlayWeight = clampNumber(style.font_weight ?? cfg.overlay_font_weight, 300, 800, 500)
   const barSide = live.bar_side === "bottom" ? "bottom" : "top"
   const anchorW = Number(live.anchor?.width) || 1
   const anchorH = Number(live.anchor?.height) || 1
-  const imageAreaH = Math.max(80, window.innerHeight || 600)
-  const imageAreaW = Math.max(80, window.innerWidth || 800)
-  const showOriginal = Boolean(state.liveOriginal)
-  const blockOriginal = state.liveBlockOriginal || new Set()
-  const geometries = blocks.map((block) =>
-    overlayBlockGeometry(block, anchorW, anchorH, imageAreaH),
-  )
-
-  const renderedBlocks = blocks
-    .map((block, index) => {
-      const source = String(block.text || "")
-      const translated = String(block.translation || "")
-      const showSource = showOriginal || blockOriginal.has(index)
-      // Reveal the captured frame instead of drawing source text.
-      if (showSource) return ""
-      if (!translated) return ""
-      const text = translated
-      if (!text) return ""
-      if (isUnchangedMathLine(source, translated)) return ""
-      const { left, top, width, height, fontPx, angle } =
-        fitOverlayBlockText({
-          text,
-          index,
-          geometries,
-          imageAreaW,
-          imageAreaH,
-          fontFamily: overlayFont,
-          fontWeight: overlayWeight,
-        })
-      const classes = [
-        "shot-block",
-        "live-block",
-        showSource ? "is-original" : "",
-        translated ? "" : "is-untranslated",
-      ]
-        .filter(Boolean)
-        .join(" ")
-      const sizeStyle = `width:${width}%;height:${height}%;`
-      const textHtml = renderGlossaryText(
-        text,
-        block.glossary_hits,
-        showSource ? "source" : "translation",
-      )
-      const { textColor, backgroundStyle, textShadow } =
-        overlayTextAppearance(block)
-      const title = `${showSource ? source : translated} · 单击切换原文/译文，双击复制`
-      return `<div class="${classes}" data-live-index="${index}"
-        data-rect="${left},${top},${width},${height}" data-angle="${angle}"
-        style="left:${left}%;top:${top}%;${sizeStyle}transform:rotate(${angle}deg);font-size:${fontPx}px;color:${textColor};${backgroundStyle}text-shadow:${textShadow};"
-        title="${escapeHtml(title)}">${textHtml}</div>`
-    })
-    .join("")
-
+  const area = live.anchor || { x: 0, y: 0, width: anchorW, height: anchorH }
+  const windowRect = live.window_rect || area
+  const imageLayout = overlayImageLayout(area, windowRect)
+  const actions = overlayActions({
+    mode: "live",
+    showOriginal: Boolean(state.liveOriginal),
+    pinned: state.livePinned,
+    paused,
+  })
+  const ctx = overlayActionContext("live", view, blocks)
+  const renderedBlocks = renderOverlayBlocks(blocks, "live", {
+    imgW: anchorW,
+    imgH: anchorH,
+    imageAreaW: imageLayout.width,
+    fontFamily: overlayFont,
+    fontWeight: overlayWeight,
+  })
   const fallback =
     !blocks.length && live.translation
-      ? `<div class="shot-fulltext live-fulltext" title="整段译文">${escapeHtml(live.translation)}</div>`
+      ? `<div class="shot-fulltext" title="整段译文">${escapeHtml(live.translation)}</div>`
       : ""
+  const imageInner = `
+    ${live.image_data_url ? `<img class="shot-image" src="${live.image_data_url}" alt="" draggable="false">` : ""}
+    <div class="shot-blocks" style="--shot-font:${overlayFont};--shot-weight:${overlayWeight}">${renderedBlocks}</div>
+    ${error ? `<div class="shot-pill is-error" title="${escapeHtml(error)}">${escapeHtml(error)}</div>` : ""}
+    ${fallback}
+    <div class="shot-edge" data-edge="n"></div>
+    <div class="shot-edge" data-edge="s"></div>
+    <div class="shot-edge" data-edge="e"></div>
+    <div class="shot-edge" data-edge="w"></div>`
 
-  app.innerHTML = `
-    <div class="shot-window live-window bar-${barSide}" id="liveWindow"
-      style="--shot-font:${overlayFont};--shot-weight:${overlayWeight}">
-      <div class="shot-bar" style="--wails-draggable: drag">
-        <span class="shot-badge"><span class="live-dot ${status}"></span><span>实时翻译</span></span>
-        <span class="trans-status ${bubbleClass}" ${statusTitle ? `title="${escapeHtml(statusTitle)}"` : ""}>${bubbleText}</span>
-        <button class="shot-btn ${showOriginal ? "is-active" : ""}" id="liveToggleBtn" type="button" title="切换原文/译文 (H)">
-          <i data-lucide="arrow-right-left"></i><span>${showOriginal ? "显示译文" : "显示原文"}</span>
-        </button>
-        <button class="shot-btn ${paused ? "is-active" : ""}" id="livePauseBtn" type="button" title="${paused ? "继续实时翻译" : "暂停实时翻译"}">
-          <i data-lucide="${paused ? "play" : "pause"}"></i><span>${paused ? "继续" : "暂停"}</span>
-        </button>
-        <button class="shot-btn" id="liveCopySourceBtn" type="button" title="复制原文">
-          <i data-lucide="copy"></i><span>原文</span>
-        </button>
-        <button class="shot-btn" id="liveCopyTargetBtn" type="button" title="复制译文">
-          <i data-lucide="languages"></i><span>译文</span>
-        </button>
-        <button class="shot-btn" id="liveCopyMarkdownBtn" type="button" title="复制 Markdown 译文（公式为 LaTeX）">
-          <i data-lucide="file-code-2"></i><span>MD</span>
-        </button>
-        <button class="shot-btn" id="liveRefreshBtn" type="button" title="刷新实时译文">
-          <i data-lucide="rotate-ccw"></i><span>刷新</span>
-        </button>
-        <button class="shot-btn" id="livePinBtn" type="button" title="${state.livePinned ? "取消置顶" : "置顶"}">
-          <i data-lucide="${state.livePinned ? "pin" : "pin-off"}"></i>
-        </button>
-        <button class="shot-btn shot-more" id="liveMoreBtn" type="button" title="更多功能">
-          <i data-lucide="more-horizontal"></i>
-        </button>
-        <button class="shot-btn shot-close" id="liveCloseBtn" type="button" title="关闭 (Esc)">
-          <i data-lucide="x"></i>
-        </button>
-        ${overlayProgressHtml(progressActive, progress)}
-      </div>
-      <div class="shot-menu-scrim" id="liveMenuScrim" hidden></div>
-      <div class="shot-menu" id="liveMenu" role="menu">
-        <button class="shot-menu-item" type="button" data-target="liveToggleBtn">
-          <i data-lucide="arrow-right-left"></i><span>${showOriginal ? "显示译文" : "显示原文"}</span>
-        </button>
-        <button class="shot-menu-item" type="button" data-target="livePauseBtn">
-          <i data-lucide="${paused ? "play" : "pause"}"></i><span>${paused ? "继续实时翻译" : "暂停实时翻译"}</span>
-        </button>
-        <button class="shot-menu-item" type="button" data-target="liveCopySourceBtn">
-          <i data-lucide="file-text"></i><span>复制原文</span>
-        </button>
-        <button class="shot-menu-item" type="button" data-target="liveCopyTargetBtn">
-          <i data-lucide="languages"></i><span>复制译文</span>
-        </button>
-        <button class="shot-menu-item" type="button" data-target="liveCopyMarkdownBtn">
-          <i data-lucide="file-code-2"></i><span>复制 Markdown 译文</span>
-        </button>
-        <button class="shot-menu-item" type="button" data-target="liveRefreshBtn">
-          <i data-lucide="rotate-ccw"></i><span>刷新实时译文</span>
-        </button>
-        <button class="shot-menu-item" type="button" data-target="livePinBtn">
-          <i data-lucide="${state.livePinned ? "pin-off" : "pin"}"></i><span>${state.livePinned ? "取消置顶" : "置顶"}</span>
-        </button>
-        <button class="shot-menu-item" type="button" data-target="liveCloseBtn">
-          <i data-lucide="x"></i><span>关闭</span>
-        </button>
-      </div>
-      <div class="shot-image-wrap live-area">
-        ${live.image_data_url ? `<img class="shot-image" src="${live.image_data_url}" alt="" draggable="false">` : ""}
-        <div class="shot-blocks">${renderedBlocks}</div>
-        ${
-          live.error
-            ? `<div class="shot-pill is-error" title="${escapeHtml(live.error)}">${escapeHtml(live.error)}</div>`
-            : ""
-        }
-        ${fallback}
-      </div>
-      <div class="shot-frame-border" aria-hidden="true"></div>
-      <div class="shot-edge" data-edge="n"></div>
-      <div class="shot-edge" data-edge="s"></div>
-      <div class="shot-edge" data-edge="e"></div>
-      <div class="shot-edge" data-edge="w"></div>
-      <div class="shot-toast" id="shotToast" aria-live="polite"></div>
-    </div>
-  `
-
+  app.innerHTML = overlayRootHtml({
+    mode: "live",
+    barSide,
+    imageLayout,
+    toolbar: overlayToolbarHtml({
+      mode: "live",
+      view,
+      showOriginal: Boolean(state.liveOriginal),
+      pinned: state.livePinned,
+      paused,
+      actions,
+    }),
+    imageInner,
+  })
   createIcons({ icons, attrs: { "stroke-width": 1.8 } })
 
-  const setPaused = (next) => {
-    if (window.go?.wailsui?.App?.LiveControl) {
-      LiveControl(next ? "pause" : "resume").catch(() => {})
-    }
-    state.live = {
-      ...live,
-      status: next ? "paused" : "listening",
-      stage: "",
-      progress: 0,
-      lines: 0,
-    }
-    renderLive()
-  }
-  document
-    .querySelector("#livePauseBtn")
-    ?.addEventListener("click", () => setPaused(!paused))
-  document.querySelector("#liveToggleBtn")?.addEventListener("click", () => {
-    state.liveOriginal = !state.liveOriginal
-    renderLive()
-  })
-  document
-    .querySelector("#liveCopySourceBtn")
-    ?.addEventListener("click", () => {
-      copyShotText(live.source || sourceJoin(blocks), "已复制原文")
-    })
-  document
-    .querySelector("#liveCopyTargetBtn")
-    ?.addEventListener("click", () => {
-      const text = live.translation || translatedJoin(blocks)
-      copyShotText(text, "已复制译文")
-    })
-  document
-    .querySelector("#liveRefreshBtn")
-    ?.addEventListener("click", () => {
-      if (window.go?.wailsui?.App?.LiveControl) {
-        LiveControl("refresh").catch(() => {})
-        showShotToast("正在刷新实时译文...")
-      }
-    })
-  document
-    .querySelector("#liveCopyMarkdownBtn")
-    ?.addEventListener("click", () =>
-      copyShotText(
-        markdownFromBlocks(blocks, live.translation),
-        "已复制 Markdown 译文",
-      ),
-    )
-  document.querySelector("#livePinBtn")?.addEventListener("click", () => {
-    state.livePinned = !state.livePinned
-    if (window.runtime?.WindowSetAlwaysOnTop) {
-      WindowSetAlwaysOnTop(state.livePinned)
-    }
-    if (window.go?.wailsui?.App?.SetOverlayPinned) {
-      SetOverlayPinned(state.livePinned).catch(() => {})
-    }
-    renderLive()
-  })
-  document
-    .querySelector("#liveCloseBtn")
-    ?.addEventListener("click", closeWindow)
-
-  document.querySelectorAll(".live-block").forEach((node) => {
-    const index = Number(node.dataset.liveIndex)
-    node.addEventListener("click", (event) => {
-      if (event.detail > 1) return
-      if (!state.liveBlockOriginal) state.liveBlockOriginal = new Set()
-      if (state.liveBlockOriginal.has(index)) {
-        state.liveBlockOriginal.delete(index)
-      } else {
-        state.liveBlockOriginal.add(index)
-      }
-      renderLive()
-    })
-    node.addEventListener("dblclick", (event) => {
-      event.preventDefault()
-      const block = blocks[index] || {}
-      copyShotText(block.translation || block.text || "", "已复制该行译文")
-    })
-  })
-  bindShotMenu("liveMoreBtn", "liveMenu", "liveMenuScrim")
+  bindOverlayActions("live", ctx)
+  bindOverlayBlocks("live")
   bindOverlayResize()
   syncOverlayRegion()
-  bindOverlayBarAutoHide(false, status)
 }
 
 function renderResult() {
@@ -2004,10 +2054,14 @@ function renderResult() {
 
 function engineStatusInfo() {
   const ready = Boolean(state.health?.translator_ready)
-  const status = String(state.health?.translator_status || "").trim()
   if (ready) {
     return { label: "引擎就绪", detail: "", state: "ready" }
   }
+  const startupError = String(state.startup_error || "").trim()
+  if (startupError) {
+    return { label: "模型未就绪", detail: startupError, state: "error" }
+  }
+  const status = String(state.health?.translator_status || "").trim()
   if (/失败|error/i.test(status)) {
     return { label: "启动失败", detail: status, state: "error" }
   }
@@ -2020,9 +2074,17 @@ function engineStatusInfo() {
   if (/启动|starting/i.test(status)) {
     return { label: "服务启动中", detail: status, state: "loading" }
   }
+  const startupStatus = String(state.startup_status || "").trim()
+  if (startupStatus && startupStatus !== "模型加载完成") {
+    return {
+      label: "引擎未就绪",
+      detail: startupStatus,
+      state: /未就绪|超时|失败/.test(startupStatus) ? "error" : "loading",
+    }
+  }
   return {
     label: "引擎未就绪",
-    detail: status || "正在启动本地服务...",
+    detail: status || startupStatus || "正在启动本地服务...",
     state: "loading",
   }
 }
@@ -2035,6 +2097,7 @@ function renderEngineBanner(engine) {
       <span class="engine-banner-text" id="engineBannerText">${escapeHtml(
         engine.detail || engine.label,
       )}</span>
+      <button class="engine-banner-action" id="engineBannerSettings" type="button">模型设置</button>
     </div>
   `
 }
@@ -2649,7 +2712,7 @@ function renderGeneralSettings() {
           <div class="section-icon"><i data-lucide="languages"></i></div>
           <div>
             <h2 id="languageHeading">翻译语言</h2>
-            <p>指定原文与译文语言；自动模式按中英互译</p>
+            <p>自动模式：中文译为英文、其它语言译为中文；OCR 内置中英、日、韩识别</p>
           </div>
         </div>
         <div class="language-row">
@@ -2662,7 +2725,7 @@ function renderGeneralSettings() {
           <div class="language-field">
             <label class="field-label" for="targetLanguage">译文语言</label>
             <select class="select-input" id="targetLanguage">
-              ${languageOptions(state.config.target_language, "自动（中英互译）")}
+              ${languageOptions(state.config.target_language, "自动（其它语言→中文）")}
             </select>
           </div>
         </div>
@@ -2826,35 +2889,6 @@ function renderGeneralSettings() {
 
       <div class="section-rule"></div>
 
-      <section class="settings-section" aria-labelledby="downloadHeading">
-        <div class="section-heading">
-          <div class="section-icon"><i data-lucide="network"></i></div>
-          <div>
-            <h2 id="downloadHeading">模型下载源</h2>
-            <p>首次下载翻译模型时使用，默认魔搭（国内推荐）</p>
-          </div>
-        </div>
-        <div class="theme-options" role="radiogroup" aria-labelledby="downloadHeading">
-          ${sourceOption("modelscope", "sparkles", "魔搭")}
-          ${sourceOption("huggingface", "network", "HuggingFace")}
-          ${sourceOption("custom", "sliders", "自定义")}
-        </div>
-        <div id="customSourceField" class="source-field ${(state.config.model_download_source || "modelscope") === "custom" ? "" : "is-disabled"}">
-          <label class="field-label" for="modelDownloadBaseUrl">镜像地址</label>
-          <input
-            class="text-input"
-            id="modelDownloadBaseUrl"
-            type="text"
-            value="${escapeHtml(state.config.model_download_base_url || "")}"
-            placeholder="https://hf-mirror.com"
-            ${(state.config.model_download_source || "modelscope") === "custom" ? "" : "disabled"}
-          />
-          <p class="field-help" id="modelDownloadHelp">可填镜像站点根地址，或完整的 .gguf 文件链接</p>
-        </div>
-      </section>
-
-      <div class="section-rule"></div>
-
       <section class="settings-section" aria-labelledby="serverHeading">
         <div class="section-heading">
           <div class="section-icon"><i data-lucide="network"></i></div>
@@ -2893,7 +2927,9 @@ function formatBytes(bytes) {
 }
 
 function modelSourceLabel(source) {
-  return source === "huggingface" ? "HuggingFace" : "魔搭 ModelScope"
+  if (source === "huggingface") return "HuggingFace"
+  if (source === "custom") return "自定义镜像"
+  return "魔搭 ModelScope"
 }
 
 function modelDisplaySize(entry, status) {
@@ -2983,6 +3019,36 @@ function renderModelsPage() {
     .join("")
 
   return `
+    <section class="settings-section" aria-labelledby="downloadHeading">
+      <div class="section-heading">
+        <div class="section-icon"><i data-lucide="network"></i></div>
+        <div>
+          <h2 id="downloadHeading">模型下载源</h2>
+          <p>首次下载翻译模型时使用，默认魔搭（国内推荐）；切换后立即保存</p>
+        </div>
+      </div>
+      <div class="theme-options" role="radiogroup" aria-labelledby="downloadHeading">
+        ${sourceOption("modelscope", "sparkles", "魔搭")}
+        ${sourceOption("huggingface", "network", "HuggingFace")}
+        ${sourceOption("custom", "sliders", "自定义")}
+      </div>
+      <div id="customSourceField" class="source-field ${(state.config.model_download_source || "modelscope") === "custom" ? "" : "is-disabled"}">
+        <label class="field-label" for="modelDownloadBaseUrl">镜像地址</label>
+        <input
+          class="text-input"
+          id="modelDownloadBaseUrl"
+          type="text"
+          value="${escapeHtml(state.config.model_download_base_url || "")}"
+          placeholder="https://hf-mirror.com"
+          ${(state.config.model_download_source || "modelscope") === "custom" ? "" : "disabled"}
+        />
+        <p class="field-help" id="modelDownloadHelp">可填镜像站点根地址，或完整的 .gguf 文件链接</p>
+      </div>
+      <p class="field-help" id="modelSourceStatus" role="status"></p>
+    </section>
+
+    <div class="section-rule"></div>
+
     <section class="settings-section" aria-labelledby="modelsHeading">
       <div class="section-heading">
         <div class="section-icon"><i data-lucide="cpu"></i></div>
@@ -3111,6 +3177,15 @@ function renderModelSearchPanel() {
 
 function bindModelsPageControls() {
   if (state.settingsTab !== "models") return
+  document.querySelectorAll('input[name="model_download_source"]').forEach((input) => {
+    input.addEventListener("change", () => {
+      toggleCustomSourceField({ currentTarget: input })
+      saveModelSource()
+    })
+  })
+  document
+    .querySelector("#modelDownloadBaseUrl")
+    ?.addEventListener("change", saveModelSource)
   const search = state.modelSearch
   document.querySelector("#modelSearchToggle")?.addEventListener("click", () => {
     search.open = !search.open
@@ -3163,6 +3238,39 @@ function bindModelsPageControls() {
       deleteConfiguredModel(button.dataset.modelDelete),
     )
   })
+}
+
+async function saveModelSource() {
+  const status = document.querySelector("#modelSourceStatus")
+  const source =
+    document.querySelector('input[name="model_download_source"]:checked')?.value ||
+    state.config.model_download_source ||
+    "modelscope"
+  const baseUrl =
+    document.querySelector("#modelDownloadBaseUrl")?.value.trim() ||
+    state.config.model_download_base_url ||
+    ""
+  if (source === "custom" && !baseUrl) {
+    if (status) status.textContent = "请先填写镜像地址"
+    return
+  }
+  const next = {
+    ...state.config,
+    model_download_source: source,
+    model_download_base_url: baseUrl,
+  }
+  try {
+    await SaveConfig(next)
+    state.config = next
+    if (status) {
+      status.textContent = "下载源已保存"
+      setTimeout(() => {
+        if (status.textContent === "下载源已保存") status.textContent = ""
+      }, 1800)
+    }
+  } catch (error) {
+    if (status) status.textContent = `保存失败：${readableError(error)}`
+  }
 }
 
 async function runModelSearch() {
@@ -3846,6 +3954,19 @@ function applyTheme(theme = "system") {
   else WindowSetSystemDefaultTheme()
 }
 
+let overlayThemeTimer = 0
+function startOverlayThemePoll() {
+  clearInterval(overlayThemeTimer)
+  overlayThemeTimer = setInterval(async () => {
+    try {
+      const theme = await window.go?.wailsui?.App?.OverlayTheme?.()
+      if (theme && theme !== activeTheme) applyTheme(theme)
+    } catch {
+      // The daemon may be shutting down; keep the current theme.
+    }
+  }, 1200)
+}
+
 function bindHotkeyInput(input) {
   if (!input) return
   input.addEventListener("focus", () => {
@@ -3939,9 +4060,13 @@ async function saveSettings() {
   const aiThreads = Number(document.querySelector("#aiThreads")?.value)
   const downloadSource =
     document.querySelector('input[name="model_download_source"]:checked')
-      ?.value || "modelscope"
+      ?.value ||
+    state.config.model_download_source ||
+    "modelscope"
   const downloadBaseUrl =
-    document.querySelector("#modelDownloadBaseUrl")?.value.trim() || ""
+    document.querySelector("#modelDownloadBaseUrl")?.value.trim() ||
+    state.config.model_download_base_url ||
+    ""
   const sourceLanguage =
     document.querySelector("#sourceLanguage")?.value || "auto"
   const targetLanguage =
@@ -4155,26 +4280,32 @@ async function refreshHealth() {
   try {
     const next = await State()
     state.health = next.health
+    state.startup_error = next.startup_error || ""
+    state.startup_status = next.startup_status || state.startup_status
     const engine = engineStatusInfo()
-    if (engine.state === "ready") clearInterval(healthTimer)
-    const node = document.querySelector("#engineState")
-    const text = document.querySelector("#engineText")
-    if (!node || !text) return
+    updateEngineIndicators()
+  } catch {
+    // The next interval retries
+  }
+}
+
+function updateEngineIndicators() {
+  const engine = engineStatusInfo()
+  const node = document.querySelector("#engineState")
+  const text = document.querySelector("#engineText")
+  if (node && text) {
     node.classList.toggle("is-ready", engine.state === "ready")
     node.classList.toggle("is-loading", engine.state === "loading")
     node.classList.toggle("is-error", engine.state === "error")
     node.title = engine.detail || "AI 引擎状态"
     text.textContent = engine.label
-
-    const banner = document.querySelector("#engineBanner")
-    if (banner) {
-      banner.style.display = engine.state === "ready" ? "none" : "flex"
-      banner.classList.toggle("is-error", engine.state === "error")
-      const bannerText = document.querySelector("#engineBannerText")
-      if (bannerText) bannerText.textContent = engine.detail || engine.label
-    }
-  } catch {
-    // The next interval retries
+  }
+  const banner = document.querySelector("#engineBanner")
+  if (banner) {
+    banner.style.display = engine.state === "ready" ? "none" : "flex"
+    banner.classList.toggle("is-error", engine.state === "error")
+    const bannerText = document.querySelector("#engineBannerText")
+    if (bannerText) bannerText.textContent = engine.detail || engine.label
   }
 }
 
@@ -4297,10 +4428,12 @@ function handleWindowKeydown(event) {
     ) {
       event.preventDefault()
       const overlay = state.overlay || {}
-      const text = state.overlayOriginal
-        ? overlay.source || ""
-        : overlay.translation || translatedJoin(overlay.blocks)
-      copyShotText(text, "已复制")
+      copyCurrentOverlayText({
+        showOriginal: Boolean(state.overlayOriginal),
+        source: overlay.source || sourceJoin(overlay.blocks),
+        translation: overlay.translation || translatedJoin(overlay.blocks),
+        markdownText: markdownFromBlocks(overlay.blocks, overlay.translation),
+      })
     }
   }
 
@@ -4319,10 +4452,12 @@ function handleWindowKeydown(event) {
     ) {
       event.preventDefault()
       const live = state.live || {}
-      const text = state.liveOriginal
-        ? live.source || ""
-        : live.translation || translatedJoin(live.blocks)
-      copyShotText(text, "已复制")
+      copyCurrentOverlayText({
+        showOriginal: Boolean(state.liveOriginal),
+        source: live.source || sourceJoin(live.blocks),
+        translation: live.translation || translatedJoin(live.blocks),
+        markdownText: markdownFromBlocks(live.blocks, live.translation),
+      })
     }
   }
 }

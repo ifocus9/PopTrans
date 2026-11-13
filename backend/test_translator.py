@@ -36,12 +36,18 @@ class TranslatorLanguageTests(unittest.TestCase):
         self.translator._model = FakeModel()
 
     def test_normalizes_language_codes_names_and_locales(self):
-        self.assertEqual(normalize_target_language("vi"), "vi")
-        self.assertEqual(normalize_target_language("vi-VN"), "vi")
-        self.assertEqual(normalize_target_language("越南语"), "vi")
-        self.assertEqual(normalize_target_language("Vietnamese"), "vi")
-        self.assertEqual(normalize_target_language("zh-Hant"), "zh-hant")
+        self.assertEqual(normalize_target_language("ja"), "ja")
+        self.assertEqual(normalize_target_language("ja-JP"), "ja")
+        self.assertEqual(normalize_target_language("日语"), "ja")
+        self.assertEqual(normalize_target_language("Japanese"), "ja")
+        self.assertEqual(normalize_target_language("ko"), "ko")
+        self.assertEqual(normalize_target_language("zh_CN"), "zh")
         self.assertIsNone(normalize_target_language(None))
+
+    def test_rejects_languages_outside_the_shipped_ocr_coverage(self):
+        for value in ("vi", "zh-Hant", "fr", "yue"):
+            with self.assertRaises(ValueError):
+                normalize_target_language(value)
 
     def test_auto_language_is_treated_as_automatic(self):
         self.assertIsNone(normalize_target_language("auto"))
@@ -75,25 +81,48 @@ class TranslatorLanguageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "不支持的目标语言"):
             normalize_target_language("unknown")
 
-    def test_translates_to_explicit_vietnamese(self):
-        result, error = self.translator.translate("你好", "vi")
+    def test_auto_target_treats_japanese_as_non_chinese(self):
+        result, error = self.translator.translate("これは日本語の文章です。")
+        self.assertIsNone(error)
+        self.assertIsNotNone(result)
+        prompt = self.translator._model.prompts[0]
+        self.assertIn("Chinese", prompt)
+        self.assertNotIn("into English", prompt)
+
+    def test_auto_target_treats_korean_as_non_chinese(self):
+        result, error = self.translator.translate("이것은 한국어 문장입니다.")
+        self.assertIsNone(error)
+        self.assertIsNotNone(result)
+        prompt = self.translator._model.prompts[0]
+        self.assertIn("Chinese", prompt)
+        self.assertNotIn("into English", prompt)
+
+    def test_translate_lines_auto_target_for_japanese(self):
+        results, error = self.translator.translate_lines(["これは行です。"])
+        self.assertIsNone(error)
+        self.assertEqual(len(results), 1)
+        prompt = self.translator._model.prompts[0]
+        self.assertIn("Chinese", prompt)
+
+    def test_translates_to_explicit_japanese(self):
+        result, error = self.translator.translate("你好", "ja")
 
         self.assertIsNone(error)
         self.assertEqual(result, "result-1")
-        self.assertIn("into Vietnamese", self.translator._model.prompts[0])
+        self.assertIn("into Japanese", self.translator._model.prompts[0])
         self.assertTrue(self.translator._model.prompts[0].endswith("\n\n你好"))
 
     def test_builds_official_prompt_with_full_language_name(self):
-        prompt = build_translation_prompt("vi", "欢迎使用")
+        prompt = build_translation_prompt("ja", "欢迎使用")
 
-        self.assertIn("into Vietnamese", prompt)
-        self.assertNotIn("vi", prompt)
+        self.assertIn("into Japanese", prompt)
+        self.assertNotIn("into ja", prompt)
         self.assertTrue(prompt.endswith("\n\n欢迎使用"))
 
     def test_cache_is_isolated_by_target_language(self):
-        first, _ = self.translator.translate("你好", "vi")
+        first, _ = self.translator.translate("你好", "ja")
         second, _ = self.translator.translate("你好", "en")
-        cached, _ = self.translator.translate("你好", "vi")
+        cached, _ = self.translator.translate("你好", "ja")
 
         self.assertEqual(first, "result-1")
         self.assertEqual(second, "result-2")
@@ -109,7 +138,7 @@ class TranslatorLanguageTests(unittest.TestCase):
     def test_long_text_is_chunked_and_joined(self):
         long_text = "这是一段用于验证长文分块翻译的中文文本。" * 200
 
-        result, error = self.translator.translate(long_text, "vi")
+        result, error = self.translator.translate(long_text, "ja")
 
         self.assertIsNone(error)
         self.assertGreater(len(self.translator._model.prompts), 1)
@@ -119,7 +148,7 @@ class TranslatorLanguageTests(unittest.TestCase):
         self.assertEqual(result, expected)
 
     def test_short_text_stays_single_inference(self):
-        result, error = self.translator.translate("你好世界", "vi")
+        result, error = self.translator.translate("你好世界", "ja")
 
         self.assertIsNone(error)
         self.assertEqual(len(self.translator._model.prompts), 1)

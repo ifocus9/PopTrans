@@ -57,6 +57,11 @@ func (c *Client) ShowLive(ctx context.Context, payload LivePayload) error {
 	return c.do(ctx, http.MethodPost, EndpointShowLive, payload, nil)
 }
 
+// SetCaptureGuard briefly excludes or re-allows the overlay in screen capture.
+func (c *Client) SetCaptureGuard(ctx context.Context, exclude bool) error {
+	return c.do(ctx, http.MethodPost, EndpointCaptureGuard, CaptureGuardPayload{Exclude: exclude}, nil)
+}
+
 func (c *Client) Hide(ctx context.Context) error {
 	return c.do(ctx, http.MethodPost, EndpointHide, map[string]any{}, nil)
 }

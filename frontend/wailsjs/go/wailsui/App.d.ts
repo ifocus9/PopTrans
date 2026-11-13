@@ -26,6 +26,8 @@ export function OnConfigSaved():Promise<void>;
 
 export function OnHidden():Promise<void>;
 
+export function OverlayTheme():Promise<string>;
+
 export function Quit():Promise<void>;
 
 export function RefreshOverlay():Promise<void>;
@@ -36,8 +38,6 @@ export function SearchModels(arg1:string,arg2:string):Promise<Array<wailsui.Mode
 
 export function SetHotkeyRecording(arg1:boolean):Promise<void>;
 
-export function SetOverlayMenu(arg1:boolean):Promise<void>;
-
 export function SetOverlayPinned(arg1:boolean):Promise<void>;
 
 export function SetOverlayRegion(arg1:string):Promise<void>;
@@ -47,6 +47,8 @@ export function SetOverlayWindowRect(arg1:number,arg2:number,arg3:number,arg4:nu
 export function ShowLive(arg1:uidaemon.LivePayload):Promise<void>;
 
 export function ShowOverlay(arg1:uidaemon.OverlayPayload):Promise<void>;
+
+export function ShowOverlayMenu(arg1:Array<wailsui.OverlayMenuItem>,arg2:number,arg3:number,arg4:boolean):Promise<number>;
 
 export function ShowResult(arg1:uidaemon.ResultPayload):Promise<void>;
 

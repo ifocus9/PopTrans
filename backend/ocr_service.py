@@ -21,6 +21,8 @@ _DEDUP_CHAR_ASPECT_RATIO = 1.25
 
 _KOREAN_REC_MODEL = "korean_PP-OCRv3_rec_infer.onnx"
 _KOREAN_REC_DICT = "korean_dict.txt"
+_JAPANESE_REC_MODEL = "japanese_PP-OCRv3_rec_infer.onnx"
+_JAPANESE_REC_DICT = "japanese_dict.txt"
 
 
 def _is_korean_language(value) -> bool:
@@ -28,7 +30,39 @@ def _is_korean_language(value) -> bool:
     if not value:
         return False
     text = str(value).strip().lower()
-    return text.startswith("ko") or text in ("korean", "한국어", "韩语", "韓語")
+    return text.split("-", 1)[0] in ("ko", "kor") or text in (
+        "korean",
+        "한국어",
+        "韩语",
+        "韓語",
+    )
+
+
+def _is_japanese_language(value) -> bool:
+    """True for Japanese language codes/names used by the settings UI."""
+    if not value:
+        return False
+    text = str(value).strip().lower()
+    return text.split("-", 1)[0] in ("ja", "jpn") or text in (
+        "japanese",
+        "日本語",
+        "日语",
+        "日語",
+    )
+
+
+def _contains_kana(text: str) -> bool:
+    return any(
+        "\u3040" <= char <= "\u30ff" or "\u31f0" <= char <= "\u31ff"
+        for char in str(text or "")
+    )
+
+
+def _contains_hangul(text: str) -> bool:
+    return any(
+        "\uac00" <= char <= "\ud7af" or "\u1100" <= char <= "\u11ff"
+        for char in str(text or "")
+    )
 
 
 def _meaningful_text_ratio(text: str) -> float:
@@ -52,6 +86,7 @@ class OCRService:
     def __init__(self):
         self._engine = None
         self._korean_engine = None
+        self._japanese_engine = None
         self._loading_lock = threading.Lock()
         # RapidOCR/ONNX sessions are not re-entrant; the API runs endpoints in
         # the threadpool, so guard the actual recognition calls.
@@ -60,7 +95,11 @@ class OCRService:
     def is_loaded(self) -> bool:
         """OCR 模型是否已加载"""
         with self._loading_lock:
-            return self._engine is not None or self._korean_engine is not None
+            return (
+                self._engine is not None
+                or self._korean_engine is not None
+                or self._japanese_engine is not None
+            )
 
     def release(self) -> None:
         """释放 OCR 模型，回收内存"""
@@ -71,20 +110,44 @@ class OCRService:
             if self._korean_engine is not None:
                 self._korean_engine = None
                 logger.info("韩语 OCR 模型已释放")
+            if self._japanese_engine is not None:
+                self._japanese_engine = None
+                logger.info("日语 OCR 模型已释放")
+
+    @staticmethod
+    def _model_files(kind: str):
+        if kind == "korean":
+            return _KOREAN_REC_MODEL, _KOREAN_REC_DICT
+        if kind == "japanese":
+            return _JAPANESE_REC_MODEL, _JAPANESE_REC_DICT
+        return None
+
+    def _language_engine_available(self, kind: str) -> bool:
+        files = self._model_files(kind)
+        if files is None:
+            return False
+        model_dir = application_dir() / "models" / "rapidocr"
+        return all((model_dir / name).is_file() for name in files)
 
     def _korean_available(self) -> bool:
-        model_dir = application_dir() / "models" / "rapidocr"
-        return (model_dir / _KOREAN_REC_MODEL).is_file() and (
-            model_dir / _KOREAN_REC_DICT
-        ).is_file()
+        return self._language_engine_available("korean")
+
+    def _japanese_available(self) -> bool:
+        return self._language_engine_available("japanese")
 
     def _ensure_engine(self, kind: str = "default"):
-        """懒加载 RapidOCR（默认中英或韩语识别模型）"""
+        """懒加载 RapidOCR（默认中英、韩语或日语识别模型）"""
         with self._loading_lock:
-            attr = "_korean_engine" if kind == "korean" else "_engine"
+            if kind == "korean":
+                attr = "_korean_engine"
+            elif kind == "japanese":
+                attr = "_japanese_engine"
+            else:
+                attr = "_engine"
             engine = getattr(self, attr)
             if engine is None:
-                label = "韩语" if kind == "korean" else "默认"
+                labels = {"korean": "韩语", "japanese": "日语"}
+                label = labels.get(kind, "默认")
                 logger.info("首次加载 RapidOCR %s 模型...", label)
                 from rapidocr_onnxruntime import RapidOCR
 
@@ -116,6 +179,9 @@ class OCRService:
         if kind == "korean":
             rec_path = model_dir / _KOREAN_REC_MODEL
             keys_path = model_dir / _KOREAN_REC_DICT
+        elif kind == "japanese":
+            rec_path = model_dir / _JAPANESE_REC_MODEL
+            keys_path = model_dir / _JAPANESE_REC_DICT
         else:
             rec_path = model_dir / "ch_PP-OCRv4_rec_infer.onnx"
             keys_path = None
@@ -379,13 +445,56 @@ class OCRService:
             "line_height": round((normal_max - normal_min) / scale, 1),
         }
 
-    def _korean_fallback(self, img, allow_retry, use_korean):
-        """Try the Korean recognizer when the default model found no text."""
-        if use_korean or not self._korean_available():
+    def _language_fallback(self, img, allow_retry, use_korean, use_japanese, text="", average_score=0.0):
+        """Try other bundled recognizers when the default result is unusable.
+
+        Candidates are picked from the recognized script first, so Japanese and
+        Korean images do not need a manual source-language setting. When the
+        default model returns nothing at all, both bundled recognizers are tried
+        and the better result wins.
+        """
+        if use_korean or use_japanese:
+            # An explicit source language owns the result; never bounce between
+            # recognizers (that would recurse when neither finds text).
             return None
-        logger.info("OCR 默认模型无结果，改用韩语识别模型")
-        korean = self.recognize_image(img, allow_retry, source_lang="ko")
-        return korean if korean.get("text") else None
+        candidates = []
+        if _contains_kana(text) and not use_japanese and self._japanese_available():
+            candidates.append("japanese")
+        if _contains_hangul(text) and not use_korean and self._korean_available():
+            candidates.append("korean")
+        if not candidates:
+            if not use_korean and self._korean_available():
+                candidates.append("korean")
+            if not use_japanese and self._japanese_available():
+                candidates.append("japanese")
+
+        best = None
+        best_quality = 0.0
+        for kind in candidates:
+            language = "ko" if kind == "korean" else "ja"
+            logger.info("OCR 默认结果不足，尝试%s识别模型", "韩语" if kind == "korean" else "日语")
+            result = self.recognize_image(img, allow_retry, source_lang=language)
+            if not result.get("text"):
+                continue
+            boxes = result.get("line_boxes") or []
+            model_score = (
+                sum(box.get("score", 0.0) for box in boxes) / len(boxes)
+                if boxes
+                else 0.0
+            )
+            quality = model_score + 0.2 * _meaningful_text_ratio(result.get("text"))
+            if quality > best_quality:
+                best = result
+                best_quality = quality
+
+        if best is None:
+            return None
+        if not text:
+            return best
+        kana_or_hangul = _contains_kana(text) or _contains_hangul(text)
+        if kana_or_hangul or best_quality > average_score + 0.05:
+            return best
+        return None
 
     def recognize_image(
         self,
@@ -406,12 +515,20 @@ class OCRService:
         continuously, so re-recognizing every frame at a larger scale doubles the
         cost for content the next frame will refresh anyway.
 
-        source_lang="ko" selects the Korean recognition model. In auto mode the
-        default model runs first; if it finds nothing (or only low-confidence
-        text), the Korean model is tried and returned when it does better.
+        source_lang selects a bundled recognizer: Chinese/English (default),
+        Korean or Japanese. In auto mode the default model runs first; if it
+        finds nothing or only low-confidence text, the other recognizers are
+        tried and the best result is returned.
         """
         use_korean = _is_korean_language(source_lang) and self._korean_available()
-        engine = self._ensure_engine("korean" if use_korean else "default")
+        use_japanese = _is_japanese_language(source_lang) and self._japanese_available()
+        if use_korean:
+            engine_kind = "korean"
+        elif use_japanese:
+            engine_kind = "japanese"
+        else:
+            engine_kind = "default"
+        engine = self._ensure_engine(engine_kind)
 
         primary_img, primary_scale = self._preprocess_image(img)
         logger.info(
@@ -443,9 +560,11 @@ class OCRService:
                 logger.info("OCR 回退放弃: 保留 %.1fx 首轮结果", primary_scale)
 
         if not merged:
-            korean = self._korean_fallback(img, allow_retry, use_korean)
-            if korean is not None:
-                return korean
+            fallback = self._language_fallback(
+                img, allow_retry, use_korean, use_japanese
+            )
+            if fallback is not None:
+                return fallback
             return {
                 "text": "",
                 "lines": [],
@@ -475,9 +594,11 @@ class OCRService:
             )
 
         if not raw_boxes:
-            korean = self._korean_fallback(img, allow_retry, use_korean)
-            if korean is not None:
-                return korean
+            fallback = self._language_fallback(
+                img, allow_retry, use_korean, use_japanese
+            )
+            if fallback is not None:
+                return fallback
             return {
                 "text": "",
                 "lines": [],
@@ -552,28 +673,31 @@ class OCRService:
             "image_width": img.size[0],
             "image_height": img.size[1],
         }
-        if not use_korean and self._korean_available():
+        if not use_korean and not use_japanese:
             boxes = result["line_boxes"]
             average_score = (
                 sum(box["score"] for box in boxes) / len(boxes) if boxes else 0.0
             )
-            if not text or (boxes and average_score < 0.6) or (
-                _meaningful_text_ratio(text) < 0.5
+            if (
+                not text
+                or (boxes and average_score < 0.6)
+                or _meaningful_text_ratio(text) < 0.5
+                or _contains_kana(text)
+                or _contains_hangul(text)
             ):
                 logger.info(
-                    "OCR 默认模型结果不足（len=%d score=%.2f），尝试韩语识别模型",
+                    "OCR 默认模型结果不足（len=%d score=%.2f），尝试其它语言模型",
                     len(text),
                     average_score,
                 )
-                korean = self.recognize_image(img, allow_retry, source_lang="ko")
-                korean_boxes = korean.get("line_boxes") or []
-                korean_score = (
-                    sum(box["score"] for box in korean_boxes) / len(korean_boxes)
-                    if korean_boxes
-                    else 0.0
+                fallback = self._language_fallback(
+                    img,
+                    allow_retry,
+                    use_korean,
+                    use_japanese,
+                    text=text,
+                    average_score=average_score,
                 )
-                if korean.get("text") and (
-                    not text or korean_score > average_score
-                ):
-                    return korean
+                if fallback is not None:
+                    return fallback
         return result

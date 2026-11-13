@@ -21,6 +21,10 @@ const (
 	EndpointShutdown      = "/shutdown"
 	EndpointNotifyHidden  = "/notify/hidden"
 	EndpointNotifyConfig  = "/notify/config-saved"
+	// EndpointCaptureGuard briefly excludes the overlay from screen capture while
+	// the host grabs a live frame. Outside that window the overlay is capturable
+	// by Snipping Tool and other screenshot apps.
+	EndpointCaptureGuard = "/overlay/capture-guard"
 
 	// Callback endpoints posted by the UI process back to the host.
 	EndpointNotifyHotkeyHold      = "/notify/hotkey-hold"
@@ -66,6 +70,12 @@ type ConfigSavedPayload struct {
 // is recording a new combination.
 type HotkeyHoldPayload struct {
 	Paused bool `json:"paused"`
+}
+
+// CaptureGuardPayload toggles the overlay's screen-capture exclusion for the
+// few milliseconds the host needs to grab a frame behind it.
+type CaptureGuardPayload struct {
+	Exclude bool `json:"exclude"`
 }
 
 // LiveControlPayload tells the host live-translation loop what to do.
@@ -152,6 +162,9 @@ type OverlayPayload struct {
 	Lines    int    `json:"lines,omitempty"`
 	// LatencyMs is the OCR+translation round-trip for this screenshot.
 	LatencyMs int64 `json:"latency_ms"`
+	// Theme is the persisted light/dark/system setting, so an overlay process
+	// that outlives the settings change repaints with the current theme.
+	Theme string `json:"theme,omitempty"`
 }
 
 // LivePayload updates the floating live-translation panel.
@@ -178,6 +191,8 @@ type LivePayload struct {
 	Lines    int    `json:"lines,omitempty"`
 	// LatencyMs is the OCR+translation round-trip for this live update.
 	LatencyMs int64 `json:"latency_ms"`
+	// Theme mirrors OverlayPayload.Theme.
+	Theme string `json:"theme,omitempty"`
 }
 
 func EndpointPath(baseDir string) string {

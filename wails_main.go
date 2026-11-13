@@ -60,20 +60,30 @@ func main() {
 		// and click-through without acrylic blur or layered-color-key limits.
 		background = &options.RGBA{R: 0, G: 0, B: 0, A: 255}
 		windowsOptions = &wailswindows.Options{
-			Theme:                winTheme,
-			WebviewIsTransparent: true,
-			WindowIsTranslucent:  false,
-			BackdropType:         wailswindows.None,
+			Theme:                             winTheme,
+			WebviewIsTransparent:              true,
+			WindowIsTranslucent:               false,
+			BackdropType:                      wailswindows.None,
+			DisableFramelessWindowDecorations: true,
 		}
 	}
 	app := wailsui.NewApp(baseDir, launch)
+
+	// The workbench needs a usable minimum; screenshot/live overlays must be
+	// allowed to match a selection smaller than that. The runtime minimum is
+	// switched per overlay mode (screenshot 56x1, live 120x48) in WM_GETMINMAXINFO;
+	// this value is only the initial floor.
+	minWidth, minHeight := 420, 560
+	if overlayMode {
+		minWidth, minHeight = 56, 1
+	}
 
 	err = wails.Run(&options.App{
 		Title:         windowTitle,
 		Width:         520,
 		Height:        720,
-		MinWidth:      420,
-		MinHeight:     560,
+		MinWidth:      minWidth,
+		MinHeight:     minHeight,
 		StartHidden:   true,
 		DisableResize: overlayMode,
 		Frameless:     true,

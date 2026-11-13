@@ -61,8 +61,6 @@ const (
 var (
 	currentApp  *App
 	mainWndProc = syscall.NewCallback(mainWindowProc)
-
-	errOCREmptyResult = errors.New("OCR 未识别到文本")
 )
 
 type App struct {
@@ -99,16 +97,17 @@ type App struct {
 	shotMu    sync.Mutex
 	shotFrame *shotFrame
 
-	liveMu        sync.Mutex
-	liveCancel    context.CancelFunc
-	livePaused    bool
-	liveActive    bool
-	liveDragging  bool
-	liveDragEpoch int
-	liveRefresh   chan struct{}
-	liveLast      uidaemon.LivePayload
-	liveRect      win.Rect
-	liveBarSide   string
+	liveMu         sync.Mutex
+	liveCancel     context.CancelFunc
+	livePaused     bool
+	liveActive     bool
+	liveDragging   bool
+	liveDragEpoch  int
+	liveRefresh    chan struct{}
+	liveLast       uidaemon.LivePayload
+	liveRect       win.Rect
+	liveBarSide    string
+	liveExtraWidth int32
 
 	backendIdleMu      sync.Mutex
 	backendIdleUsers   int
@@ -550,6 +549,14 @@ func (a *App) handleOCRSelection(rect win.Rect) {
 		defer a.finishBusy()
 
 		time.Sleep(80 * time.Millisecond)
+		// A previous screenshot/live overlay may still be visible. It is now
+		// capturable (so users can screenshot the result), which means it must be
+		// hidden before grabbing the new selection or its chips would be baked
+		// into the new frame.
+		if hwnd := win.FindWindowByTitle(overlayWindowTitle); hwnd != 0 && win.IsWindowVisible(hwnd) {
+			win.ShowWindow(hwnd, win.SWHide)
+			time.Sleep(35 * time.Millisecond)
+		}
 		pngBytes, err := win.CaptureScreenPNG(rect)
 		if err != nil {
 			log.Printf("app ocr screen capture failed: %v", err)
@@ -577,6 +584,7 @@ func (a *App) handleOCRSelection(rect win.Rect) {
 			Loading:      true,
 			Stage:        "ocr",
 			Progress:     15,
+			Theme:        a.uiTheme(),
 		}
 		a.storeShotFrame(basePayload, pngBytes)
 		showCtx, showCancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -617,6 +625,7 @@ func (a *App) handleOCRSelection(rect win.Rect) {
 				return callErr
 			}
 
+			ocr.LineBoxes = groupOCRLines(ocr.LineBoxes)
 			lines = len(ocr.LineBoxes)
 			a.updateOverlayProgress(seq, basePayload, "translate", 55, lines)
 			var callErr error
@@ -698,6 +707,7 @@ func (a *App) overlayPayloadFromResult(
 		Source:       strings.TrimSpace(result.SourceText),
 		Translation:  strings.TrimSpace(result.Translation),
 		Style:        base.Style,
+		Theme:        base.Theme,
 	}
 	for index, block := range result.Blocks {
 		translated := toTranslatedBlock(block)
@@ -745,9 +755,12 @@ func (a *App) overlayResultPayload(
 		update.Stage = "error"
 		update.Progress = 0
 	case update.Source == "":
-		update.Error = errOCREmptyResult.Error()
-		update.Stage = "error"
-		update.Progress = 0
+		// A blank capture is not an error: let the toolbar say "no text was
+		// recognized" instead of drawing an error pill over the frame.
+		update.Stage = "done"
+		update.Progress = 100
+		update.Lines = 0
+		update.Error = ""
 	default:
 		update.Stage = "done"
 		update.Progress = 100
@@ -777,7 +790,7 @@ func (a *App) ocrTranslateFrame(ctx context.Context, pngBytes []byte) (backend.O
 	}
 	text = strings.TrimSpace(text)
 	if text == "" {
-		return backend.OCRTranslateBlocksResult{}, errOCREmptyResult
+		return backend.OCRTranslateBlocksResult{}, nil
 	}
 	translation, translateErr := a.client.TranslateWithLanguages(
 		ctx, text, a.cfg.SourceLanguage, a.cfg.TargetLanguage,
@@ -950,6 +963,7 @@ func (a *App) refreshScreenshot() {
 			case ocrErr != nil:
 				return ocrErr
 			default:
+				ocr.LineBoxes = groupOCRLines(ocr.LineBoxes)
 				a.updateOverlayProgress(seq, base, "translate", 55, len(ocr.LineBoxes))
 				var err error
 				result, err = a.translateOCRResult(callCtx, ocr, true)
@@ -1035,6 +1049,15 @@ func (a *App) overlayStyle() uidaemon.OverlayStyle {
 	}
 }
 
+func (a *App) uiTheme() string {
+	switch a.cfg.Theme {
+	case "light", "dark":
+		return a.cfg.Theme
+	default:
+		return "system"
+	}
+}
+
 func (a *App) prewarmOverlayUI() {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -1056,6 +1079,7 @@ func (a *App) startLiveSession(rect win.Rect) {
 		Status:     "translating",
 		Stage:      "ocr",
 		Progress:   10,
+		Theme:      a.uiTheme(),
 	}
 	a.liveMu.Lock()
 	a.liveCancel = cancel
@@ -1068,6 +1092,7 @@ func (a *App) startLiveSession(rect win.Rect) {
 	a.liveLast = initial
 	a.liveRect = rect
 	a.liveBarSide = barSide
+	a.liveExtraWidth = int32(windowRect.Width) - rect.Width()
 	a.liveMu.Unlock()
 
 	a.setStatus("实时翻译监听中")
@@ -1123,19 +1148,25 @@ func (a *App) liveLoop(ctx context.Context, rect win.Rect, refresh <-chan struct
 		}
 
 		startedAt := time.Now()
-		// The overlay is excluded from capture (SetWindowDisplayAffinity), so it
-		// can stay visible while we grab the screen. Only fall back to hiding it
-		// when affinity is unavailable; hide/show flickers visibly.
-		overlayWindow := win.FindWindowByTitle(overlayWindowTitle)
-		captureExcluded := overlayWindow != 0 && win.WindowCaptureExcluded(overlayWindow)
-		if overlayWindow != 0 && !captureExcluded {
-			win.ShowWindow(overlayWindow, win.SWHide)
-			time.Sleep(30 * time.Millisecond)
+		// The live panel is normally capturable, so Snipping Tool and other apps
+		// can screenshot it at any time. Exclude it only for the few milliseconds
+		// of the host's own frame grab; otherwise the panel's translated text would
+		// be fed back into OCR. Toggling display affinity does not repaint the
+		// window, so there is no visible flicker.
+		guardCtx, guardCancel := context.WithTimeout(ctx, 800*time.Millisecond)
+		guardErr := a.overlayUI.SetCaptureGuard(guardCtx, true)
+		guardCancel()
+		if guardErr != nil {
+			log.Printf("app live capture guard failed: %v", guardErr)
+			time.Sleep(200 * time.Millisecond)
+			continue
 		}
 		pngBytes, fingerprint, err := win.CaptureScreenFrame(captureRect)
-		if overlayWindow != 0 && !captureExcluded {
-			win.ShowWindow(overlayWindow, win.SWShowNoActivate)
+		restoreCtx, restoreCancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+		if restoreErr := a.overlayUI.SetCaptureGuard(restoreCtx, false); restoreErr != nil {
+			log.Printf("app live capture guard restore failed: %v", restoreErr)
 		}
+		restoreCancel()
 		if err != nil {
 			log.Printf("app live capture failed: %v", err)
 			continue
@@ -1163,8 +1194,24 @@ func (a *App) liveLoop(ctx context.Context, rect win.Rect, refresh <-chan struct
 		case ocrErr != nil:
 			callErr = ocrErr
 		default:
-			a.pushLiveProgress("translate", 55, len(ocr.LineBoxes))
-			result, callErr = a.translateOCRResult(reqCtx, ocr, force)
+			ocr.LineBoxes = groupOCRLines(ocr.LineBoxes)
+			total := len(ocr.LineBoxes)
+			a.pushLiveProgress("translate", 55, total)
+			// Progressive: publish translated lines as each batch returns, so
+			// large pages never sit at a fixed 60% until everything finishes.
+			result, callErr = a.translateOCRProgressive(reqCtx, ocr, force,
+				func(partial backend.OCRTranslateBlocksResult, done, batchTotal int) {
+					if ctx.Err() != nil || a.liveEpoch() != epoch {
+						return
+					}
+					payload := a.livePayloadFrom(captureRect, windowRect, barSide, pngBytes, partial, nil)
+					payload.Status = "translating"
+					payload.Stage = "translate"
+					payload.Progress = progressForBatches(done, batchTotal)
+					payload.Lines = batchTotal
+					a.pushLive(payload)
+				})
+			a.pushLiveProgress("translate", 95, total)
 		}
 		cancel()
 		if ctx.Err() != nil {
@@ -1348,12 +1395,14 @@ func (a *App) translateOCRProgressive(
 }
 
 // currentLiveGeometry derives the monitored image area from the live window's
-// current screen geometry. Dragging or resizing the window therefore changes
-// the capture region immediately.
+// current screen geometry. The window contains the image plus a toolbar strip,
+// so the strip is removed from the capture rectangle. Dragging or resizing the
+// window therefore changes the capture region immediately.
 func (a *App) currentLiveGeometry() (win.Rect, win.Rect, string, bool) {
 	a.liveMu.Lock()
 	base := a.liveRect
 	side := a.liveBarSide
+	extra := a.liveExtraWidth
 	a.liveMu.Unlock()
 
 	if base.Width() <= 0 || base.Height() <= 0 {
@@ -1368,9 +1417,46 @@ func (a *App) currentLiveGeometry() (win.Rect, win.Rect, string, bool) {
 		return base, win.Rect{}, side, false
 	}
 
-	// The toolbar lives inside the window, so the capture area is the whole
-	// window rectangle (the overlay itself is excluded from capture).
-	return window, window, "top", true
+	dpi := win.DpiForRect(window)
+	if dpi == 0 {
+		dpi = 96
+	}
+	scale := float64(dpi) / 96.0
+	barPx := int32(math.Round(frameBarDip * scale))
+
+	capture, ok := liveCaptureRect(window, side, extra, barPx)
+	if !ok {
+		return base, window, side, false
+	}
+	return capture, window, side, true
+}
+
+// liveCaptureRect removes the toolbar strip and the optional side gutter (used
+// when a narrow image needs a wider toolbar) from the live window rectangle.
+func liveCaptureRect(window win.Rect, side string, extra, barPx int32) (win.Rect, bool) {
+	if window.Width() <= 0 || window.Height() <= 0 {
+		return win.Rect{}, false
+	}
+	if extra < 0 || extra >= window.Width() {
+		extra = 0
+	}
+	width := window.Width() - extra
+	left := window.Left + extra/2
+	capture := win.Rect{
+		Left:   left,
+		Top:    window.Top,
+		Right:  left + width,
+		Bottom: window.Bottom,
+	}
+	if side == "bottom" {
+		capture.Bottom -= barPx
+	} else {
+		capture.Top += barPx
+	}
+	if capture.Width() <= 0 || capture.Height() <= 0 {
+		return win.Rect{}, false
+	}
+	return capture, true
 }
 
 func (a *App) livePayloadFrom(anchor win.Rect, window win.Rect, barSide string, pngBytes []byte, result backend.OCRTranslateBlocksResult, err error) uidaemon.LivePayload {
@@ -1401,6 +1487,7 @@ func (a *App) livePayloadFrom(anchor win.Rect, window win.Rect, barSide string, 
 		Translation:  strings.TrimSpace(result.Translation),
 		Status:       "listening",
 		Style:        a.overlayStyle(),
+		Theme:        a.uiTheme(),
 	}
 	for _, block := range result.Blocks {
 		payload.Blocks = append(payload.Blocks, toTranslatedBlock(block))
@@ -1432,6 +1519,11 @@ func clipBlockOverlaps(blocks []uidaemon.TranslatedBlock) {
 	for index := range blocks {
 		block := &blocks[index]
 		if math.Abs(block.Angle) > 3 || block.SourceHeight <= 0 {
+			continue
+		}
+		// Sentence groups span several source lines; their box is already the
+		// union of those lines and must not be clipped to a single line height.
+		if block.H > block.SourceHeight*1.55 {
 			continue
 		}
 		top := block.CY - block.LineHeight/2
@@ -1673,6 +1765,7 @@ func (a *App) stopLiveSession(hideUI bool) {
 	a.livePaused = false
 	a.liveRefresh = nil
 	a.liveLast = uidaemon.LivePayload{}
+	a.liveExtraWidth = 0
 	a.liveMu.Unlock()
 
 	if cancel != nil {
@@ -1697,23 +1790,77 @@ func (a *App) stopLiveSession(hideUI bool) {
 }
 
 const (
-	frameBarDip    = 44.0
-	frameBorderDip = 2.0
+	frameBarDip = 40.0
 )
 
-// computeFrameLayout expands the selected image area by a toolbar strip and a
-// border placed outside the image. The strip prefers the space above the
-// selection and falls back below it, so it never covers translated text.
+// progressForBatches maps finished translation batches onto 55..95%, matching
+// the OCR stage (15%) and the final 100% done state.
+func progressForBatches(done, total int) int {
+	if total <= 0 {
+		return 55
+	}
+	value := 55 + int(40*float64(done)/float64(total))
+	if value > 95 {
+		value = 95
+	}
+	return value
+}
+
+// computeFrameLayout reserves a toolbar strip above (or below) the selected
+// image. The image keeps the exact selected rectangle; only the strip is added
+// to the window. A narrow selection widens the window just enough for the
+// horizontal "…" + close buttons.
 func computeFrameLayout(rect win.Rect) (uidaemon.ScreenRect, string) {
-	// The overlay window is exactly the selected rectangle. The toolbar is drawn
-	// inside it as a floating strip, so the selection never grows outside the
-	// user's drag area.
+	dpi := win.DpiForRect(rect)
+	if dpi == 0 {
+		dpi = 96
+	}
+	scale := float64(dpi) / 96.0
+	barPx := int32(math.Round(frameBarDip * scale))
+	minWidthPx := int32(math.Round(56 * scale))
+	windowWidth := rect.Width()
+	if windowWidth < minWidthPx {
+		windowWidth = minWidthPx
+	}
+	extraWidth := windowWidth - rect.Width()
+
+	center := win.Point{
+		X: (rect.Left + rect.Right) / 2,
+		Y: (rect.Top + rect.Bottom) / 2,
+	}
+	work := win.WorkAreaForPoint(center)
+	windowX := rect.Left - extraWidth/2
+	if windowX < work.Left {
+		windowX = work.Left
+	}
+	if windowX+windowWidth > work.Right {
+		windowX = work.Right - windowWidth
+	}
+
+	above := rect.Top - work.Top
+	below := work.Bottom - rect.Bottom
+
+	barSide := "top"
+	windowY := rect.Top - barPx
+	if above < barPx && below > above {
+		barSide = "bottom"
+		windowY = rect.Top
+	}
+	// If neither side has enough room (full-screen selection), keep the image
+	// at its exact screen position and let the strip overlap its top edge.
+	if barSide == "top" && windowY < work.Top {
+		windowY = rect.Top
+	}
+	if barSide == "bottom" && windowY+rect.Height()+barPx > work.Bottom {
+		windowY = rect.Top
+	}
+
 	return uidaemon.ScreenRect{
-		X:      int(rect.Left),
-		Y:      int(rect.Top),
-		Width:  int(rect.Width()),
-		Height: int(rect.Height()),
-	}, "top"
+		X:      int(windowX),
+		Y:      int(windowY),
+		Width:  int(windowWidth),
+		Height: int(rect.Height() + barPx),
+	}, barSide
 }
 
 func (a *App) finishBusy() {

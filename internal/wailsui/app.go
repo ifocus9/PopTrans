@@ -76,10 +76,16 @@ type App struct {
 	hitTestRect      win.Rect
 	hitTestActive    bool
 	hitTestResizable bool
-	menuOpen         bool
 	overlayPrepared  bool
 	regionSig        string
 	origWndProc      uintptr
+	// overlaySizing lets an overlay window use its selection-derived size
+	// instead of the workbench minimum. The responsive toolbar keeps the "…"
+	// and close buttons usable down to the small overlay floor.
+	overlaySizing bool
+	// overlayLive tracks whether the current overlay is the live panel. Both
+	// modes share the same 56x1 floor; live simply carries one extra action.
+	overlayLive bool
 
 	pinMu         sync.Mutex
 	overlayPinned bool
@@ -89,8 +95,76 @@ type App struct {
 // click-through hit testing.
 var hitTestApp *App
 
+const (
+	// Overlay windows are resized with physical pixels by the host. Both modes
+	// use the same small floor because the responsive toolbar folds every
+	// non-essential action into the "…" menu; the live panel adds a pause button
+	// but never forces a wider selection.
+	overlayMinWidthDIP  = 56
+	overlayMinHeightDIP = 1
+	liveMinWidthDIP     = 56
+	liveMinHeightDIP    = 1
+
+	wmShowOverlayMenu = win.WmApp + 40
+)
+
+// overlayMenuRequest is consumed synchronously by the overlay window's UI
+// thread. TrackPopupMenu must run on the thread that owns the window, otherwise
+// it returns immediately without showing anything.
+type overlayMenuRequest struct {
+	x        int32
+	y        int32
+	below    bool
+	items    []win.MenuItem
+	selected uint16
+}
+
+var (
+	overlayMenuMu  sync.Mutex
+	overlayMenuReq *overlayMenuRequest
+)
+
 var overlayHitTestProc = syscall.NewCallback(func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	app := hitTestApp
+	if msg == win.WmMeasureItem {
+		if win.HandleOwnerDrawMeasure(lParam) {
+			return 1
+		}
+	}
+	if msg == win.WmDrawItem {
+		if win.HandleOwnerDrawDraw(lParam) {
+			return 1
+		}
+	}
+	if msg == wmShowOverlayMenu {
+		if request := overlayMenuReq; request != nil {
+			started := time.Now()
+			request.selected = win.ShowPopupMenuAt(
+				win.HWND(hwnd), request.x, request.y, request.below, request.items,
+			)
+			// The first click can race the WebView's mouse-up handling and
+			// immediately cancel the modal menu. Retry once only when the menu
+			// returned instantly, which the user could not have dismissed.
+			if request.selected == 0 && time.Since(started) < 120*time.Millisecond {
+				time.Sleep(120 * time.Millisecond)
+				request.selected = win.ShowPopupMenuAt(
+					win.HWND(hwnd), request.x, request.y, request.below, request.items,
+				)
+			}
+		}
+		return 0
+	}
+	if app != nil && msg == win.WmGetMinMaxInfo && app.overlaySizingEnabled() {
+		// Wails' workbench minimum (420x560) would otherwise expand small
+		// selections. Keep the overlay's own control floor, scaled to the
+		// monitor DPI because MINMAXINFO uses physical pixels.
+		dpi := win.DpiForWindow(win.HWND(hwnd))
+		widthDIP, heightDIP := app.overlayMinDIP()
+		width := int32((widthDIP*int(dpi) + 95) / 96)
+		height := int32((heightDIP*int(dpi) + 95) / 96)
+		win.SetMinTrackSize(lParam, width, height)
+		return 0
+	}
 	if app != nil && msg == win.WmNcHitTest {
 		if app.hitTestEnabled() {
 			screen := win.LParamPoint(lParam)
@@ -240,10 +314,16 @@ func (a *App) Startup(ctx context.Context) {
 		}
 		a.mu.Lock()
 		a.ready = true
-		a.mode = "settings"
+		a.mode = "translate"
 		a.visible = true
 		a.settingsOpen = false
-		a.startupLoading = true
+		// The workbench is usable immediately. Model/engine startup continues in
+		// the background and is surfaced through the header badge and banner; it
+		// must never block settings, so the user can change the download source
+		// when the default mirror is unreachable.
+		a.startupLoading = false
+		a.startupStatus = ""
+		a.startupError = ""
 		a.startupStarted = time.Now()
 		a.mu.Unlock()
 		// The host process starts the backend. Poll its health here so the UI can
@@ -322,14 +402,12 @@ func (a *App) prepareOverlayWindow() {
 		return
 	}
 	win.MakeToolWindow(hwnd)
-	// Keep the overlay out of screen captures so the live loop can capture the
-	// screen without hiding this window (which caused visible flicker).
-	// POPTRANS_ALLOW_CAPTURE=1 is a debugging aid for screenshots of the overlay.
-	if os.Getenv("POPTRANS_ALLOW_CAPTURE") != "1" {
-		if !win.SetWindowCaptureExcluded(hwnd) {
-			log.Printf("overlay: SetWindowDisplayAffinity failed; live capture will hide/show")
-		}
-	}
+	win.RemoveWindowFrame(hwnd)
+	// Overlay frames report a phantom client height equal to the window height
+	// in one-pixel-overlap cases (e.g. 96x44 window, 96 client height). Let the
+	// WebView fill the real client area so the page's innerHeight always
+	// matches the physical window it is laid out for.
+	win.FillClientArea(hwnd)
 	if a.origWndProc == 0 {
 		hitTestApp = a
 		a.origWndProc = win.SubclassWindow(hwnd, overlayHitTestProc)
@@ -337,6 +415,47 @@ func (a *App) prepareOverlayWindow() {
 	a.hitMu.Lock()
 	a.overlayPrepared = true
 	a.hitMu.Unlock()
+}
+
+// setCaptureVisibility keeps the overlay visible to Snipping Tool and other
+// screenshot apps. During the host's own live frame grab, SetCaptureGuard
+// briefly excludes it and then restores normal capture.
+func (a *App) setCaptureVisibility(hwnd win.HWND, allow bool) {
+	if hwnd == 0 {
+		return
+	}
+	if os.Getenv("POPTRANS_ALLOW_CAPTURE") == "1" {
+		allow = true
+	}
+	if allow {
+		if !win.SetWindowCaptureAllowed(hwnd) {
+			log.Printf("overlay: failed to allow screen capture")
+		}
+		return
+	}
+	if !win.SetWindowCaptureExcluded(hwnd) {
+		log.Printf("overlay: SetWindowDisplayAffinity failed; live capture guard unavailable")
+	}
+}
+
+// SetCaptureGuard implements uidaemon.Handler. It briefly hides the overlay
+// from screen capture while the host grabs a live frame, then restores normal
+// capture so Snipping Tool and other apps can always see the panel.
+func (a *App) SetCaptureGuard(exclude bool) error {
+	hwnd := win.FindWindowByTitle(a.windowTitle)
+	if hwnd == 0 {
+		return nil
+	}
+	if exclude {
+		if !win.SetWindowCaptureExcluded(hwnd) {
+			return fmt.Errorf("exclude overlay from capture")
+		}
+		return nil
+	}
+	if !win.SetWindowCaptureAllowed(hwnd) {
+		return fmt.Errorf("allow overlay capture")
+	}
+	return nil
 }
 
 // monitorClickThrough keeps the overlay content area click-through. WebView2
@@ -361,11 +480,6 @@ func (a *App) monitorClickThrough(ctx context.Context) {
 			continue
 		}
 		if !win.IsWindowVisible(hwnd) || !a.hitTestEnabled() {
-			win.SetClickThrough(hwnd, false)
-			continue
-		}
-		if a.menuVisible() {
-			// The "…" dropdown overlaps the image area; keep it clickable.
 			win.SetClickThrough(hwnd, false)
 			continue
 		}
@@ -490,6 +604,28 @@ func (a *App) hitTestEnabled() bool {
 	return a.hitTestActive
 }
 
+func (a *App) setOverlaySizing(allow bool) {
+	a.hitMu.Lock()
+	a.overlaySizing = allow
+	a.hitMu.Unlock()
+}
+
+func (a *App) overlaySizingEnabled() bool {
+	a.hitMu.Lock()
+	defer a.hitMu.Unlock()
+	return a.overlaySizing
+}
+
+func (a *App) overlayMinDIP() (int, int) {
+	a.hitMu.Lock()
+	live := a.overlayLive
+	a.hitMu.Unlock()
+	if live {
+		return liveMinWidthDIP, liveMinHeightDIP
+	}
+	return overlayMinWidthDIP, overlayMinHeightDIP
+}
+
 func (a *App) hitRect() win.Rect {
 	a.hitMu.Lock()
 	defer a.hitMu.Unlock()
@@ -508,21 +644,6 @@ func (a *App) setHitTest(rect win.Rect, active, resizable bool) {
 	a.hitTestActive = active
 	a.hitTestResizable = resizable
 	a.hitMu.Unlock()
-}
-
-// SetOverlayMenu tells the click-through monitor that the overlay's "…" menu
-// is open. The dropdown extends into the image area, which normally passes
-// clicks through, so the whole window must stay interactive while it is shown.
-func (a *App) SetOverlayMenu(open bool) {
-	a.hitMu.Lock()
-	a.menuOpen = open
-	a.hitMu.Unlock()
-}
-
-func (a *App) menuVisible() bool {
-	a.hitMu.Lock()
-	defer a.hitMu.Unlock()
-	return a.menuOpen
 }
 
 func (a *App) isOverlayPinned() bool {
@@ -555,50 +676,52 @@ func (a *App) monitorStartup() {
 	defer ticker.Stop()
 	deadline := time.NewTimer(backend.StartupReadyTimeout)
 	defer deadline.Stop()
+	failures := 0
 	for {
 		select {
 		case <-ticker.C:
 			health, err := a.client.Health(ctx)
 			a.mu.Lock()
 			if err != nil {
-				a.startupStatus = "正在连接本地服务..."
-			} else if health.TranslatorStatus != "" {
-				a.startupStatus = health.TranslatorStatus
-			} else if !health.TranslatorReady {
-				a.startupStatus = "正在加载翻译模型..."
+				failures++
+				if failures >= 6 {
+					a.startupStatus = "本地引擎未就绪，可在“设置 → 模型”中检查下载源或手动下载模型"
+				} else {
+					a.startupStatus = "正在连接本地服务..."
+				}
+			} else {
+				failures = 0
+				if health.TranslatorStatus != "" {
+					a.startupStatus = health.TranslatorStatus
+				} else if !health.TranslatorReady {
+					a.startupStatus = "正在加载翻译模型..."
+				}
+				if strings.Contains(health.TranslatorStatus, "失败") ||
+					strings.Contains(strings.ToLower(health.TranslatorStatus), "error") {
+					a.startupError = health.TranslatorStatus
+				}
 			}
 			ready := err == nil && health.TranslatorReady && time.Since(a.startupStarted) >= 1200*time.Millisecond
-			// 冷启动由本函数收尾：模型就绪后隐藏启动窗口。但 daemon 可能因
-			// UI 空闲退出后被宿主首个快捷键/设置请求重新拉起，此时宿主已把
-			// 视图切到 result 弹窗(ShowResult)或打开设置(ShowSettings)。
-			// 若这里无条件 WindowHide，会藏掉正在显示的翻译/加载弹窗，且 Go
-			// 侧 visible=true 与真实窗口不可见不一致——这就是"AI 引擎休眠后
-			// 首个翻译弹窗看不到"的根因。仅纯冷启动(settings 未打开)才收尾。
-			mode := a.mode
-			settingsOpen := a.settingsOpen
+			// Background loading never hides or replaces the workbench. On success
+			// the banner clears; on failure the timeout branch below explains how
+			// to change the download source.
 			if ready {
 				a.startupLoading = false
 				a.startupStatus = "模型加载完成"
-			}
-			if ready && (mode == "settings" || mode == "translate") && !settingsOpen {
-				a.visible = false
+				a.startupError = ""
 			}
 			a.mu.Unlock()
 			a.emitState()
 			if ready {
-				if (mode == "settings" || mode == "translate") && !settingsOpen {
-					runtime.WindowHide(ctx)
-				}
-				a.scheduleIdleExit()
+				// Keep the workbench visible. Background loading is done; the user
+				// may continue translating or adjusting settings.
 				return
 			}
 		case <-deadline.C:
 			a.mu.Lock()
-			// Keep the startup page visible on timeout so the user can see why the
-			// app did not move to the tray.
-			a.startupLoading = true
-			a.startupError = "等待模型加载超时，请检查网络或模型文件"
+			a.startupLoading = false
 			a.startupStatus = "模型加载超时"
+			a.startupError = "模型加载超时：请在“设置 → 模型”中检查下载源、网络或手动下载模型。"
 			a.mu.Unlock()
 			a.emitState()
 			return
@@ -719,7 +842,9 @@ func (a *App) State() (UIState, error) {
 	state.Visible = a.visible
 	a.mu.Unlock()
 	if mode == "settings" || mode == "translate" || state.StartupLoading {
-		healthCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		// Keep the first paint fast even when the engine is still booting; the
+		// frontend polls again and the header/banner update in place.
+		healthCtx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
 		health, _ := a.client.Health(healthCtx)
 		cancel()
 		state.Health = health
@@ -1177,6 +1302,7 @@ func (a *App) ShowSettings() error {
 		return context.Canceled
 	}
 
+	a.setOverlaySizing(false)
 	a.mu.Lock()
 	a.mode = "settings"
 	a.visible = true
@@ -1200,6 +1326,7 @@ func (a *App) ShowTranslate() error {
 		return context.Canceled
 	}
 
+	a.setOverlaySizing(false)
 	a.mu.Lock()
 	a.mode = "translate"
 	a.visible = true
@@ -1223,6 +1350,8 @@ func (a *App) ShowResult(payload uidaemon.ResultPayload) error {
 		return context.Canceled
 	}
 
+	// The compact result popup is 425x300, below the workbench minimum.
+	a.setOverlaySizing(true)
 	a.mu.Lock()
 	wasVisibleResult := a.visible && a.mode == "result"
 	a.mode = "result"
@@ -1269,6 +1398,10 @@ func (a *App) ShowOverlay(payload uidaemon.OverlayPayload) error {
 	if windowRect.Width <= 0 || windowRect.Height <= 0 {
 		windowRect = payload.Rect
 	}
+	a.hitMu.Lock()
+	a.overlayLive = false
+	a.hitMu.Unlock()
+	a.setOverlaySizing(true)
 	a.prepareOverlayWindow()
 	// The screenshot overlay now displays the captured frame as an opaque base,
 	// so the whole window is interactive instead of click-through.
@@ -1283,6 +1416,7 @@ func (a *App) ShowOverlay(payload uidaemon.OverlayPayload) error {
 		false,
 	)
 	if hwnd := win.FindWindowByTitle(a.windowTitle); hwnd != 0 {
+		a.setCaptureVisibility(hwnd, true)
 		win.SetResizable(hwnd, false)
 	}
 
@@ -1310,14 +1444,23 @@ func (a *App) ShowOverlay(payload uidaemon.OverlayPayload) error {
 			win.ForceForegroundWindow(hwnd)
 		}
 	}
+	// The host hides the previous overlay before capturing a new selection.
+	// Re-show it even when the rect is unchanged, otherwise a same-size
+	// selection would leave the overlay hidden.
+	if hwnd := win.FindWindowByTitle(a.windowTitle); hwnd != 0 {
+		win.SetWindowTopmost(hwnd, a.isOverlayPinned())
+		win.ShowWindow(hwnd, win.SWShowNoActivate)
+	}
 
 	runtime.EventsEmit(a.ctx, eventOverlay, payload)
 	a.emitState()
 	return nil
 }
 
-// ShowLive implements uidaemon.Handler. The panel sits next to the monitored
-// region (never on top of it) so the live capture cannot see its own output.
+// ShowLive implements uidaemon.Handler. The panel covers exactly the monitored
+// region and shows its captured frame. It is always capturable so users can
+// screenshot the translation with any screen tool; the host skips a live frame
+// while the panel overlaps the monitored region, which prevents OCR feedback.
 func (a *App) ShowLive(payload uidaemon.LivePayload) error {
 	if a.ctx == nil {
 		return context.Canceled
@@ -1327,6 +1470,10 @@ func (a *App) ShowLive(payload uidaemon.LivePayload) error {
 	if windowRect.Width <= 0 || windowRect.Height <= 0 {
 		windowRect = payload.Anchor
 	}
+	a.hitMu.Lock()
+	a.overlayLive = true
+	a.hitMu.Unlock()
+	a.setOverlaySizing(true)
 	a.prepareOverlayWindow()
 	// The live panel also shows the captured frame, so it is an interactive
 	// rectangle; the page's edge strips handle resizing.
@@ -1341,6 +1488,9 @@ func (a *App) ShowLive(payload uidaemon.LivePayload) error {
 		false,
 	)
 	if hwnd := win.FindWindowByTitle(a.windowTitle); hwnd != 0 {
+		// Live and screenshot overlays are always capturable. The host avoids
+		// OCR feedback by skipping a frame while this panel overlaps the region.
+		a.setCaptureVisibility(hwnd, true)
 		// Edge resizing is handled by the page so the shaped window keeps a
 		// consistent client area; the native thick frame would be clipped away
 		// by the window region.
@@ -1372,6 +1522,12 @@ func (a *App) ShowLive(payload uidaemon.LivePayload) error {
 			win.ForceForegroundWindow(hwnd)
 		}
 	}
+	// The live loop may hide the panel for a paused refresh; always bring it
+	// back for the next payload.
+	if hwnd := win.FindWindowByTitle(a.windowTitle); hwnd != 0 {
+		win.SetWindowTopmost(hwnd, a.isOverlayPinned())
+		win.ShowWindow(hwnd, win.SWShowNoActivate)
+	}
 
 	runtime.EventsEmit(a.ctx, eventLive, payload)
 	a.emitState()
@@ -1385,7 +1541,18 @@ func (a *App) applyWindowRect(rect uidaemon.ScreenRect) {
 	if rect.Width <= 0 || rect.Height <= 0 {
 		return
 	}
-	if hwnd := win.FindWindowByTitle(a.windowTitle); hwnd != 0 {
+	hwnd := win.FindWindowByTitle(a.windowTitle)
+	if hwnd == 0 {
+		// The overlay process may still be creating its window when the host
+		// pushes the first payload. Wait briefly so the exact physical MoveWindow
+		// path is used instead of the DPI-scaled Wails fallback.
+		deadline := time.Now().Add(1500 * time.Millisecond)
+		for hwnd == 0 && time.Now().Before(deadline) {
+			time.Sleep(25 * time.Millisecond)
+			hwnd = win.FindWindowByTitle(a.windowTitle)
+		}
+	}
+	if hwnd != 0 {
 		// A live window may have been dragged by the user; don't fight the
 		// drag when the computed rect already matches its actual position.
 		if current, err := win.GetWindowRect(hwnd); err == nil {
@@ -1429,6 +1596,94 @@ func (a *App) SetHotkeyRecording(recording bool) error {
 	return a.notify.HotkeyHold(ctx, recording)
 }
 
+// OverlayMenuItem is one entry in the overlay's separate owner-drawn popup
+// menu. Header/note entries are disabled labels; separators have no label.
+type OverlayMenuItem struct {
+	ID        uint16 `json:"id"`
+	Label     string `json:"label"`
+	Shortcut  string `json:"shortcut"`
+	Icon      string `json:"icon"`
+	Checked   bool   `json:"checked"`
+	Disabled  bool   `json:"disabled"`
+	Separator bool   `json:"separator"`
+	Header    bool   `json:"header"`
+	Danger    bool   `json:"danger"`
+}
+
+// OverlayTheme returns the persisted theme for the overlay process. The
+// overlay polls it so a settings change repaints an already-open HUD.
+func (a *App) OverlayTheme() string {
+	cfg, err := config.Load(a.baseDir)
+	if err != nil {
+		return "system"
+	}
+	switch cfg.Theme {
+	case "light", "dark", "system":
+		return cfg.Theme
+	default:
+		return "system"
+	}
+}
+
+// ShowOverlayMenu opens a separate owner-drawn popup at a client point. The
+// popup lives outside the shaped window, so opening it never resizes the
+// selection or introduces an in-window scrollbar. Returns the selected command
+// ID (0 when dismissed).
+func (a *App) ShowOverlayMenu(items []OverlayMenuItem, clientX, clientY int, below bool) uint16 {
+	hwnd := win.FindWindowByTitle(a.windowTitle)
+	if hwnd == 0 || len(items) == 0 {
+		log.Printf("overlay menu ignored: hwnd=%d items=%d", hwnd, len(items))
+		return 0
+	}
+	if len(items) > 48 {
+		items = items[:48]
+	}
+	menuItems := make([]win.MenuItem, 0, len(items))
+	for _, item := range items {
+		label := strings.TrimSpace(item.Label)
+		shortcut := strings.TrimSpace(item.Shortcut)
+		if !item.Separator && label == "" {
+			continue
+		}
+		if len([]rune(label)) > 120 {
+			label = string([]rune(label)[:120])
+		}
+		if len([]rune(shortcut)) > 24 {
+			shortcut = string([]rune(shortcut)[:24])
+		}
+		menuItems = append(menuItems, win.MenuItem{
+			ID:        item.ID,
+			Text:      label,
+			Shortcut:  shortcut,
+			Icon:      item.Icon,
+			Disabled:  item.Disabled,
+			Separator: item.Separator,
+			Checked:   item.Checked,
+			Header:    item.Header,
+			Danger:    item.Danger,
+		})
+	}
+	if len(menuItems) == 0 {
+		return 0
+	}
+	point := win.ClientToScreen(hwnd, win.Point{X: int32(clientX), Y: int32(clientY)})
+	// Let the click's mouse-up finish before entering TrackPopupMenu's modal
+	// loop; otherwise the pending button-up dismisses the menu immediately.
+	win.ForceForegroundWindow(hwnd)
+	time.Sleep(100 * time.Millisecond)
+	win.PostMessage(hwnd, 0, 0, 0)
+
+	request := &overlayMenuRequest{x: point.X, y: point.Y, below: below, items: menuItems}
+	overlayMenuMu.Lock()
+	overlayMenuReq = request
+	log.Printf("overlay menu open: items=%d at %d,%d below=%v", len(menuItems), point.X, point.Y, below)
+	win.SendMessage(hwnd, wmShowOverlayMenu, 0, 0)
+	overlayMenuReq = nil
+	overlayMenuMu.Unlock()
+	log.Printf("overlay menu selected: %d", request.selected)
+	return request.selected
+}
+
 // LiveControl lets the panel pause/resume/refresh/stop the host capture loop.
 func (a *App) LiveControl(action string) error {
 	if a.notify == nil {
@@ -1453,8 +1708,8 @@ func (a *App) RefreshOverlay() error {
 // Hide implements uidaemon.Handler.
 func (a *App) Hide() error {
 	a.stopClickOutsideMonitor()
+	a.setOverlaySizing(false)
 	a.setHitTest(win.Rect{}, false, false)
-	a.SetOverlayMenu(false)
 	a.hitMu.Lock()
 	a.regionSig = ""
 	a.hitMu.Unlock()

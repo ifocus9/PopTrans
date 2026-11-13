@@ -164,20 +164,24 @@ func (m *Manager) ShowOverlay(ctx context.Context, payload OverlayPayload) error
 }
 
 func (m *Manager) ShowLive(ctx context.Context, payload LivePayload) error {
-	client, err := m.currentClient()
-	if err == nil {
-		if err := client.ShowLive(ctx, payload); err == nil {
-			return nil
-		}
-	}
 	if err := m.EnsureReady(ctx); err != nil {
 		return err
 	}
-	client, err = m.currentClient()
+	client, err := m.currentClient()
 	if err != nil {
 		return err
 	}
 	return client.ShowLive(ctx, payload)
+}
+
+// SetCaptureGuard briefly excludes the overlay from screen capture around the
+// host's live frame grab. The panel stays capturable the rest of the time.
+func (m *Manager) SetCaptureGuard(ctx context.Context, exclude bool) error {
+	client, err := m.currentClient()
+	if err != nil {
+		return err
+	}
+	return client.SetCaptureGuard(ctx, exclude)
 }
 
 func (m *Manager) Hide(ctx context.Context) error {

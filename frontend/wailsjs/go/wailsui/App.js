@@ -46,6 +46,10 @@ export function OnHidden() {
   return window['go']['wailsui']['App']['OnHidden']();
 }
 
+export function OverlayTheme() {
+  return window['go']['wailsui']['App']['OverlayTheme']();
+}
+
 export function Quit() {
   return window['go']['wailsui']['App']['Quit']();
 }
@@ -66,10 +70,6 @@ export function SetHotkeyRecording(arg1) {
   return window['go']['wailsui']['App']['SetHotkeyRecording'](arg1);
 }
 
-export function SetOverlayMenu(arg1) {
-  return window['go']['wailsui']['App']['SetOverlayMenu'](arg1);
-}
-
 export function SetOverlayPinned(arg1) {
   return window['go']['wailsui']['App']['SetOverlayPinned'](arg1);
 }
@@ -88,6 +88,10 @@ export function ShowLive(arg1) {
 
 export function ShowOverlay(arg1) {
   return window['go']['wailsui']['App']['ShowOverlay'](arg1);
+}
+
+export function ShowOverlayMenu(arg1, arg2, arg3, arg4) {
+  return window['go']['wailsui']['App']['ShowOverlayMenu'](arg1, arg2, arg3, arg4);
 }
 
 export function ShowResult(arg1) {

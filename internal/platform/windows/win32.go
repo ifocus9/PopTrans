@@ -31,6 +31,27 @@ type MonitorInfo struct {
 	Flags   uint32
 }
 
+// MinMaxInfo mirrors the Win32 MINMAXINFO structure delivered with
+// WM_GETMINMAXINFO. Only the two track-size points are used here.
+type MinMaxInfo struct {
+	Reserved     Point
+	MaxSize      Point
+	MaxPosition  Point
+	MinTrackSize Point
+	MaxTrackSize Point
+}
+
+// SetMinTrackSize overrides the minimum size Windows enforces for a window.
+// It is called synchronously from WM_GETMINMAXINFO, unlike Wails' runtime API.
+func SetMinTrackSize(lParam uintptr, width, height int32) {
+	if lParam == 0 {
+		return
+	}
+	info := (*MinMaxInfo)(unsafe.Pointer(lParam))
+	info.MinTrackSize.X = width
+	info.MinTrackSize.Y = height
+}
+
 type Msg struct {
 	HWnd     HWND
 	Message  uint32
@@ -102,17 +123,19 @@ const (
 	SWPFrameChanged  = 0x0020
 	SWPShowWindow    = 0x0040
 
-	WSOverlapped = 0x00000000
-	WSPopup      = 0x80000000
-	WSCaption    = 0x00C00000
-	WSSysMenu    = 0x00080000
-	WSVisible    = 0x10000000
-	WSChild      = 0x40000000
-	WSVScroll    = 0x00200000
-	WSTabStop    = 0x00010000
-	WSBorder     = 0x00800000
-	WSDisabled   = 0x08000000
-	WsThickFrame = 0x00040000
+	WSOverlapped  = 0x00000000
+	WSPopup       = 0x80000000
+	WSCaption     = 0x00C00000
+	WSSysMenu     = 0x00080000
+	WSVisible     = 0x10000000
+	WSChild       = 0x40000000
+	WSVScroll     = 0x00200000
+	WSTabStop     = 0x00010000
+	WSBorder      = 0x00800000
+	WSDisabled    = 0x08000000
+	WsThickFrame  = 0x00040000
+	WsMinimizeBox = 0x00020000
+	WsMaximizeBox = 0x00010000
 
 	WsExClientEdge  = 0x00000200
 	WsExToolWindow  = 0x00000080
@@ -133,10 +156,34 @@ const (
 	MFSeparator = 0x00000800
 	MFDisabled  = 0x00000002
 	MFGrayED    = 0x00000001
+	MFChecked   = 0x00000008
+	MFOwnerDraw = 0x00000100
+
+	MIMBackground      = 0x00000002
+	MIMApplyToSubmenus = 0x80000000
+
+	ODSSelected = 0x0001
+	ODSDisabled = 0x0004
+	ODSChecked  = 0x0008
+
+	WmMeasureItem = 0x002C
+	WmDrawItem    = 0x002B
+
+	DTLeft        = 0x00000000
+	DTCenter      = 0x00000001
+	DTRight       = 0x00000002
+	DTVCenter     = 0x00000004
+	DTSingleLine  = 0x00000020
+	DTNoPrefix    = 0x00000800
+	DTEndEllipsis = 0x00008000
 
 	TPMRightButton = 0x0002
+	TPMRightAlign  = 0x0008
 	TPMBottomAlign = 0x0020
 	TPMLeftAlign   = 0x0000
+	TPMTopAlign    = 0x0000
+	TPMReturnCmd   = 0x0100
+	TPMNonotify    = 0x0080
 
 	NIMAdd     = 0x00000000
 	NIMModify  = 0x00000001
@@ -171,6 +218,7 @@ const (
 	WmRButtonDblClk = 0x0206
 	WmSize          = 0x0005
 	WmSetcursor     = 0x0020
+	WmGetMinMaxInfo = 0x0024
 	WmSetIcon       = 0x0080
 	WmNcHitTest     = 0x0084
 	WmHotkey        = 0x0312
@@ -255,6 +303,14 @@ var (
 	procCreatePopupMenu               = modUser32.NewProc("CreatePopupMenu")
 	procAppendMenuW                   = modUser32.NewProc("AppendMenuW")
 	procTrackPopupMenu                = modUser32.NewProc("TrackPopupMenu")
+	procDestroyMenu                   = modUser32.NewProc("DestroyMenu")
+	procSetMenuInfo                   = modUser32.NewProc("SetMenuInfo")
+	procCreateFontW                   = modGdi32.NewProc("CreateFontW")
+	procCreatePen                     = modGdi32.NewProc("CreatePen")
+	procTextOutW                      = modGdi32.NewProc("TextOutW")
+	procRoundRect                     = modGdi32.NewProc("RoundRect")
+	procMoveToEx                      = modGdi32.NewProc("MoveToEx")
+	procLineTo                        = modGdi32.NewProc("LineTo")
 	procSetForegroundWindow           = modUser32.NewProc("SetForegroundWindow")
 	procGetCursorPos                  = modUser32.NewProc("GetCursorPos")
 	procGetSystemMetrics              = modUser32.NewProc("GetSystemMetrics")
@@ -303,7 +359,9 @@ var (
 	procSetProcessDpiAwareness        = modShcore.NewProc("SetProcessDpiAwareness")
 	procGetDpiForMonitor              = modShcore.NewProc("GetDpiForMonitor")
 	procCallWindowProcW               = modUser32.NewProc("CallWindowProcW")
+	procGetWindow                     = modUser32.NewProc("GetWindow")
 	procScreenToClient                = modUser32.NewProc("ScreenToClient")
+	procClientToScreen                = modUser32.NewProc("ClientToScreen")
 	procSetCapture                    = modUser32.NewProc("SetCapture")
 	procReleaseCapture                = modUser32.NewProc("ReleaseCapture")
 	procInvalidateRect                = modUser32.NewProc("InvalidateRect")
@@ -404,6 +462,11 @@ func PostQuitMessage(code int32) {
 
 func PostMessage(hwnd HWND, msg uint32, wParam, lParam uintptr) {
 	procPostMessageW.Call(uintptr(hwnd), uintptr(msg), wParam, lParam)
+}
+
+func SendMessage(hwnd HWND, msg uint32, wParam, lParam uintptr) uintptr {
+	result, _, _ := procSendMessageW.Call(uintptr(hwnd), uintptr(msg), wParam, lParam)
+	return result
 }
 
 func MessageLoop() (int32, error) {
@@ -542,8 +605,383 @@ func ShowTrayMenu(hwnd HWND, items []MenuItem) {
 type MenuItem struct {
 	ID        uint16
 	Text      string
+	Shortcut  string
+	Icon      string
 	Disabled  bool
 	Separator bool
+	Checked   bool
+	Header    bool
+	Danger    bool
+}
+
+type measureItemStruct struct {
+	CtlType    uint32
+	CtlID      uint32
+	ItemID     uint32
+	ItemWidth  uint32
+	ItemHeight uint32
+	ItemData   uintptr
+}
+
+type drawItemStruct struct {
+	CtlType    uint32
+	CtlID      uint32
+	ItemID     uint32
+	ItemAction uint32
+	ItemState  uint32
+	HwndItem   HWND
+	HDC        uintptr
+	RcItem     Rect
+	ItemData   uintptr
+}
+
+type menuInfo struct {
+	CbSize        uint32
+	FMask         uint32
+	DwStyle       uint32
+	CyMax         uint32
+	HbrBack       uintptr
+	DwContextHelp uint32
+	DwMenuData    uintptr
+}
+
+// The owner-drawn menu is modal on the UI thread, so this state is only touched
+// from that thread while TrackPopupMenu runs.
+var (
+	ownerMenuItems      []MenuItem
+	ownerMenuScale      float64 = 1
+	ownerMenuTextFont   uintptr
+	ownerMenuHeaderFont uintptr
+	ownerMenuIconFont   uintptr
+	ownerMenuKeyFont    uintptr
+)
+
+func menuGlyph(name string) string {
+	switch name {
+	case "toggle":
+		return "\uE8AB"
+	case "pause":
+		return "\uE769"
+	case "play":
+		return "\uE768"
+	case "copy":
+		return "\uE8C8"
+	case "markdown":
+		return "\uE943"
+	case "refresh":
+		return "\uE72C"
+	case "pin":
+		return "\uE840"
+	case "unpin":
+		return "\uE718"
+	case "close":
+		return "\uE8BB"
+	case "warning":
+		return "\uE7BA"
+	case "info":
+		return "\uE946"
+	case "check":
+		return "\uE73E"
+	case "more":
+		return "\uE712"
+	default:
+		return ""
+	}
+}
+
+func colorRef(r, g, b uint8) uintptr {
+	return uintptr(r) | uintptr(g)<<8 | uintptr(b)<<16
+}
+
+func createMenuFont(size float64, weight int, face string) uintptr {
+	facePtr, _ := xwindows.UTF16PtrFromString(face)
+	font, _, _ := procCreateFontW.Call(
+		uintptr(int32(-size)), // negative = character height
+		0, 0, 0,
+		uintptr(weight),
+		0, 0, 0,
+		1, // DEFAULT_CHARSET
+		0, 0,
+		5, // CLEARTYPE_QUALITY
+		0,
+		uintptr(unsafe.Pointer(facePtr)),
+	)
+	return font
+}
+
+func drawMenuText(hdc uintptr, text string, rect *Rect, font uintptr, color uintptr, flags uint32) {
+	if text == "" || font == 0 {
+		return
+	}
+	textPtr, _ := xwindows.UTF16PtrFromString(text)
+	oldFont, _, _ := procSelectObject.Call(hdc, font)
+	oldColor, _, _ := procSetTextColor.Call(hdc, color)
+	procSetBkMode.Call(hdc, 1) // TRANSPARENT
+	procDrawTextW.Call(
+		hdc,
+		uintptr(unsafe.Pointer(textPtr)),
+		^uintptr(0),
+		uintptr(unsafe.Pointer(rect)),
+		uintptr(flags),
+	)
+	procSetTextColor.Call(hdc, oldColor)
+	procSelectObject.Call(hdc, oldFont)
+}
+
+// HandleOwnerDrawMeasure answers WM_MEASUREITEM for the owner-drawn popup.
+func HandleOwnerDrawMeasure(lParam uintptr) bool {
+	if len(ownerMenuItems) == 0 || lParam == 0 {
+		return false
+	}
+	mis := (*measureItemStruct)(unsafe.Pointer(lParam))
+	index := int(mis.ItemData) - 1
+	if index < 0 || index >= len(ownerMenuItems) {
+		return false
+	}
+	item := ownerMenuItems[index]
+	scale := ownerMenuScale
+	mis.ItemWidth = uint32(200*scale + 0.5)
+	switch {
+	case item.Separator:
+		mis.ItemHeight = uint32(6*scale + 0.5)
+	case item.Header:
+		mis.ItemHeight = uint32(22*scale + 0.5)
+	default:
+		mis.ItemHeight = uint32(28*scale + 0.5)
+	}
+	return true
+}
+
+// HandleOwnerDrawDraw paints one menu item in the deep-purple HUD palette.
+func HandleOwnerDrawDraw(lParam uintptr) bool {
+	if len(ownerMenuItems) == 0 || lParam == 0 {
+		return false
+	}
+	dis := (*drawItemStruct)(unsafe.Pointer(lParam))
+	index := int(dis.ItemData) - 1
+	if index < 0 || index >= len(ownerMenuItems) {
+		return false
+	}
+	item := ownerMenuItems[index]
+	scale := ownerMenuScale
+	hdc := dis.HDC
+	rc := dis.RcItem
+
+	selected := dis.ItemState&ODSSelected != 0 &&
+		!item.Disabled && !item.Header && !item.Separator
+	// Subtle per-row vertical gradient from a lifted purple at the top to a
+	// near-black violet at the bottom; the whole menu reads as one surface.
+	ratio := 0.0
+	if len(ownerMenuItems) > 1 {
+		ratio = float64(index) / float64(len(ownerMenuItems)-1)
+	}
+	background := colorRef(
+		uint8(30-float64(11)*ratio),
+		uint8(19-float64(8)*ratio),
+		uint8(60-float64(22)*ratio),
+	)
+	if item.Header {
+		background = colorRef(21, 13, 42)
+	}
+	if selected {
+		if item.Danger {
+			background = colorRef(122, 38, 56)
+		} else {
+			background = colorRef(72, 54, 142)
+		}
+	}
+	brush, _, _ := procCreateSolidBrush.Call(background)
+	if brush != 0 {
+		procFillRect.Call(hdc, uintptr(unsafe.Pointer(&rc)), brush)
+		procDeleteObject.Call(brush)
+	}
+
+	if item.Separator {
+		pen, _, _ := procCreatePen.Call(0, uintptr(maxInt32(1, int32(scale+0.5))), colorRef(88, 68, 148))
+		oldPen := uintptr(0)
+		if pen != 0 {
+			oldPen, _, _ = procSelectObject.Call(hdc, pen)
+		}
+		mid := (rc.Top + rc.Bottom) / 2
+		procMoveToEx.Call(hdc, uintptr(rc.Left+int32(10*scale)), uintptr(mid), 0)
+		procLineTo.Call(hdc, uintptr(rc.Right-int32(10*scale)), uintptr(mid))
+		if pen != 0 {
+			procSelectObject.Call(hdc, oldPen)
+			procDeleteObject.Call(pen)
+		}
+		return true
+	}
+
+	textColor := colorRef(245, 242, 255)
+	if item.Disabled {
+		textColor = colorRef(180, 168, 215)
+	}
+	if item.Header {
+		textColor = colorRef(157, 140, 201)
+	}
+	if item.Danger {
+		textColor = colorRef(255, 154, 168)
+	}
+	if item.Icon == "warning" && item.Disabled {
+		textColor = colorRef(255, 208, 94)
+	}
+	if selected {
+		textColor = colorRef(255, 255, 255)
+	}
+
+	left := rc.Left + int32(10*scale)
+	right := rc.Right - int32(10*scale)
+	shortcutWidth := int32(0)
+	if item.Shortcut != "" {
+		shortcutWidth = int32(46 * scale)
+	}
+	checkWidth := int32(0)
+	if item.Checked {
+		checkWidth = int32(20 * scale)
+	}
+
+	if !item.Header && item.Icon != "" {
+		glyph := menuGlyph(item.Icon)
+		if glyph != "" {
+			iconRect := Rect{
+				Left:   left,
+				Top:    rc.Top,
+				Right:  left + int32(18*scale),
+				Bottom: rc.Bottom,
+			}
+			drawMenuText(hdc, glyph, &iconRect, ownerMenuIconFont, textColor,
+				DTCenter|DTVCenter|DTSingleLine|DTNoPrefix)
+		}
+		left += int32(24 * scale)
+	}
+
+	textRight := right - shortcutWidth - checkWidth
+	if textRight < left {
+		textRight = left
+	}
+	textRect := Rect{Left: left, Top: rc.Top, Right: textRight, Bottom: rc.Bottom}
+	font := ownerMenuTextFont
+	if item.Header {
+		font = ownerMenuHeaderFont
+	}
+	drawMenuText(hdc, item.Text, &textRect, font, textColor,
+		DTLeft|DTVCenter|DTSingleLine|DTEndEllipsis|DTNoPrefix)
+
+	if item.Checked {
+		checkRect := Rect{
+			Left:   textRight + int32(2*scale),
+			Top:    rc.Top,
+			Right:  textRight + int32(20*scale),
+			Bottom: rc.Bottom,
+		}
+		drawMenuText(hdc, "\uE73E", &checkRect, ownerMenuIconFont, colorRef(167, 143, 255),
+			DTCenter|DTVCenter|DTSingleLine|DTNoPrefix)
+	}
+
+	if item.Shortcut != "" {
+		keyRect := Rect{
+			Left:   right - shortcutWidth,
+			Top:    rc.Top,
+			Right:  right,
+			Bottom: rc.Bottom,
+		}
+		keyColor := colorRef(157, 140, 201)
+		if selected {
+			keyColor = colorRef(232, 224, 255)
+		}
+		drawMenuText(hdc, item.Shortcut, &keyRect, ownerMenuKeyFont, keyColor,
+			DTRight|DTVCenter|DTSingleLine|DTNoPrefix)
+	}
+	return true
+}
+
+func maxInt32(a, b int32) int32 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// ShowPopupMenuAt displays a styled popup menu in its own top-level window at
+// screen coordinates. It is not clipped by the overlay window and never
+// resizes it, so a tiny selection still gets a complete, readable menu.
+func ShowPopupMenuAt(hwnd HWND, x, y int32, below bool, items []MenuItem) uint16 {
+	menu, _, _ := procCreatePopupMenu.Call()
+	if menu == 0 {
+		return 0
+	}
+	defer procDestroyMenu.Call(menu)
+
+	dpi := uint32(96)
+	if hwnd != 0 {
+		dpi = DpiForWindow(hwnd)
+	}
+	if dpi == 0 {
+		dpi = 96
+	}
+	scale := float64(dpi) / 96.0
+	ownerMenuScale = scale
+	ownerMenuTextFont = createMenuFont(12.5*scale, 500, "Microsoft YaHei UI")
+	ownerMenuHeaderFont = createMenuFont(10.5*scale, 600, "Microsoft YaHei UI")
+	ownerMenuIconFont = createMenuFont(12*scale, 400, "Segoe MDL2 Assets")
+	ownerMenuKeyFont = createMenuFont(9.5*scale, 500, "Microsoft YaHei UI")
+	defer func() {
+		for _, font := range []uintptr{
+			ownerMenuTextFont, ownerMenuHeaderFont, ownerMenuIconFont, ownerMenuKeyFont,
+		} {
+			if font != 0 {
+				procDeleteObject.Call(font)
+			}
+		}
+		ownerMenuItems = nil
+		ownerMenuTextFont = 0
+		ownerMenuHeaderFont = 0
+		ownerMenuIconFont = 0
+		ownerMenuKeyFont = 0
+	}()
+
+	ownerMenuItems = items
+	for index, item := range items {
+		flags := uintptr(MFOwnerDraw)
+		if item.Disabled || item.Header || item.Separator {
+			flags |= MFDisabled
+		}
+		procAppendMenuW.Call(menu, flags, uintptr(item.ID), uintptr(index+1))
+	}
+
+	brush, _, _ := procCreateSolidBrush.Call(colorRef(22, 14, 44))
+	if brush != 0 {
+		info := menuInfo{
+			CbSize:  uint32(unsafe.Sizeof(menuInfo{})),
+			FMask:   MIMBackground | MIMApplyToSubmenus,
+			HbrBack: brush,
+		}
+		procSetMenuInfo.Call(menu, uintptr(unsafe.Pointer(&info)))
+		defer procDeleteObject.Call(brush)
+	}
+
+	if hwnd != 0 {
+		procSetForegroundWindow.Call(uintptr(hwnd))
+	}
+	align := uintptr(TPMRightAlign | TPMReturnCmd | TPMNonotify)
+	if below {
+		align |= TPMTopAlign
+	} else {
+		align |= TPMBottomAlign
+	}
+	result, _, _ := procTrackPopupMenu.Call(
+		menu,
+		align,
+		uintptr(x),
+		uintptr(y),
+		0,
+		uintptr(hwnd),
+		0,
+	)
+	if hwnd != 0 {
+		procPostMessageW.Call(uintptr(hwnd), 0, 0, 0)
+	}
+	return uint16(result)
 }
 
 func SetWindowPosTopMost(hwnd HWND, x, y, width, height int32) {
@@ -614,6 +1052,12 @@ func ScreenToClient(hwnd HWND, point Point) Point {
 	return pt
 }
 
+func ClientToScreen(hwnd HWND, point Point) Point {
+	pt := point
+	procClientToScreen.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&pt)))
+	return pt
+}
+
 func IsWindowVisible(hwnd HWND) bool {
 	if hwnd == 0 {
 		return false
@@ -634,6 +1078,18 @@ func SetWindowCaptureExcluded(hwnd HWND) bool {
 	return ret != 0
 }
 
+// SetWindowCaptureAllowed makes the window visible to screen capture again.
+// Screenshot overlays use it so the translated result can be captured by
+// Snipping Tool or other screenshot apps.
+func SetWindowCaptureAllowed(hwnd HWND) bool {
+	if hwnd == 0 {
+		return false
+	}
+	const wdaNone = 0
+	ret, _, _ := procSetWindowDisplayAffinity.Call(uintptr(hwnd), wdaNone)
+	return ret != 0
+}
+
 // WindowCaptureExcluded reports whether the window is excluded from capture.
 func WindowCaptureExcluded(hwnd HWND) bool {
 	if hwnd == 0 {
@@ -646,6 +1102,11 @@ func WindowCaptureExcluded(hwnd HWND) bool {
 
 func SetForegroundWindow(hwnd HWND) {
 	procSetForegroundWindow.Call(uintptr(hwnd))
+}
+
+func GetForegroundWindow() HWND {
+	hwnd, _, _ := procGetForegroundWindow.Call()
+	return HWND(hwnd)
 }
 
 // SetCrosshairCursor switches the pointer to a crosshair, used by the screen
@@ -708,6 +1169,44 @@ func MakeToolWindow(hwnd HWND) {
 		0,
 		SWPNoSize|SWPNoMove|SWPNoZOrder|SWPNoActivate|SWPFrameChanged,
 	)
+}
+
+// RemoveWindowFrame strips the native caption/sysmenu/resize styles. Wails
+// normally removes the frame via WM_NCCALCSIZE, but overlay windows also get a
+// window region; keeping WS_CAPTION in the style let a small overlay reveal the
+// native title bar (and its own close button) when the region was applied.
+func RemoveWindowFrame(hwnd HWND) {
+	if hwnd == 0 {
+		return
+	}
+	index := int32(GwlpStyle)
+	style, _, _ := procGetWindowLongPtrW.Call(uintptr(hwnd), uintptr(index))
+	style &^= uintptr(WSCaption | WSSysMenu | WsMinimizeBox | WsMaximizeBox | WsThickFrame)
+	procSetWindowLongPtrW.Call(uintptr(hwnd), uintptr(index), style)
+	procSetWindowPos.Call(
+		uintptr(hwnd),
+		0,
+		0,
+		0,
+		0,
+		0,
+		SWPNoSize|SWPNoMove|SWPNoZOrder|SWPNoActivate|SWPFrameChanged,
+	)
+}
+
+// FillClientArea resizes the window's direct child (the WebView container) to
+// the full client rectangle. Without it a stale one-pixel client height can
+// leave the page one pixel short of the window on shaped overlay windows.
+func FillClientArea(hwnd HWND) {
+	if hwnd == 0 {
+		return
+	}
+	client := GetClientRect(hwnd)
+	child, _, _ := procGetWindow.Call(uintptr(hwnd), 5) // GW_CHILD
+	if child == 0 || client.Right <= 0 || client.Bottom <= 0 {
+		return
+	}
+	MoveWindow(HWND(child), 0, 0, client.Right-client.Left, client.Bottom-client.Top, true)
 }
 
 // SetWindowRegion replaces the window shape with the union of rects (client
@@ -897,6 +1396,16 @@ func ScreenSize() (int32, int32) {
 const mdtEffectiveDPI = 0
 
 // DpiForRect returns the effective DPI of the monitor containing rect.
+// DpiForWindow returns the effective DPI of a window (96 when unavailable).
+func DpiForWindow(hwnd HWND) uint32 {
+	if hwnd != 0 {
+		if dpi, _, _ := procGetDpiForWindow.Call(uintptr(hwnd)); dpi > 0 {
+			return uint32(dpi)
+		}
+	}
+	return 96
+}
+
 func DpiForRect(rect Rect) uint32 {
 	monitor, _, _ := procMonitorFromRect.Call(uintptr(unsafe.Pointer(&rect)), monitorDefaultToNearest)
 	if monitor != 0 {

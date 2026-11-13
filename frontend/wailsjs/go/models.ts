@@ -25,6 +25,24 @@ export namespace backend {
 
 export namespace config {
 	
+	export class GlossaryEntry {
+	    term: string;
+	    translation: string;
+	    source: string;
+	    note?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new GlossaryEntry(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.term = source["term"];
+	        this.translation = source["translation"];
+	        this.source = source["source"];
+	        this.note = source["note"];
+	    }
+	}
 	export class ModelEntry {
 	    id: string;
 	    name: string;
@@ -49,25 +67,6 @@ export namespace config {
 	        this.size = source["size"];
 	        this.dir = source["dir"];
 	        this.builtin = source["builtin"];
-	    }
-	}
-	
-	export class GlossaryEntry {
-	    term: string;
-	    translation: string;
-	    source: string;
-	    note?: string;
-	
-	    static createFrom(source: any = {}) {
-	        return new GlossaryEntry(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.term = source["term"];
-	        this.translation = source["translation"];
-	        this.source = source["source"];
-	        this.note = source["note"];
 	    }
 	}
 	export class Config {
@@ -150,6 +149,7 @@ export namespace config {
 		    return a;
 		}
 	}
+	
 
 }
 
@@ -279,7 +279,11 @@ export namespace uidaemon {
 	    error: string;
 	    style: OverlayStyle;
 	    version: number;
+	    stage?: string;
+	    progress?: number;
+	    lines?: number;
 	    latency_ms: number;
+	    theme?: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new LivePayload(source);
@@ -300,7 +304,11 @@ export namespace uidaemon {
 	        this.error = source["error"];
 	        this.style = this.convertValues(source["style"], OverlayStyle);
 	        this.version = source["version"];
+	        this.stage = source["stage"];
+	        this.progress = source["progress"];
+	        this.lines = source["lines"];
 	        this.latency_ms = source["latency_ms"];
+	        this.theme = source["theme"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -334,7 +342,11 @@ export namespace uidaemon {
 	    loading: boolean;
 	    error: string;
 	    style: OverlayStyle;
+	    stage?: string;
+	    progress?: number;
+	    lines?: number;
 	    latency_ms: number;
+	    theme?: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new OverlayPayload(source);
@@ -354,7 +366,11 @@ export namespace uidaemon {
 	        this.loading = source["loading"];
 	        this.error = source["error"];
 	        this.style = this.convertValues(source["style"], OverlayStyle);
+	        this.stage = source["stage"];
+	        this.progress = source["progress"];
+	        this.lines = source["lines"];
 	        this.latency_ms = source["latency_ms"];
+	        this.theme = source["theme"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -422,6 +438,20 @@ export namespace uidaemon {
 
 export namespace wailsui {
 	
+	export class ModelFileItem {
+	    name: string;
+	    size: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new ModelFileItem(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.size = source["size"];
+	    }
+	}
 	export class ModelSearchItem {
 	    id: string;
 	    name: string;
@@ -446,20 +476,6 @@ export namespace wailsui {
 	        this.parameters = source["parameters"];
 	    }
 	}
-	export class ModelFileItem {
-	    name: string;
-	    size: number;
-	
-	    static createFrom(source: any = {}) {
-	        return new ModelFileItem(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.name = source["name"];
-	        this.size = source["size"];
-	    }
-	}
 	export class ModelStatus {
 	    id: string;
 	    installed: boolean;
@@ -478,37 +494,34 @@ export namespace wailsui {
 	        this.path = source["path"];
 	    }
 	}
-	export class ModelDownloadEvent {
-	    status: string;
-	    source: string;
-	    repo: string;
-	    file: string;
-	    name: string;
-	    downloaded: number;
-	    total: number;
-	    percent: number;
-	    speed: number;
-	    error?: string;
+	export class OverlayMenuItem {
+	    id: number;
+	    label: string;
+	    shortcut: string;
+	    icon: string;
+	    checked: boolean;
+	    disabled: boolean;
+	    separator: boolean;
+	    header: boolean;
+	    danger: boolean;
 	
 	    static createFrom(source: any = {}) {
-	        return new ModelDownloadEvent(source);
+	        return new OverlayMenuItem(source);
 	    }
 	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.status = source["status"];
-	        this.source = source["source"];
-	        this.repo = source["repo"];
-	        this.file = source["file"];
-	        this.name = source["name"];
-	        this.downloaded = source["downloaded"];
-	        this.total = source["total"];
-	        this.percent = source["percent"];
-	        this.speed = source["speed"];
-	        this.error = source["error"];
+	        this.id = source["id"];
+	        this.label = source["label"];
+	        this.shortcut = source["shortcut"];
+	        this.icon = source["icon"];
+	        this.checked = source["checked"];
+	        this.disabled = source["disabled"];
+	        this.separator = source["separator"];
+	        this.header = source["header"];
+	        this.danger = source["danger"];
 	    }
 	}
-	
 	export class ResultView {
 	    source: string;
 	    result: string;
