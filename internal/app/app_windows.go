@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"log"
 	"math"
 	"os"
@@ -54,6 +53,8 @@ const (
 	wmLivePause      = win.WmApp + 10
 	wmLiveResume     = win.WmApp + 11
 	wmLiveStop       = win.WmApp + 12
+	wmOverlayRefresh = win.WmApp + 13
+	wmLiveRefresh    = win.WmApp + 14
 )
 
 var (
@@ -94,12 +95,16 @@ type App struct {
 	overlayMu  sync.Mutex
 	overlaySeq int
 
+	shotMu    sync.Mutex
+	shotFrame *shotFrame
+
 	liveMu        sync.Mutex
 	liveCancel    context.CancelFunc
 	livePaused    bool
 	liveActive    bool
 	liveDragging  bool
 	liveDragEpoch int
+	liveRefresh   chan struct{}
 	liveLast      uidaemon.LivePayload
 	liveRect      win.Rect
 	liveBarSide   string
@@ -564,6 +569,7 @@ func (a *App) handleOCRSelection(rect win.Rect) {
 			Stage:       "ocr",
 			Progress:    15,
 		}
+		a.storeShotFrame(basePayload, pngBytes)
 		showCtx, showCancel := context.WithTimeout(context.Background(), 20*time.Second)
 		if err := a.overlayUI.ShowOverlay(showCtx, basePayload); err != nil {
 			log.Printf("app show screenshot overlay failed: %v", err)
@@ -602,7 +608,7 @@ func (a *App) handleOCRSelection(rect win.Rect) {
 			lines = len(ocr.LineBoxes)
 			a.updateOverlayProgress(seq, basePayload, "translate", 55, lines)
 			var callErr error
-			result, callErr = a.translateOCRResult(callCtx, ocr)
+			result, callErr = a.translateOCRResult(callCtx, ocr, false)
 			return callErr
 		})
 
@@ -611,41 +617,16 @@ func (a *App) handleOCRSelection(rect win.Rect) {
 			return
 		}
 
-		update := uidaemon.OverlayPayload{
-			Rect:        basePayload.Rect,
-			WindowRect:  basePayload.WindowRect,
-			BarSide:     basePayload.BarSide,
-			ImageWidth:  basePayload.ImageWidth,
-			ImageHeight: basePayload.ImageHeight,
-			Source:      strings.TrimSpace(result.SourceText),
-			Translation: strings.TrimSpace(result.Translation),
-			Style:       basePayload.Style,
-			LatencyMs:   time.Since(startedAt).Milliseconds(),
-		}
-		for _, block := range result.Blocks {
-			update.Blocks = append(update.Blocks, toTranslatedBlock(block))
-		}
-		clipBlockOverlaps(update.Blocks)
-		attachBlurredBackgrounds(pngBytes, update.Blocks)
-
+		update := a.overlayResultPayload(basePayload, pngBytes, result, err, time.Since(startedAt))
 		switch {
 		case err != nil:
 			log.Printf("app ocr blocks request failed: %v", err)
-			update.Error = err.Error()
-			update.Stage = "error"
-			update.Progress = 0
 			a.setStatus("OCR 失败")
 		case update.Source == "":
 			log.Printf("app ocr returned empty text")
-			update.Error = errOCREmptyResult.Error()
-			update.Stage = "error"
-			update.Progress = 0
 			a.setStatus("OCR 未识别到文本")
 		default:
 			log.Printf("app ocr blocks success: blocks=%d source_chars=%d result_chars=%d", len(update.Blocks), len(update.Source), len(update.Translation))
-			update.Stage = "done"
-			update.Progress = 100
-			update.Lines = len(update.Blocks)
 			a.setStatus("就绪")
 		}
 
@@ -655,6 +636,49 @@ func (a *App) handleOCRSelection(rect win.Rect) {
 			log.Printf("app update screenshot overlay failed: %v", err)
 		}
 	}()
+}
+
+// overlayResultPayload turns an OCR/translation result into the final overlay
+// update, including clipped geometry, blurred backgrounds and progress state.
+func (a *App) overlayResultPayload(
+	base uidaemon.OverlayPayload,
+	pngBytes []byte,
+	result backend.OCRTranslateBlocksResult,
+	err error,
+	latency time.Duration,
+) uidaemon.OverlayPayload {
+	update := uidaemon.OverlayPayload{
+		Rect:        base.Rect,
+		WindowRect:  base.WindowRect,
+		BarSide:     base.BarSide,
+		ImageWidth:  base.ImageWidth,
+		ImageHeight: base.ImageHeight,
+		Source:      strings.TrimSpace(result.SourceText),
+		Translation: strings.TrimSpace(result.Translation),
+		Style:       base.Style,
+		LatencyMs:   latency.Milliseconds(),
+	}
+	for _, block := range result.Blocks {
+		update.Blocks = append(update.Blocks, toTranslatedBlock(block))
+	}
+	clipBlockOverlaps(update.Blocks)
+	attachBlurredBackgrounds(pngBytes, update.Blocks)
+
+	switch {
+	case err != nil:
+		update.Error = err.Error()
+		update.Stage = "error"
+		update.Progress = 0
+	case update.Source == "":
+		update.Error = errOCREmptyResult.Error()
+		update.Stage = "error"
+		update.Progress = 0
+	default:
+		update.Stage = "done"
+		update.Progress = 100
+		update.Lines = len(update.Blocks)
+	}
+	return update
 }
 
 // ocrTranslateFrame prefers the line-level blocks endpoint. Older packaged
@@ -772,6 +796,116 @@ func (a *App) overlayCurrent(seq int) bool {
 
 func (a *App) invalidateOverlay() {
 	a.beginOverlay()
+	a.shotMu.Lock()
+	a.shotFrame = nil
+	a.shotMu.Unlock()
+}
+
+// shotFrame keeps the last screenshot so the refresh button can re-run OCR and
+// translation without recapturing the screen.
+type shotFrame struct {
+	base uidaemon.OverlayPayload
+	png  []byte
+}
+
+func (a *App) storeShotFrame(base uidaemon.OverlayPayload, pngBytes []byte) {
+	a.shotMu.Lock()
+	a.shotFrame = &shotFrame{base: base, png: pngBytes}
+	a.shotMu.Unlock()
+}
+
+func (a *App) currentShotFrame() *shotFrame {
+	a.shotMu.Lock()
+	defer a.shotMu.Unlock()
+	return a.shotFrame
+}
+
+// refreshScreenshot re-runs OCR and translation for the displayed screenshot.
+// force=true bypasses the backend line cache so a manual refresh produces a
+// fresh model result.
+func (a *App) refreshScreenshot() {
+	a.resultMu.Lock()
+	if a.busy {
+		a.resultMu.Unlock()
+		return
+	}
+	a.shotMu.Lock()
+	frame := a.shotFrame
+	a.shotMu.Unlock()
+	if frame == nil || len(frame.png) == 0 {
+		a.resultMu.Unlock()
+		return
+	}
+	a.busy = true
+	a.resultMu.Unlock()
+
+	seq := a.beginOverlay()
+	base := frame.base
+	base.Loading = true
+	base.Stage = "ocr"
+	base.Progress = 15
+	base.Lines = 0
+	base.Blocks = nil
+	base.Source = ""
+	base.Translation = ""
+	base.Error = ""
+	base.LatencyMs = 0
+	a.updateOverlayProgress(seq, base, "ocr", 15, 0)
+	a.setStatus("正在刷新译文...")
+
+	go func() {
+		defer a.finishBusy()
+		reqCtx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+		defer cancel()
+
+		startedAt := time.Now()
+		var result backend.OCRTranslateBlocksResult
+		callErr := a.withBackend(reqCtx, func(status string) {
+			if status != "" {
+				a.setStatus(status)
+			}
+		}, func(callCtx context.Context) error {
+			ocr, ocrErr := a.client.OCRBlocks(callCtx, frame.png)
+			switch {
+			case errors.Is(ocrErr, backend.ErrOCRBlocksUnsupported):
+				log.Printf("app refresh using legacy combined path")
+				var err error
+				result, err = a.ocrTranslateFrame(callCtx, frame.png)
+				return err
+			case ocrErr != nil:
+				return ocrErr
+			default:
+				a.updateOverlayProgress(seq, base, "translate", 55, len(ocr.LineBoxes))
+				var err error
+				result, err = a.translateOCRResult(callCtx, ocr, true)
+				return err
+			}
+		})
+
+		if !a.overlayCurrent(seq) {
+			log.Printf("app refresh result dropped: overlay closed")
+			return
+		}
+
+		update := a.overlayResultPayload(base, frame.png, result, callErr, time.Since(startedAt))
+		switch {
+		case callErr != nil:
+			log.Printf("app refresh screenshot failed: %v", callErr)
+			a.setStatus("刷新失败")
+		case update.Source == "":
+			log.Printf("app refresh returned empty text")
+			a.setStatus("OCR 未识别到文本")
+		default:
+			log.Printf("app refresh screenshot success: blocks=%d", len(update.Blocks))
+			a.setStatus("就绪")
+		}
+
+		updateCtx, updateCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer updateCancel()
+		if err := a.overlayUI.ShowOverlay(updateCtx, update); err != nil {
+			log.Printf("app update refreshed overlay failed: %v", err)
+		}
+	}()
 }
 
 // ── 区域实时翻译 ──────────────────────────────────────────
@@ -854,6 +988,8 @@ func (a *App) startLiveSession(rect win.Rect) {
 	a.livePaused = false
 	a.liveDragging = false
 	a.liveDragEpoch++
+	a.liveRefresh = make(chan struct{}, 1)
+	refresh := a.liveRefresh
 	a.liveLast = initial
 	a.liveRect = rect
 	a.liveBarSide = barSide
@@ -862,29 +998,39 @@ func (a *App) startLiveSession(rect win.Rect) {
 	a.setStatus("实时翻译监听中")
 	a.pushLive(initial)
 	go a.liveMoveWatcher(ctx)
-	go a.liveLoop(ctx, rect)
+	go a.liveLoop(ctx, rect, refresh)
 }
 
-// liveLoop captures the selected region, deduplicates identical frames, runs
-// OCR, then translates the recognized lines. OCR and the LLM are deliberately
-// serialized: both are CPU/memory-bandwidth bound, and overlapping them
-// measured ~30% slower than running them one after the other on a 20-thread
-// CPU, so a pipeline would lose time rather than save it.
-func (a *App) liveLoop(ctx context.Context, rect win.Rect) {
+// liveLoop captures the selected region, skips frames that are visually
+// identical to the last processed one, then runs OCR and translation. OCR and
+// the LLM are deliberately serialized: both are CPU/memory-bandwidth bound, and
+// overlapping them measured ~30% slower than running them one after the other.
+func (a *App) liveLoop(ctx context.Context, rect win.Rect, refresh <-chan struct{}) {
 	ticker := time.NewTicker(700 * time.Millisecond)
 	defer ticker.Stop()
 
-	var lastHash uint64
-	first := true
+	var lastFingerprint win.FrameFingerprint
+	haveFingerprint := false
 	lastEpoch := -1
+	forceNext := false
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
+		force := forceNext
+		forceNext = false
+		if !force {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			case <-refresh:
+				force = true
+			}
 		}
 
-		if a.isLivePaused() || a.isLiveDragging() {
+		paused := a.isLivePaused()
+		if paused && !force {
+			continue
+		}
+		if a.isLiveDragging() {
 			continue
 		}
 
@@ -896,11 +1042,9 @@ func (a *App) liveLoop(ctx context.Context, rect win.Rect) {
 		}
 		epoch := a.liveEpoch()
 		if epoch != lastEpoch {
-			// A drag/resize invalidated the previous content; recapture even if
-			// the new pixels happen to hash the same.
+			// A drag/resize invalidated the previous content; always recapture.
 			lastEpoch = epoch
-			first = true
-			lastHash = 0
+			haveFingerprint = false
 		}
 
 		startedAt := time.Now()
@@ -913,7 +1057,7 @@ func (a *App) liveLoop(ctx context.Context, rect win.Rect) {
 			win.ShowWindow(overlayWindow, win.SWHide)
 			time.Sleep(30 * time.Millisecond)
 		}
-		pngBytes, err := win.CaptureScreenPNG(captureRect)
+		pngBytes, fingerprint, err := win.CaptureScreenFrame(captureRect)
 		if overlayWindow != 0 && !captureExcluded {
 			win.ShowWindow(overlayWindow, win.SWShowNoActivate)
 		}
@@ -921,12 +1065,15 @@ func (a *App) liveLoop(ctx context.Context, rect win.Rect) {
 			log.Printf("app live capture failed: %v", err)
 			continue
 		}
-		digest := hashBytes(pngBytes)
-		if !first && digest == lastHash {
+
+		// Similar frames (caret blink, cursor movement, anti-aliasing noise) do
+		// not change the recognized text, so reusing the previous overlay avoids
+		// a full OCR + translation cycle. The refresh button bypasses this.
+		if !force && haveFingerprint && lastFingerprint.Similar(fingerprint) {
 			continue
 		}
-		first = false
-		lastHash = digest
+		haveFingerprint = true
+		lastFingerprint = fingerprint
 		a.pushLiveProgress("ocr", 15, 0)
 
 		reqCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
@@ -942,7 +1089,7 @@ func (a *App) liveLoop(ctx context.Context, rect win.Rect) {
 			callErr = ocrErr
 		default:
 			a.pushLiveProgress("translate", 55, len(ocr.LineBoxes))
-			result, callErr = a.translateOCRResult(reqCtx, ocr)
+			result, callErr = a.translateOCRResult(reqCtx, ocr, force)
 		}
 		cancel()
 		if ctx.Err() != nil {
@@ -952,33 +1099,36 @@ func (a *App) liveLoop(ctx context.Context, rect win.Rect) {
 		// A drag/resize during inference invalidates this frame: the watcher
 		// already cleared the overlay, so never push stale blocks back.
 		if a.liveEpoch() != epoch || a.isLiveDragging() {
-			first = true
-			lastHash = 0
+			haveFingerprint = false
 			continue
 		}
 		// If the window moved/resized while the engine was working, discard this
 		// frame and immediately process the new region instead.
 		if nextAnchor, _, _, nextOK := a.currentLiveGeometry(); nextOK && nextAnchor != captureRect {
-			first = true
-			lastHash = 0
+			haveFingerprint = false
 			continue
 		}
 
 		payload := a.livePayloadFrom(captureRect, windowRect, barSide, pngBytes, result, callErr)
 		payload.LatencyMs = time.Since(startedAt).Milliseconds()
+		if paused {
+			payload.Status = "paused"
+			payload.Stage = ""
+			payload.Progress = 0
+		}
 		a.pushLive(payload)
 
 		if callErr != nil {
 			// Retry the same screen after the engine becomes available.
-			first = true
-			lastHash = 0
+			haveFingerprint = false
 		}
 	}
 }
 
 // translateOCRResult translates an already-OCR'd frame, falling back to
 // whole-text translation for engines without the split blocks endpoint.
-func (a *App) translateOCRResult(ctx context.Context, ocr backend.OCRBlocksResult) (backend.OCRTranslateBlocksResult, error) {
+// force bypasses the backend line cache (manual refresh).
+func (a *App) translateOCRResult(ctx context.Context, ocr backend.OCRBlocksResult, force bool) (backend.OCRTranslateBlocksResult, error) {
 	text := strings.TrimSpace(ocr.Text)
 	if len(ocr.LineBoxes) > 0 {
 		result, err := a.client.TranslateBlocksWithLanguages(
@@ -989,6 +1139,7 @@ func (a *App) translateOCRResult(ctx context.Context, ocr backend.OCRBlocksResul
 			ocr.ImageHeight,
 			a.cfg.SourceLanguage,
 			a.cfg.TargetLanguage,
+			force,
 		)
 		if !errors.Is(err, backend.ErrOCRBlocksUnsupported) {
 			return result, err
@@ -1331,6 +1482,23 @@ func (a *App) setLivePaused(paused bool) {
 	a.pushLive(payload)
 }
 
+// requestLiveRefresh asks the live loop to re-run OCR and translation on the
+// current screen even if it is visually identical to the previous frame.
+func (a *App) requestLiveRefresh() {
+	a.liveMu.Lock()
+	refresh := a.liveRefresh
+	active := a.liveActive
+	a.liveMu.Unlock()
+	if !active || refresh == nil {
+		return
+	}
+	select {
+	case refresh <- struct{}{}:
+	default:
+	}
+	a.setStatus("正在刷新实时译文...")
+}
+
 func (a *App) stopLiveSession(hideUI bool) {
 	a.liveMu.Lock()
 	cancel := a.liveCancel
@@ -1338,6 +1506,7 @@ func (a *App) stopLiveSession(hideUI bool) {
 	a.liveCancel = nil
 	a.liveActive = false
 	a.livePaused = false
+	a.liveRefresh = nil
 	a.liveLast = uidaemon.LivePayload{}
 	a.liveMu.Unlock()
 
@@ -1400,12 +1569,6 @@ func computeFrameLayout(rect win.Rect) (uidaemon.ScreenRect, string) {
 		Height: int(rect.Height() + 2*border + bar),
 	}
 	return window, side
-}
-
-func hashBytes(data []byte) uint64 {
-	digest := fnv.New64a()
-	_, _ = digest.Write(data)
-	return digest.Sum64()
 }
 
 func (a *App) finishBusy() {
@@ -1893,12 +2056,16 @@ func (a *App) handleUIDaemonEvent(event int) {
 		win.PostMessage(a.hwnd, wmHotkeyResume, 0, 0)
 	case uidaemon.EventOverlayClosed:
 		win.PostMessage(a.hwnd, wmOverlayClosed, 0, 0)
+	case uidaemon.EventOverlayRefresh:
+		win.PostMessage(a.hwnd, wmOverlayRefresh, 0, 0)
 	case uidaemon.EventLivePause:
 		win.PostMessage(a.hwnd, wmLivePause, 0, 0)
 	case uidaemon.EventLiveResume:
 		win.PostMessage(a.hwnd, wmLiveResume, 0, 0)
 	case uidaemon.EventLiveStop:
 		win.PostMessage(a.hwnd, wmLiveStop, 0, 0)
+	case uidaemon.EventLiveRefresh:
+		win.PostMessage(a.hwnd, wmLiveRefresh, 0, 0)
 	}
 }
 
@@ -2027,6 +2194,10 @@ func mainWindowProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		currentApp.invalidateOverlay()
 		currentApp.finishBusy()
 		return 0
+	case wmOverlayRefresh:
+		log.Printf("main window proc: refresh screenshot translation")
+		currentApp.refreshScreenshot()
+		return 0
 	case wmLivePause:
 		log.Printf("main window proc: live translation paused")
 		currentApp.setLivePaused(true)
@@ -2038,6 +2209,10 @@ func mainWindowProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 	case wmLiveStop:
 		log.Printf("main window proc: live translation stopped by ui")
 		currentApp.stopLiveSession(false)
+		return 0
+	case wmLiveRefresh:
+		log.Printf("main window proc: refresh live translation")
+		currentApp.requestLiveRefresh()
 		return 0
 	case win.WmClose:
 		log.Printf("main window proc: wm_close")

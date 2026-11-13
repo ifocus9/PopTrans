@@ -28,6 +28,8 @@ export function OnHidden():Promise<void>;
 
 export function Quit():Promise<void>;
 
+export function RefreshOverlay():Promise<void>;
+
 export function SaveConfig(arg1:config.Config):Promise<void>;
 
 export function SearchModels(arg1:string,arg2:string):Promise<Array<wailsui.ModelSearchItem>>;

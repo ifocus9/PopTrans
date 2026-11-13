@@ -41,6 +41,7 @@ import {
   LiveControl,
   ModelStatuses,
   OCRTranslateImage,
+  RefreshOverlay,
   SaveConfig,
   SearchModels,
   SetHotkeyRecording,
@@ -909,6 +910,9 @@ function renderOverlay() {
         <button class="shot-btn" id="shotCopyTargetBtn" type="button" title="复制译文 (Ctrl+C)">
           <i data-lucide="languages"></i><span>译文</span>
         </button>
+        <button class="shot-btn" id="shotRefreshBtn" type="button" title="刷新译文">
+          <i data-lucide="rotate-ccw"></i><span>刷新</span>
+        </button>
         <button class="shot-btn" id="shotPinBtn" type="button" title="${state.overlayPinned ? "取消置顶" : "置顶"}">
           <i data-lucide="${state.overlayPinned ? "pin" : "pin-off"}"></i>
         </button>
@@ -930,6 +934,9 @@ function renderOverlay() {
         </button>
         <button class="shot-menu-item" type="button" data-target="shotCopyTargetBtn">
           <i data-lucide="languages"></i><span>复制译文</span>
+        </button>
+        <button class="shot-menu-item" type="button" data-target="shotRefreshBtn">
+          <i data-lucide="rotate-ccw"></i><span>刷新译文</span>
         </button>
         <button class="shot-menu-item" type="button" data-target="shotPinBtn">
           <i data-lucide="${state.overlayPinned ? "pin-off" : "pin"}"></i><span>${state.overlayPinned ? "取消置顶" : "置顶"}</span>
@@ -974,6 +981,14 @@ function renderOverlay() {
         "已复制译文",
       ),
     )
+  document
+    .querySelector("#shotRefreshBtn")
+    ?.addEventListener("click", () => {
+      if (window.go?.wailsui?.App?.RefreshOverlay) {
+        RefreshOverlay().catch(() => {})
+        showShotToast("正在刷新译文...")
+      }
+    })
   document.querySelector("#shotPinBtn")?.addEventListener("click", () => {
     state.overlayPinned = !state.overlayPinned
     if (window.runtime?.WindowSetAlwaysOnTop) {
@@ -1441,6 +1456,9 @@ function renderLive() {
         <button class="shot-btn" id="liveCopyTargetBtn" type="button" title="复制译文">
           <i data-lucide="languages"></i><span>译文</span>
         </button>
+        <button class="shot-btn" id="liveRefreshBtn" type="button" title="刷新实时译文">
+          <i data-lucide="rotate-ccw"></i><span>刷新</span>
+        </button>
         <button class="shot-btn" id="livePinBtn" type="button" title="${state.livePinned ? "取消置顶" : "置顶"}">
           <i data-lucide="${state.livePinned ? "pin" : "pin-off"}"></i>
         </button>
@@ -1465,6 +1483,9 @@ function renderLive() {
         </button>
         <button class="shot-menu-item" type="button" data-target="liveCopyTargetBtn">
           <i data-lucide="languages"></i><span>复制译文</span>
+        </button>
+        <button class="shot-menu-item" type="button" data-target="liveRefreshBtn">
+          <i data-lucide="rotate-ccw"></i><span>刷新实时译文</span>
         </button>
         <button class="shot-menu-item" type="button" data-target="livePinBtn">
           <i data-lucide="${state.livePinned ? "pin-off" : "pin"}"></i><span>${state.livePinned ? "取消置顶" : "置顶"}</span>
@@ -1523,6 +1544,14 @@ function renderLive() {
     ?.addEventListener("click", () => {
       const text = live.translation || translatedJoin(blocks)
       copyShotText(text, "已复制译文")
+    })
+  document
+    .querySelector("#liveRefreshBtn")
+    ?.addEventListener("click", () => {
+      if (window.go?.wailsui?.App?.LiveControl) {
+        LiveControl("refresh").catch(() => {})
+        showShotToast("正在刷新实时译文...")
+      }
     })
   document.querySelector("#livePinBtn")?.addEventListener("click", () => {
     state.livePinned = !state.livePinned

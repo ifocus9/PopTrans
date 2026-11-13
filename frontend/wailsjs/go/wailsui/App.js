@@ -50,6 +50,10 @@ export function Quit() {
   return window['go']['wailsui']['App']['Quit']();
 }
 
+export function RefreshOverlay() {
+  return window['go']['wailsui']['App']['RefreshOverlay']();
+}
+
 export function SaveConfig(arg1) {
   return window['go']['wailsui']['App']['SaveConfig'](arg1);
 }

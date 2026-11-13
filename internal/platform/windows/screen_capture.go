@@ -70,28 +70,35 @@ func EncodePNGToJPEG(pngBytes []byte, quality int) ([]byte, error) {
 }
 
 func CaptureScreenPNG(rect Rect) ([]byte, error) {
+	pngBytes, _, err := CaptureScreenFrame(rect)
+	return pngBytes, err
+}
+
+// CaptureScreenFrame captures a region once and returns both the lossless PNG
+// used for OCR and a downscaled fingerprint used for change detection.
+func CaptureScreenFrame(rect Rect) ([]byte, FrameFingerprint, error) {
 	rect = NormalizeRect(rect)
 	width := rect.Width()
 	height := rect.Height()
 	if width <= 0 || height <= 0 {
-		return nil, fmt.Errorf("invalid capture rect: %+v", rect)
+		return nil, FrameFingerprint{}, fmt.Errorf("invalid capture rect: %+v", rect)
 	}
 
 	screenDC, _, err := procGetDC.Call(0)
 	if screenDC == 0 {
-		return nil, fmt.Errorf("get screen dc: %w", err)
+		return nil, FrameFingerprint{}, fmt.Errorf("get screen dc: %w", err)
 	}
 	defer procReleaseDC.Call(0, screenDC)
 
 	memDC, _, err := procCreateCompatibleDC.Call(screenDC)
 	if memDC == 0 {
-		return nil, fmt.Errorf("create compatible dc: %w", err)
+		return nil, FrameFingerprint{}, fmt.Errorf("create compatible dc: %w", err)
 	}
 	defer procDeleteDC.Call(memDC)
 
 	bitmap, _, err := procCreateCompatibleBitmap.Call(screenDC, uintptr(width), uintptr(height))
 	if bitmap == 0 {
-		return nil, fmt.Errorf("create compatible bitmap: %w", err)
+		return nil, FrameFingerprint{}, fmt.Errorf("create compatible bitmap: %w", err)
 	}
 	defer deleteObject(bitmap)
 
@@ -112,7 +119,7 @@ func CaptureScreenPNG(rect Rect) ([]byte, error) {
 		srccopy|captureBLT,
 	)
 	if ok == 0 {
-		return nil, fmt.Errorf("bitblt: %w", err)
+		return nil, FrameFingerprint{}, fmt.Errorf("bitblt: %w", err)
 	}
 	// GetDIBits requires the bitmap not to be selected into any device context.
 	if oldObj != 0 {
@@ -143,7 +150,7 @@ func CaptureScreenPNG(rect Rect) ([]byte, error) {
 		dibRGBColors,
 	)
 	if lines == 0 {
-		return nil, fmt.Errorf("get dibits: %w", err)
+		return nil, FrameFingerprint{}, fmt.Errorf("get dibits: %w", err)
 	}
 
 	img := image.NewRGBA(image.Rect(0, 0, int(width), int(height)))
@@ -158,9 +165,10 @@ func CaptureScreenPNG(rect Rect) ([]byte, error) {
 		}
 	}
 
+	fingerprint := FingerprintImage(img)
 	var out bytes.Buffer
 	if err := png.Encode(&out, img); err != nil {
-		return nil, err
+		return nil, FrameFingerprint{}, err
 	}
-	return out.Bytes(), nil
+	return out.Bytes(), fingerprint, nil
 }

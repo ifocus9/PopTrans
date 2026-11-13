@@ -243,6 +243,7 @@ curl -X POST http://127.0.0.1:8989/api/v1/ocr_translate_blocks \
 | `image_width/image_height` | number | 否 | 图片尺寸，原样回传 |
 | `source_lang` | string | 否 | 原文语言；省略或 `auto` 时自动判断 |
 | `target_lang` | string | 否 | 目标语言；省略时中英自动互译 |
+| `force` | bool | 否 | `true` 时跳过逐行翻译缓存，强制重新推理（供手动刷新按钮使用） |
 
 `lines` 最多 300 行。
 

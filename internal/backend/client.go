@@ -123,6 +123,7 @@ type translateBlocksRequest struct {
 	ImageHeight int       `json:"image_height"`
 	SourceLang  string    `json:"source_lang,omitempty"`
 	TargetLang  string    `json:"target_lang,omitempty"`
+	Force       bool      `json:"force,omitempty"`
 }
 
 // OCRTranslateBlocksResult returns per-line translations aligned to image boxes.
@@ -471,7 +472,7 @@ func (c *Client) OCRBlocks(ctx context.Context, pngBytes []byte) (OCRBlocksResul
 
 // TranslateBlocks translates lines that were already recognized by OCRBlocks.
 func (c *Client) TranslateBlocks(ctx context.Context, lines []OCRLine, sourceText string, imageWidth, imageHeight int) (OCRTranslateBlocksResult, error) {
-	return c.TranslateBlocksWithLanguages(ctx, lines, sourceText, imageWidth, imageHeight, "", "")
+	return c.TranslateBlocksWithLanguages(ctx, lines, sourceText, imageWidth, imageHeight, "", "", false)
 }
 
 func (c *Client) TranslateBlocksWithLanguages(
@@ -480,12 +481,13 @@ func (c *Client) TranslateBlocksWithLanguages(
 	sourceText string,
 	imageWidth, imageHeight int,
 	sourceLang, targetLang string,
+	force bool,
 ) (OCRTranslateBlocksResult, error) {
 	var decoded OCRTranslateBlocksResult
 	startedAt := time.Now()
 	log.Printf(
-		"backend translate_blocks request start: lines=%d chars=%d source=%q target=%q",
-		len(lines), len(sourceText), sourceLang, targetLang,
+		"backend translate_blocks request start: lines=%d chars=%d source=%q target=%q force=%t",
+		len(lines), len(sourceText), sourceLang, targetLang, force,
 	)
 
 	payload := translateBlocksRequest{
@@ -495,6 +497,7 @@ func (c *Client) TranslateBlocksWithLanguages(
 		ImageHeight: imageHeight,
 		SourceLang:  normalizeLanguage(sourceLang),
 		TargetLang:  normalizeLanguage(targetLang),
+		Force:       force,
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {

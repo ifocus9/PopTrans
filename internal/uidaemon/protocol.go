@@ -23,9 +23,10 @@ const (
 	EndpointNotifyConfig  = "/notify/config-saved"
 
 	// Callback endpoints posted by the UI process back to the host.
-	EndpointNotifyHotkeyHold    = "/notify/hotkey-hold"
-	EndpointNotifyOverlayClosed = "/notify/overlay-closed"
-	EndpointNotifyLiveControl   = "/notify/live-control"
+	EndpointNotifyHotkeyHold      = "/notify/hotkey-hold"
+	EndpointNotifyOverlayClosed   = "/notify/overlay-closed"
+	EndpointNotifyOverlayRefresh  = "/notify/overlay-refresh"
+	EndpointNotifyLiveControl     = "/notify/live-control"
 
 	headerToken = "X-PopTrans-Token"
 )

@@ -1359,11 +1359,14 @@ class Translator:
         lines: list[str],
         target_lang: Optional[str] = None,
         source_lang: Optional[str] = None,
+        use_cache: bool = True,
     ) -> Tuple[list[str], Optional[str]]:
         """Translate OCR lines while keeping one result per input line.
 
         Returns (translations, error). Untranslatable lines are returned as
         empty strings so callers can fall back to the source text for that box.
+        use_cache=False forces a fresh model call for every line (the manual
+        refresh button), while still updating the cache with the new result.
         """
         if not self.ready:
             return [], self._status_message
@@ -1394,14 +1397,16 @@ class Translator:
         for index, line in enumerate(cleaned):
             if not line:
                 continue
-            cached = self._get_cached_translation(
-                (
-                    line,
-                    target_code,
-                    normalized_source or "auto",
-                    _glossary_signature(line, glossary),
+            cached = None
+            if use_cache:
+                cached = self._get_cached_translation(
+                    (
+                        line,
+                        target_code,
+                        normalized_source or "auto",
+                        _glossary_signature(line, glossary),
+                    )
                 )
-            )
             if cached is not None:
                 results[index] = cached
             else:

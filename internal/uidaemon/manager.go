@@ -32,6 +32,10 @@ const (
 	EventLivePause  = 7
 	EventLiveResume = 8
 	EventLiveStop   = 9
+	// EventOverlayRefresh re-runs the current screenshot translation.
+	EventOverlayRefresh = 10
+	// EventLiveRefresh re-runs OCR + translation for the current live frame.
+	EventLiveRefresh = 11
 
 	processQueryLimitedInformation = 0x1000
 	stillActive                    = 259

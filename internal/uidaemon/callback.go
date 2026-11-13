@@ -95,6 +95,16 @@ func (s *CallbackServer) Start() (url, token string, err error) {
 		}
 		writeJSON(w, map[string]any{"ok": true})
 	}))
+	mux.HandleFunc(EndpointNotifyOverlayRefresh, s.withAuth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if s.onEvent != nil {
+			s.onEvent(EventOverlayRefresh)
+		}
+		writeJSON(w, map[string]any{"ok": true})
+	}))
 	mux.HandleFunc(EndpointNotifyLiveControl, s.withAuth(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -113,6 +123,8 @@ func (s *CallbackServer) Start() (url, token string, err error) {
 				s.onEvent(EventLiveResume)
 			case "stop":
 				s.onEvent(EventLiveStop)
+			case "refresh":
+				s.onEvent(EventLiveRefresh)
 			default:
 				http.Error(w, "invalid action", http.StatusBadRequest)
 				return
@@ -192,6 +204,10 @@ func (c *NotifyClient) HotkeyHold(ctx context.Context, paused bool) error {
 
 func (c *NotifyClient) OverlayClosed(ctx context.Context) error {
 	return c.post(ctx, EndpointNotifyOverlayClosed, map[string]any{"ok": true})
+}
+
+func (c *NotifyClient) OverlayRefresh(ctx context.Context) error {
+	return c.post(ctx, EndpointNotifyOverlayRefresh, map[string]any{"ok": true})
 }
 
 func (c *NotifyClient) LiveControl(ctx context.Context, action string) error {

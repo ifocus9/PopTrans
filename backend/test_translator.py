@@ -202,6 +202,28 @@ class LinePromptTests(unittest.TestCase):
         self.assertNotIn("[1]", translator._model.prompts[0])
         self.assertIn("[1]", translator._model.prompts[1])
 
+    def test_translate_lines_can_bypass_cache(self):
+        class CountingModel:
+            def __init__(self):
+                self.calls = 0
+
+            def create_chat_completion(self, messages, **kwargs):
+                self.calls += 1
+                return {"choices": [{"message": {"content": f"译文{self.calls}"}}]}
+
+        translator = Translator()
+        translator.ready = True
+        translator._model = CountingModel()
+
+        first, _ = translator.translate_lines(["hello"], "zh")
+        cached, _ = translator.translate_lines(["hello"], "zh")
+        refreshed, _ = translator.translate_lines(["hello"], "zh", use_cache=False)
+
+        self.assertEqual(first, ["译文1"])
+        self.assertEqual(cached, ["译文1"])
+        self.assertEqual(refreshed, ["译文2"])
+        self.assertEqual(translator._model.calls, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

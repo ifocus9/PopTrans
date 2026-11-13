@@ -170,6 +170,7 @@ def _translate_line_boxes(
     image_height: int,
     target_lang: Optional[str],
     source_lang: Optional[str],
+    force: bool = False,
 ) -> dict:
     """Translate OCR line boxes and return the overlay block payload."""
     translations: list[str] = []
@@ -178,6 +179,7 @@ def _translate_line_boxes(
             [block.get("text", "") for block in line_boxes],
             target_lang,
             source_lang,
+            use_cache=not force,
         )
         if error:
             raise HTTPException(status_code=500, detail=error)
@@ -280,6 +282,9 @@ class TranslateBlocksBody(BaseModel):
     image_height: int = 0
     source_lang: Optional[str] = None
     target_lang: Optional[str] = None
+    # force=True bypasses the line cache so the manual refresh button gets a
+    # fresh model result even when the OCR text is unchanged.
+    force: bool = False
 
 
 @app.post("/api/v1/translate_blocks")
@@ -303,6 +308,7 @@ def translate_blocks(body: TranslateBlocksBody):
             body.image_height,
             body.target_lang,
             body.source_lang,
+            force=body.force,
         )
     except HTTPException:
         raise

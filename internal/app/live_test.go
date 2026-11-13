@@ -18,6 +18,7 @@ func TestTranslateLiveFrameUsesSplitBlocksEndpoint(t *testing.T) {
 		SourceText  string            `json:"source_text"`
 		ImageWidth  int               `json:"image_width"`
 		ImageHeight int               `json:"image_height"`
+		Force       bool              `json:"force"`
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/translate_blocks" {
@@ -47,7 +48,7 @@ func TestTranslateLiveFrameUsesSplitBlocksEndpoint(t *testing.T) {
 		ImageWidth: 640, ImageHeight: 480,
 	}
 
-	result, err := app.translateOCRResult(t.Context(), ocr)
+	result, err := app.translateOCRResult(t.Context(), ocr, true)
 	if err != nil {
 		t.Fatalf("translateOCRResult: %v", err)
 	}
@@ -59,6 +60,9 @@ func TestTranslateLiveFrameUsesSplitBlocksEndpoint(t *testing.T) {
 	}
 	if received.ImageWidth != 640 || received.ImageHeight != 480 {
 		t.Fatalf("image size not forwarded: %+v", received)
+	}
+	if !received.Force {
+		t.Fatal("force refresh flag was not forwarded")
 	}
 }
 
@@ -86,7 +90,7 @@ func TestTranslateLiveFrameFallsBackToWholeText(t *testing.T) {
 	result, err := app.translateOCRResult(t.Context(), backend.OCRBlocksResult{
 		Text:      "Hello\nWorld",
 		LineBoxes: []backend.OCRLine{{Text: "Hello"}},
-	})
+	}, false)
 	if err != nil {
 		t.Fatalf("translateOCRResult fallback: %v", err)
 	}
@@ -104,7 +108,7 @@ func TestTranslateLiveFrameBlankRegionIsQuiet(t *testing.T) {
 	defer server.Close()
 
 	app := &App{client: backend.NewClient(server.URL), cfg: config.Config{}}
-	result, err := app.translateOCRResult(t.Context(), backend.OCRBlocksResult{})
+	result, err := app.translateOCRResult(t.Context(), backend.OCRBlocksResult{}, false)
 	if err != nil {
 		t.Fatalf("blank region returned error: %v", err)
 	}

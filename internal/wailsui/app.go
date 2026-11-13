@@ -1395,7 +1395,7 @@ func (a *App) SetHotkeyRecording(recording bool) error {
 	return a.notify.HotkeyHold(ctx, recording)
 }
 
-// LiveControl lets the panel pause/resume/stop the host capture loop.
+// LiveControl lets the panel pause/resume/refresh/stop the host capture loop.
 func (a *App) LiveControl(action string) error {
 	if a.notify == nil {
 		return nil
@@ -1403,6 +1403,17 @@ func (a *App) LiveControl(action string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	return a.notify.LiveControl(ctx, action)
+}
+
+// RefreshOverlay asks the host to re-run OCR and translation for the currently
+// displayed screenshot.
+func (a *App) RefreshOverlay() error {
+	if a.notify == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return a.notify.OverlayRefresh(ctx)
 }
 
 // Hide implements uidaemon.Handler.
