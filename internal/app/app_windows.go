@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
@@ -561,16 +562,21 @@ func (a *App) handleOCRSelection(rect win.Rect) {
 		// top of the live screen, so the captured image is never sent to the UI
 		// process.
 		windowRect, barSide := computeFrameLayout(rect)
+		imageDataURL := ""
+		if jpegBytes, jpegErr := win.EncodePNGToJPEG(pngBytes, 82); jpegErr == nil {
+			imageDataURL = "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(jpegBytes)
+		}
 		basePayload := uidaemon.OverlayPayload{
-			Rect:        screenRect(rect),
-			WindowRect:  windowRect,
-			BarSide:     barSide,
-			ImageWidth:  int(rect.Width()),
-			ImageHeight: int(rect.Height()),
-			Style:       a.overlayStyle(),
-			Loading:     true,
-			Stage:       "ocr",
-			Progress:    15,
+			Rect:         screenRect(rect),
+			WindowRect:   windowRect,
+			BarSide:      barSide,
+			ImageWidth:   int(rect.Width()),
+			ImageHeight:  int(rect.Height()),
+			ImageDataURL: imageDataURL,
+			Style:        a.overlayStyle(),
+			Loading:      true,
+			Stage:        "ocr",
+			Progress:     15,
 		}
 		a.storeShotFrame(basePayload, pngBytes)
 		showCtx, showCancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -611,7 +617,28 @@ func (a *App) handleOCRSelection(rect win.Rect) {
 			lines = len(ocr.LineBoxes)
 			a.updateOverlayProgress(seq, basePayload, "translate", 55, lines)
 			var callErr error
-			result, callErr = a.translateOCRResult(callCtx, ocr, false)
+			result, callErr = a.translateOCRProgressive(callCtx, ocr, false,
+				func(partial backend.OCRTranslateBlocksResult, done, total int) {
+					if !a.overlayCurrent(seq) {
+						return
+					}
+					payload := a.overlayPayloadFromResult(basePayload, pngBytes, partial, nil)
+					payload.Loading = true
+					payload.Stage = "translate"
+					payload.Progress = 55
+					if total > 0 {
+						payload.Progress = 55 + int(40*float64(done)/float64(total))
+						if payload.Progress > 95 {
+							payload.Progress = 95
+						}
+					}
+					payload.Lines = total
+					progressCtx, progressCancel := context.WithTimeout(context.Background(), 20*time.Second)
+					defer progressCancel()
+					if err := a.overlayUI.ShowOverlay(progressCtx, payload); err != nil {
+						log.Printf("app update partial screenshot overlay failed: %v", err)
+					}
+				})
 			return callErr
 		})
 
@@ -641,6 +668,36 @@ func (a *App) handleOCRSelection(rect win.Rect) {
 	}()
 }
 
+// overlayPayloadFromResult builds the image + chips payload without deciding
+// the final stage, so progressive updates can reuse it.
+func (a *App) overlayPayloadFromResult(
+	base uidaemon.OverlayPayload,
+	pngBytes []byte,
+	result backend.OCRTranslateBlocksResult,
+	err error,
+) uidaemon.OverlayPayload {
+	update := uidaemon.OverlayPayload{
+		Rect:         base.Rect,
+		WindowRect:   base.WindowRect,
+		BarSide:      base.BarSide,
+		ImageWidth:   base.ImageWidth,
+		ImageHeight:  base.ImageHeight,
+		ImageDataURL: base.ImageDataURL,
+		Source:       strings.TrimSpace(result.SourceText),
+		Translation:  strings.TrimSpace(result.Translation),
+		Style:        base.Style,
+	}
+	for _, block := range result.Blocks {
+		update.Blocks = append(update.Blocks, toTranslatedBlock(block))
+	}
+	clipBlockOverlaps(update.Blocks)
+	attachBlurredBackgrounds(pngBytes, update.Blocks)
+	if err != nil {
+		update.Error = err.Error()
+	}
+	return update
+}
+
 // overlayResultPayload turns an OCR/translation result into the final overlay
 // update, including clipped geometry, blurred backgrounds and progress state.
 func (a *App) overlayResultPayload(
@@ -650,26 +707,11 @@ func (a *App) overlayResultPayload(
 	err error,
 	latency time.Duration,
 ) uidaemon.OverlayPayload {
-	update := uidaemon.OverlayPayload{
-		Rect:        base.Rect,
-		WindowRect:  base.WindowRect,
-		BarSide:     base.BarSide,
-		ImageWidth:  base.ImageWidth,
-		ImageHeight: base.ImageHeight,
-		Source:      strings.TrimSpace(result.SourceText),
-		Translation: strings.TrimSpace(result.Translation),
-		Style:       base.Style,
-		LatencyMs:   latency.Milliseconds(),
-	}
-	for _, block := range result.Blocks {
-		update.Blocks = append(update.Blocks, toTranslatedBlock(block))
-	}
-	clipBlockOverlaps(update.Blocks)
-	attachBlurredBackgrounds(pngBytes, update.Blocks)
+	update := a.overlayPayloadFromResult(base, pngBytes, result, err)
+	update.LatencyMs = latency.Milliseconds()
 
 	switch {
 	case err != nil:
-		update.Error = err.Error()
 		update.Stage = "error"
 		update.Progress = 0
 	case update.Source == "":
@@ -1167,6 +1209,114 @@ func (a *App) translateOCRResult(ctx context.Context, ocr backend.OCRBlocksResul
 	}, nil
 }
 
+// progressiveBatchLines keeps first results visible quickly for large pages.
+// Each batch is one model call; the backend prompt prefix cache makes the
+// per-batch overhead small.
+const progressiveBatchLines = 4
+
+func ocrBlocksFromLines(ocr backend.OCRBlocksResult) backend.OCRTranslateBlocksResult {
+	result := backend.OCRTranslateBlocksResult{
+		SourceText:  strings.TrimSpace(ocr.Text),
+		ImageWidth:  ocr.ImageWidth,
+		ImageHeight: ocr.ImageHeight,
+	}
+	for _, line := range ocr.LineBoxes {
+		result.Blocks = append(result.Blocks, backend.OCRBlock{
+			Text:       line.Text,
+			X:          line.X,
+			Y:          line.Y,
+			W:          line.W,
+			H:          line.H,
+			Score:      line.Score,
+			Angle:      line.Angle,
+			CX:         line.CX,
+			CY:         line.CY,
+			LineWidth:  line.LineWidth,
+			LineHeight: line.LineHeight,
+		})
+	}
+	return result
+}
+
+// translateOCRProgressive translates OCR lines in small batches and calls
+// onPartial after each batch. The full OCR geometry is available immediately,
+// so the UI can show translated chips as soon as the first batch returns.
+func (a *App) translateOCRProgressive(
+	ctx context.Context,
+	ocr backend.OCRBlocksResult,
+	force bool,
+	onPartial func(result backend.OCRTranslateBlocksResult, done, total int),
+) (backend.OCRTranslateBlocksResult, error) {
+	full := ocrBlocksFromLines(ocr)
+	total := len(full.Blocks)
+	if total == 0 {
+		if text := strings.TrimSpace(ocr.Text); text != "" {
+			translation, err := a.client.TranslateWithLanguages(
+				ctx, text, a.cfg.SourceLanguage, a.cfg.TargetLanguage,
+			)
+			if err != nil {
+				return full, err
+			}
+			full.Translation = strings.TrimSpace(translation)
+		}
+		return full, nil
+	}
+
+	var firstErr error
+	for start := 0; start < total; start += progressiveBatchLines {
+		if ctx.Err() != nil {
+			return full, ctx.Err()
+		}
+		end := start + progressiveBatchLines
+		if end > total {
+			end = total
+		}
+		batch := make([]backend.OCRLine, 0, end-start)
+		for _, block := range full.Blocks[start:end] {
+			batch = append(batch, backend.OCRLine{
+				Text:       block.Text,
+				X:          block.X,
+				Y:          block.Y,
+				W:          block.W,
+				H:          block.H,
+				Score:      block.Score,
+				Angle:      block.Angle,
+				CX:         block.CX,
+				CY:         block.CY,
+				LineWidth:  block.LineWidth,
+				LineHeight: block.LineHeight,
+			})
+		}
+		translated, err := a.client.TranslateBlocksWithLanguages(
+			ctx, batch, "", full.ImageWidth, full.ImageHeight,
+			a.cfg.SourceLanguage, a.cfg.TargetLanguage, force,
+		)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+		} else {
+			for offset := range batch {
+				if offset < len(translated.Blocks) {
+					full.Blocks[start+offset].Translation = translated.Blocks[offset].Translation
+				}
+			}
+		}
+		if onPartial != nil {
+			onPartial(full, end, total)
+		}
+	}
+
+	parts := make([]string, 0, total)
+	for _, block := range full.Blocks {
+		if value := strings.TrimSpace(block.Translation); value != "" {
+			parts = append(parts, value)
+		}
+	}
+	full.Translation = strings.Join(parts, "\n")
+	return full, firstErr
+}
+
 // currentLiveGeometry derives the monitored image area from the live window's
 // current screen geometry. Dragging or resizing the window therefore changes
 // the capture region immediately.
@@ -1188,34 +1338,9 @@ func (a *App) currentLiveGeometry() (win.Rect, win.Rect, string, bool) {
 		return base, win.Rect{}, side, false
 	}
 
-	dpi := win.DpiForRect(window)
-	scale := float64(dpi) / 96.0
-	if scale <= 0 {
-		scale = 1
-	}
-	border := int32(math.Round(2 * scale))
-	bar := int32(math.Round(44 * scale))
-
-	var anchor win.Rect
-	if side == "bottom" {
-		anchor = win.Rect{
-			Left:   window.Left + border,
-			Top:    window.Top + border,
-			Right:  window.Right - border,
-			Bottom: window.Bottom - border - bar,
-		}
-	} else {
-		anchor = win.Rect{
-			Left:   window.Left + border,
-			Top:    window.Top + border + bar,
-			Right:  window.Right - border,
-			Bottom: window.Bottom - border,
-		}
-	}
-	if anchor.Width() < 10 || anchor.Height() < 10 {
-		return base, window, side, false
-	}
-	return anchor, window, side, true
+	// The toolbar lives inside the window, so the capture area is the whole
+	// window rectangle (the overlay itself is excluded from capture).
+	return window, window, "top", true
 }
 
 func (a *App) livePayloadFrom(anchor win.Rect, window win.Rect, barSide string, pngBytes []byte, result backend.OCRTranslateBlocksResult, err error) uidaemon.LivePayload {
@@ -1229,16 +1354,23 @@ func (a *App) livePayloadFrom(anchor win.Rect, window win.Rect, barSide string, 
 		}
 		barSide = computedSide
 	}
+	imageDataURL := ""
+	if len(pngBytes) > 0 {
+		if jpegBytes, jpegErr := win.EncodePNGToJPEG(pngBytes, 78); jpegErr == nil {
+			imageDataURL = "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(jpegBytes)
+		}
+	}
 	payload := uidaemon.LivePayload{
-		Anchor:      screenRect(anchor),
-		WindowRect:  screenRect(window),
-		BarSide:     barSide,
-		ImageWidth:  int(anchor.Width()),
-		ImageHeight: int(anchor.Height()),
-		Source:      strings.TrimSpace(result.SourceText),
-		Translation: strings.TrimSpace(result.Translation),
-		Status:      "listening",
-		Style:       a.overlayStyle(),
+		Anchor:       screenRect(anchor),
+		WindowRect:   screenRect(window),
+		BarSide:      barSide,
+		ImageWidth:   int(anchor.Width()),
+		ImageHeight:  int(anchor.Height()),
+		ImageDataURL: imageDataURL,
+		Source:       strings.TrimSpace(result.SourceText),
+		Translation:  strings.TrimSpace(result.Translation),
+		Status:       "listening",
+		Style:        a.overlayStyle(),
 	}
 	for _, block := range result.Blocks {
 		payload.Blocks = append(payload.Blocks, toTranslatedBlock(block))
@@ -1543,35 +1675,15 @@ const (
 // border placed outside the image. The strip prefers the space above the
 // selection and falls back below it, so it never covers translated text.
 func computeFrameLayout(rect win.Rect) (uidaemon.ScreenRect, string) {
-	dpi := win.DpiForRect(rect)
-	scale := float64(dpi) / 96.0
-	if scale <= 0 {
-		scale = 1
-	}
-	bar := int32(math.Round(frameBarDip * scale))
-	border := int32(math.Round(frameBorderDip * scale))
-
-	area := win.WorkAreaForPoint(win.Point{X: rect.Left, Y: rect.Top})
-	side := "top"
-	y := rect.Top - bar - border
-	if y < area.Top {
-		side = "bottom"
-		y = rect.Top - border
-		if y+rect.Height()+border+bar > area.Bottom {
-			// No room outside on either side (e.g. full-screen selection):
-			// keep the strip above and let it overlap the image's top edge.
-			side = "top"
-			y = area.Top
-		}
-	}
-
-	window := uidaemon.ScreenRect{
-		X:      int(rect.Left - border),
-		Y:      int(y),
-		Width:  int(rect.Width() + 2*border),
-		Height: int(rect.Height() + 2*border + bar),
-	}
-	return window, side
+	// The overlay window is exactly the selected rectangle. The toolbar is drawn
+	// inside it as a floating strip, so the selection never grows outside the
+	// user's drag area.
+	return uidaemon.ScreenRect{
+		X:      int(rect.Left),
+		Y:      int(rect.Top),
+		Width:  int(rect.Width()),
+		Height: int(rect.Height()),
+	}, "top"
 }
 
 func (a *App) finishBusy() {

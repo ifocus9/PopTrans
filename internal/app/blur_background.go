@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	blurBackgroundPad    = 5
+	blurBackgroundPad = 5
 	// A strong blur removes the source glyph shapes from the chip background, so
 	// only the translated text is readable over the original line.
 	blurBackgroundRadius = 14
@@ -35,6 +35,11 @@ func attachBlurredBackgrounds(pngBytes []byte, blocks []uidaemon.TranslatedBlock
 	for index := range blocks {
 		block := &blocks[index]
 		if strings.TrimSpace(block.Translation) == "" {
+			continue
+		}
+		// Progressive updates keep blocks from earlier batches; do not re-blur
+		// them on every partial refresh.
+		if block.BackgroundImage != "" {
 			continue
 		}
 		x0 := int(math.Floor(block.X)) - blurBackgroundPad

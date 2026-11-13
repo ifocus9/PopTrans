@@ -1270,8 +1270,8 @@ func (a *App) ShowOverlay(payload uidaemon.OverlayPayload) error {
 		windowRect = payload.Rect
 	}
 	a.prepareOverlayWindow()
-	// Screenshot overlays are also transparent: only the translated chips are
-	// drawn over the real screen, and the image area stays click-through.
+	// The screenshot overlay now displays the captured frame as an opaque base,
+	// so the whole window is interactive instead of click-through.
 	a.setHitTest(
 		win.Rect{
 			Left:   int32(payload.Rect.X - windowRect.X),
@@ -1279,7 +1279,7 @@ func (a *App) ShowOverlay(payload uidaemon.OverlayPayload) error {
 			Right:  int32(payload.Rect.X - windowRect.X + payload.Rect.Width),
 			Bottom: int32(payload.Rect.Y - windowRect.Y + payload.Rect.Height),
 		},
-		true,
+		false,
 		false,
 	)
 	if hwnd := win.FindWindowByTitle(a.windowTitle); hwnd != 0 {
@@ -1328,8 +1328,8 @@ func (a *App) ShowLive(payload uidaemon.LivePayload) error {
 		windowRect = payload.Anchor
 	}
 	a.prepareOverlayWindow()
-	// Live translation only draws text chips over the real screen; the chip
-	// area is click-through so the user can keep operating the app underneath.
+	// The live panel also shows the captured frame, so it is an interactive
+	// rectangle; the page's edge strips handle resizing.
 	a.setHitTest(
 		win.Rect{
 			Left:   int32(payload.Anchor.X - windowRect.X),
@@ -1337,8 +1337,8 @@ func (a *App) ShowLive(payload uidaemon.LivePayload) error {
 			Right:  int32(payload.Anchor.X - windowRect.X + payload.Anchor.Width),
 			Bottom: int32(payload.Anchor.Y - windowRect.Y + payload.Anchor.Height),
 		},
-		true,
-		true,
+		false,
+		false,
 	)
 	if hwnd := win.FindWindowByTitle(a.windowTitle); hwnd != 0 {
 		// Edge resizing is handled by the page so the shaped window keeps a

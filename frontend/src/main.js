@@ -1009,6 +1009,28 @@ function overlayProgressHtml(active, progress) {
   </div>`
 }
 
+let overlayBarHideTimer = null
+
+// The toolbar now floats inside the selected image. Hide it after a short idle
+// period so it does not cover the top line, and reveal it on pointer movement.
+function bindOverlayBarAutoHide(loading, status) {
+  const win = document.querySelector(".shot-window")
+  if (!win) return
+  const keepVisible = Boolean(loading) || status === "translating"
+  const reveal = () => {
+    win.classList.remove("bar-hidden")
+    clearTimeout(overlayBarHideTimer)
+    if (!keepVisible) {
+      overlayBarHideTimer = setTimeout(() => {
+        win.classList.add("bar-hidden")
+      }, 2600)
+    }
+  }
+  win.addEventListener("pointermove", reveal, { passive: true })
+  win.addEventListener("pointerdown", reveal, { passive: true })
+  reveal()
+}
+
 function renderOverlay() {
   const overlay = state.overlay || {}
   const blocks = Array.isArray(overlay.blocks) ? overlay.blocks : []
@@ -1030,8 +1052,8 @@ function renderOverlay() {
     500,
   )
   const barSide = overlay.bar_side === "bottom" ? "bottom" : "top"
-  const imageAreaH = Math.max(80, (window.innerHeight || 600) - 48)
-  const imageAreaW = Math.max(80, (window.innerWidth || 800) - 4)
+  const imageAreaH = Math.max(80, window.innerHeight || 600)
+  const imageAreaW = Math.max(80, window.innerWidth || 800)
   const geometries = blocks.map((block) =>
     overlayBlockGeometry(block, imgW, imgH, imageAreaH),
   )
@@ -1041,13 +1063,11 @@ function renderOverlay() {
       const source = String(block.text || "")
       const translated = String(block.translation || "")
       const showSource = showOriginal || blockOriginal.has(index)
-      // Empty translations stay blank instead of covering the source text.
-      if (!showSource && !translated) return ""
-      const text = showSource ? source : translated
-      if (!text) return ""
-      // Formula lines that the translator left untouched are better left as the
-      // original screen content than covered by garbled OCR text.
-      if (!showSource && isUnchangedMathLine(source, translated)) return ""
+      // Showing the original means revealing the captured frame underneath:
+      // simply omit the chip instead of re-rendering the source text.
+      if (showSource) return ""
+      if (!translated) return ""
+      const text = translated
       const { left, top, width, height, fontPx, angle } =
         fitOverlayBlockText({
           text,
@@ -1168,6 +1188,7 @@ function renderOverlay() {
         </button>
       </div>
       <div class="shot-image-wrap">
+        ${overlay.image_data_url ? `<img class="shot-image" src="${overlay.image_data_url}" alt="" draggable="false">` : ""}
         <div class="shot-blocks">${renderedBlocks}</div>
         ${error ? `<div class="shot-pill is-error" title="${escapeHtml(error)}">${escapeHtml(error)}</div>` : ""}
         ${fullText}
@@ -1252,6 +1273,7 @@ function renderOverlay() {
   bindShotMenu("shotMoreBtn", "shotMenu", "shotMenuScrim")
   bindOverlayResize()
   syncOverlayRegion()
+  bindOverlayBarAutoHide(loading, "")
 }
 
 // In very narrow overlay windows the toolbar collapses to a single "…" button.
@@ -1262,6 +1284,27 @@ function renderOverlay() {
 function syncOverlayRegion() {
   if (!window.go?.wailsui?.App?.SetOverlayRegion) return
   const dpr = window.devicePixelRatio || 1
+  // With a captured frame the whole window is covered by the image; shape it
+  // as a plain rectangle so the selection stays exactly the drag rectangle.
+  const hasFrame = Boolean(
+    state.overlay?.image_data_url || state.live?.image_data_url,
+  )
+  if (hasFrame) {
+    SetOverlayRegion(
+      JSON.stringify({
+        rects: [
+          {
+            x: 0,
+            y: 0,
+            w: Math.round((window.innerWidth || 1) * dpr),
+            h: Math.round((window.innerHeight || 1) * dpr),
+          },
+        ],
+        polys: [],
+      }),
+    )
+    return
+  }
   const rects = []
   const polys = []
   const push = (rect, pad = 1) => {
@@ -1615,8 +1658,8 @@ function renderLive() {
   const barSide = live.bar_side === "bottom" ? "bottom" : "top"
   const anchorW = Number(live.anchor?.width) || 1
   const anchorH = Number(live.anchor?.height) || 1
-  const imageAreaH = Math.max(80, (window.innerHeight || 600) - 48)
-  const imageAreaW = Math.max(80, (window.innerWidth || 800) - 4)
+  const imageAreaH = Math.max(80, window.innerHeight || 600)
+  const imageAreaW = Math.max(80, window.innerWidth || 800)
   const showOriginal = Boolean(state.liveOriginal)
   const blockOriginal = state.liveBlockOriginal || new Set()
   const geometries = blocks.map((block) =>
@@ -1628,13 +1671,12 @@ function renderLive() {
       const source = String(block.text || "")
       const translated = String(block.translation || "")
       const showSource = showOriginal || blockOriginal.has(index)
-      // Empty translations stay blank instead of covering the source text.
-      if (!showSource && !translated) return ""
-      const text = showSource ? source : translated
+      // Reveal the captured frame instead of drawing source text.
+      if (showSource) return ""
+      if (!translated) return ""
+      const text = translated
       if (!text) return ""
-      // Formula lines that the translator left untouched are better left as the
-      // original screen content than covered by garbled OCR text.
-      if (!showSource && isUnchangedMathLine(source, translated)) return ""
+      if (isUnchangedMathLine(source, translated)) return ""
       const { left, top, width, height, fontPx, angle } =
         fitOverlayBlockText({
           text,
@@ -1737,6 +1779,7 @@ function renderLive() {
         </button>
       </div>
       <div class="shot-image-wrap live-area">
+        ${live.image_data_url ? `<img class="shot-image" src="${live.image_data_url}" alt="" draggable="false">` : ""}
         <div class="shot-blocks">${renderedBlocks}</div>
         ${
           live.error
@@ -1838,6 +1881,7 @@ function renderLive() {
   bindShotMenu("liveMoreBtn", "liveMenu", "liveMenuScrim")
   bindOverlayResize()
   syncOverlayRegion()
+  bindOverlayBarAutoHide(false, status)
 }
 
 function renderResult() {

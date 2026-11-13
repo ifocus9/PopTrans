@@ -140,3 +140,58 @@ func TestLivePayloadReportsProgress(t *testing.T) {
 		t.Fatalf("error payload progress = %+v", failed)
 	}
 }
+
+func TestTranslateOCRProgressiveBatches(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Lines []backend.OCRLine `json:"lines"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		calls++
+		blocks := make([]backend.OCRBlock, 0, len(request.Lines))
+		for _, line := range request.Lines {
+			blocks = append(blocks, backend.OCRBlock{
+				Text:        line.Text,
+				Translation: "t" + line.Text,
+				X:           line.X,
+				Y:           line.Y,
+				W:           line.W,
+				H:           line.H,
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(backend.OCRTranslateBlocksResult{
+			Blocks:      blocks,
+			ImageWidth:  800,
+			ImageHeight: 400,
+		})
+	}))
+	defer server.Close()
+
+	ocr := backend.OCRBlocksResult{Text: "line", ImageWidth: 800, ImageHeight: 400}
+	for index := 0; index < 10; index++ {
+		ocr.LineBoxes = append(ocr.LineBoxes, backend.OCRLine{
+			Text: "line", X: float64(index), Y: 0, W: 10, H: 10,
+		})
+	}
+	app := &App{client: backend.NewClient(server.URL), cfg: config.Config{}}
+	var progress []int
+	result, err := app.translateOCRProgressive(t.Context(), ocr, false, func(_ backend.OCRTranslateBlocksResult, done, total int) {
+		progress = append(progress, done)
+	})
+	if err != nil {
+		t.Fatalf("progressive translate: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("calls = %d, want 3", calls)
+	}
+	if len(progress) != 3 || progress[0] != 4 || progress[1] != 8 || progress[2] != 10 {
+		t.Fatalf("progress = %v", progress)
+	}
+	if len(result.Blocks) != 10 || result.Translation == "" {
+		t.Fatalf("result = %+v", result)
+	}
+}
