@@ -3,6 +3,7 @@ import unittest
 from backend.translator import (
     Translator,
     _glossary_hits,
+    _is_math_line,
     build_lines_prompt,
     build_translation_prompt,
     normalize_target_language,
@@ -145,6 +146,19 @@ class LinePromptTests(unittest.TestCase):
         prompt = build_lines_prompt("zh", ["First line"])
 
         self.assertTrue(prompt.endswith("\n\n[1] First line"))
+
+    def test_math_line_detection(self):
+        self.assertTrue(_is_math_line("The total energy is E = mc2."))
+        self.assertTrue(_is_math_line("函数 f(x) = x2 + 2x + 1 在 x = -1 处取最小值"))
+        self.assertTrue(_is_math_line(r"\frac{a}{b} + \sqrt{x}"))
+        self.assertFalse(_is_math_line("The quick brown fox jumps over the lazy dog."))
+
+    def test_math_prompt_adds_latex_instruction(self):
+        math_prompt = build_lines_prompt("zh", ["E = mc2"], math=True)
+        plain_prompt = build_lines_prompt("zh", ["Hello"])
+
+        self.assertIn("LaTeX inline math", math_prompt)
+        self.assertNotIn("LaTeX inline math", plain_prompt)
 
     def test_parser_accepts_plain_one_line_per_input_output(self):
         parsed = parse_numbered_translations("第一行\n第二行\n", 2)

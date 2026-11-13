@@ -75,7 +75,7 @@ PopTrans.exe
 # Local agent/tooling workspaces
 .zcode/
 .mimosa/
-.tmp-perf/
+.tmp-*/
 
 # UI daemon runtime discovery
 translate-ui-endpoint.json

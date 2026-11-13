@@ -93,10 +93,15 @@ def health_check():
 def recognize_ocr(
     file: UploadFile = File(...),
     allow_retry: bool = Form(True),
+    source_lang: Optional[str] = Form(None),
 ):
-    """接收图片并进行 OCR 识别"""
+    """接收图片并进行 OCR 识别（source_lang=ko 时使用韩语识别模型）"""
     if not (file.content_type or "").startswith("image/"):
         raise HTTPException(status_code=400, detail="Must be an image file")
+    try:
+        normalize_source_language(source_lang)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
 
     try:
         content = file.file.read()
@@ -105,7 +110,9 @@ def recognize_ocr(
         if image.mode not in ("L", "RGB", "RGBA"):
             image = image.convert("RGB")
             
-        result = ocr_engine.recognize_image(image, allow_retry=allow_retry)
+        result = ocr_engine.recognize_image(
+            image, allow_retry=allow_retry, source_lang=source_lang
+        )
         return result
     except Exception as e:
         logger.exception("OCR 处理异常")
@@ -134,7 +141,7 @@ async def recognize_and_translate_ocr(
         if image.mode not in ("L", "RGB", "RGBA"):
             image = image.convert("RGB")
 
-        ocr_result = ocr_engine.recognize_image(image)
+        ocr_result = ocr_engine.recognize_image(image, source_lang=source_lang)
         source_text = (ocr_result.get("text") or "").strip()
         if not source_text:
             return {
@@ -259,7 +266,7 @@ def recognize_and_translate_blocks(
         if image.mode not in ("L", "RGB", "RGBA"):
             image = image.convert("RGB")
 
-        ocr_result = ocr_engine.recognize_image(image)
+        ocr_result = ocr_engine.recognize_image(image, source_lang=source_lang)
         return _translate_line_boxes(
             ocr_result.get("line_boxes") or [],
             (ocr_result.get("text") or "").strip(),

@@ -417,14 +417,24 @@ func (c *Client) OCRTranslateBlocksWithLanguages(ctx context.Context, pngBytes [
 // OCRBlocks recognizes an image and returns per-line geometry without
 // translating it. On a 404 the running engine predates the split pipeline.
 func (c *Client) OCRBlocks(ctx context.Context, pngBytes []byte) (OCRBlocksResult, error) {
+	return c.OCRBlocksWithLanguages(ctx, pngBytes, "")
+}
+
+// OCRBlocksWithLanguages hints the OCR engine at the expected source language
+// (e.g. "ko" selects the Korean recognition model).
+func (c *Client) OCRBlocksWithLanguages(ctx context.Context, pngBytes []byte, sourceLang string) (OCRBlocksResult, error) {
 	var decoded OCRBlocksResult
 	startedAt := time.Now()
-	log.Printf("backend ocr_blocks request start: bytes=%d", len(pngBytes))
+	log.Printf("backend ocr_blocks request start: bytes=%d source=%q", len(pngBytes), sourceLang)
 
-	body, contentType, err := multipartImageBody(pngBytes, map[string]string{
+	fields := map[string]string{
 		// Live capture refreshes every frame; skip the slow second OCR pass.
 		"allow_retry": "false",
-	})
+	}
+	if lang := normalizeLanguage(sourceLang); lang != "" {
+		fields["source_lang"] = lang
+	}
+	body, contentType, err := multipartImageBody(pngBytes, fields)
 	if err != nil {
 		return decoded, err
 	}

@@ -70,10 +70,12 @@ func main() {
 
 	err = wails.Run(&options.App{
 		Title:         windowTitle,
-		Width:         458,
-		Height:        640,
+		Width:         520,
+		Height:        720,
+		MinWidth:      420,
+		MinHeight:     560,
 		StartHidden:   true,
-		DisableResize: true,
+		DisableResize: overlayMode,
 		Frameless:     true,
 		AlwaysOnTop:   overlayMode,
 		AssetServer: &assetserver.Options{

@@ -77,6 +77,7 @@ curl http://127.0.0.1:8989/health
 | --- | --- | --- | --- | --- |
 | `file` | form-data | file | 是 | 图片文件，`Content-Type` 必须以 `image/` 开头 |
 | `allow_retry` | form-data | bool | 否 | 默认 `true`。识别质量偏低时会再放大识别一次；实时翻译传 `false` 跳过第二轮，下一帧会重新识别 |
+| `source_lang` | form-data | string | 否 | 原文语言；传 `ko`/`ko-KR` 时使用韩语识别模型；省略或 `auto` 时先跑默认模型，无有效文字再自动尝试韩语模型 |
 
 ### 返回参数
 

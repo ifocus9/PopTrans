@@ -345,7 +345,10 @@ func (a *App) resumeHotkeys() error {
 		win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
 		win.UnregisterHotKey(a.hwnd, hotkeyOCR)
 		win.UnregisterHotKey(a.hwnd, hotkeyLive)
-		return err
+		a.hotkeysSuspended = false
+		log.Printf("app hotkeys resume failed (hotkeys unavailable): %v", err)
+		a.setStatus("快捷键被占用，暂时无法注册")
+		return nil
 	}
 	a.hotkeysSuspended = false
 	log.Printf("app hotkeys resumed")
@@ -592,7 +595,7 @@ func (a *App) handleOCRSelection(rect win.Rect) {
 			}
 			a.setStatus(status)
 		}, func(callCtx context.Context) error {
-			ocr, ocrErr := a.client.OCRBlocks(callCtx, pngBytes)
+			ocr, ocrErr := a.client.OCRBlocksWithLanguages(callCtx, pngBytes, a.cfg.SourceLanguage)
 			if ocrErr != nil {
 				if !errors.Is(ocrErr, backend.ErrOCRBlocksUnsupported) {
 					return ocrErr
@@ -865,7 +868,7 @@ func (a *App) refreshScreenshot() {
 				a.setStatus(status)
 			}
 		}, func(callCtx context.Context) error {
-			ocr, ocrErr := a.client.OCRBlocks(callCtx, frame.png)
+			ocr, ocrErr := a.client.OCRBlocksWithLanguages(callCtx, frame.png, a.cfg.SourceLanguage)
 			switch {
 			case errors.Is(ocrErr, backend.ErrOCRBlocksUnsupported):
 				log.Printf("app refresh using legacy combined path")
@@ -1079,7 +1082,7 @@ func (a *App) liveLoop(ctx context.Context, rect win.Rect, refresh <-chan struct
 		reqCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 		var result backend.OCRTranslateBlocksResult
 		var callErr error
-		ocr, ocrErr := a.client.OCRBlocks(reqCtx, pngBytes)
+		ocr, ocrErr := a.client.OCRBlocksWithLanguages(reqCtx, pngBytes, a.cfg.SourceLanguage)
 		switch {
 		case errors.Is(ocrErr, backend.ErrOCRBlocksUnsupported):
 			log.Printf("app live ocr endpoint unsupported, using legacy combined path")
@@ -1748,19 +1751,26 @@ func (a *App) applySettings(next config.Config) error {
 
 	a.cfg = next
 	if err := a.registerHotkeys(); err != nil {
-		log.Printf("app apply settings failed, restoring previous config: %v", err)
+		// A hotkey can be owned by another application (or by a second PopTrans
+		// instance). Keep the new non-hotkey settings, but restore the previous
+		// hotkeys instead of rejecting the whole configuration as a
+		// "translation failure".
+		log.Printf("app hotkey registration failed, keeping previous hotkeys: %v", err)
+		a.cfg.Hotkey = prev.Hotkey
+		a.cfg.HotkeyDisplay = prev.HotkeyDisplay
+		a.cfg.OcrHotkey = prev.OcrHotkey
+		a.cfg.OcrHotkeyDisplay = prev.OcrHotkeyDisplay
+		a.cfg.LiveHotkey = prev.LiveHotkey
+		a.cfg.LiveHotkeyDisplay = prev.LiveHotkeyDisplay
 		win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
 		win.UnregisterHotKey(a.hwnd, hotkeyOCR)
 		win.UnregisterHotKey(a.hwnd, hotkeyLive)
-		a.cfg = prev
-		_ = a.registerHotkeys()
-		if keepSuspended {
-			win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
-			win.UnregisterHotKey(a.hwnd, hotkeyOCR)
-			win.UnregisterHotKey(a.hwnd, hotkeyLive)
+		if restoreErr := a.registerHotkeys(); restoreErr != nil {
+			log.Printf("app restore previous hotkeys failed (hotkeys unavailable): %v", restoreErr)
+			a.setStatus("快捷键被占用，暂时无法注册")
+		} else {
+			log.Printf("app previous hotkeys restored")
 		}
-		_ = config.Save(a.baseDir, prev)
-		return err
 	}
 
 	if err := config.Save(a.baseDir, a.cfg); err != nil {

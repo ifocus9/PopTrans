@@ -19,6 +19,30 @@ _DEDUP_SIMILAR_SIZE_RATIO = 1.35
 _DEDUP_CHAR_WIDTH_RATIO = 0.45
 _DEDUP_CHAR_ASPECT_RATIO = 1.25
 
+_KOREAN_REC_MODEL = "korean_PP-OCRv3_rec_infer.onnx"
+_KOREAN_REC_DICT = "korean_dict.txt"
+
+
+def _is_korean_language(value) -> bool:
+    """True for Korean language codes/names used by the settings UI."""
+    if not value:
+        return False
+    text = str(value).strip().lower()
+    return text.startswith("ko") or text in ("korean", "한국어", "韩语", "韓語")
+
+
+def _meaningful_text_ratio(text: str) -> float:
+    """Share of letters/digits in the recognized text.
+
+    The default Chinese model sometimes turns Korean glyphs into punctuation
+    with high confidence; a low ratio means the result is not real text.
+    """
+    compact = [char for char in str(text or "") if not char.isspace()]
+    if not compact:
+        return 0.0
+    meaningful = sum(1 for char in compact if char.isalnum())
+    return meaningful / len(compact)
+
 
 class OCRService:
     """
@@ -27,6 +51,7 @@ class OCRService:
 
     def __init__(self):
         self._engine = None
+        self._korean_engine = None
         self._loading_lock = threading.Lock()
         # RapidOCR/ONNX sessions are not re-entrant; the API runs endpoints in
         # the threadpool, so guard the actual recognition calls.
@@ -35,7 +60,7 @@ class OCRService:
     def is_loaded(self) -> bool:
         """OCR 模型是否已加载"""
         with self._loading_lock:
-            return self._engine is not None
+            return self._engine is not None or self._korean_engine is not None
 
     def release(self) -> None:
         """释放 OCR 模型，回收内存"""
@@ -43,27 +68,40 @@ class OCRService:
             if self._engine is not None:
                 self._engine = None
                 logger.info("OCR 模型已释放")
+            if self._korean_engine is not None:
+                self._korean_engine = None
+                logger.info("韩语 OCR 模型已释放")
 
-    def _ensure_engine(self):
-        """懒加载 RapidOCR"""
+    def _korean_available(self) -> bool:
+        model_dir = application_dir() / "models" / "rapidocr"
+        return (model_dir / _KOREAN_REC_MODEL).is_file() and (
+            model_dir / _KOREAN_REC_DICT
+        ).is_file()
+
+    def _ensure_engine(self, kind: str = "default"):
+        """懒加载 RapidOCR（默认中英或韩语识别模型）"""
         with self._loading_lock:
-            if self._engine is None:
-                logger.info("首次加载 RapidOCR 模型...")
+            attr = "_korean_engine" if kind == "korean" else "_engine"
+            engine = getattr(self, attr)
+            if engine is None:
+                label = "韩语" if kind == "korean" else "默认"
+                logger.info("首次加载 RapidOCR %s 模型...", label)
                 from rapidocr_onnxruntime import RapidOCR
 
-                config_path = self._create_rapidocr_config()
+                config_path = self._create_rapidocr_config(kind)
                 try:
-                    self._engine = RapidOCR(config_path=config_path)
+                    engine = RapidOCR(config_path=config_path)
                 finally:
                     try:
                         os.remove(config_path)
                     except OSError:
                         pass
-                logger.info("RapidOCR 模型加载完成")
-            return self._engine
+                setattr(self, attr, engine)
+                logger.info("RapidOCR %s 模型加载完成", label)
+            return engine
 
     @staticmethod
-    def _create_rapidocr_config() -> str:
+    def _create_rapidocr_config(kind: str = "default") -> str:
         import rapidocr_onnxruntime
         import yaml
 
@@ -73,12 +111,18 @@ class OCRService:
             config = yaml.safe_load(file)
 
         model_dir = application_dir() / "models" / "rapidocr"
-        model_paths = {
-            "Det": model_dir / "ch_PP-OCRv4_det_infer.onnx",
-            "Rec": model_dir / "ch_PP-OCRv4_rec_infer.onnx",
-            "Cls": model_dir / "ch_ppocr_mobile_v2.0_cls_infer.onnx",
-        }
-        missing = [str(path) for path in model_paths.values() if not path.is_file()]
+        det_path = model_dir / "ch_PP-OCRv4_det_infer.onnx"
+        cls_path = model_dir / "ch_ppocr_mobile_v2.0_cls_infer.onnx"
+        if kind == "korean":
+            rec_path = model_dir / _KOREAN_REC_MODEL
+            keys_path = model_dir / _KOREAN_REC_DICT
+        else:
+            rec_path = model_dir / "ch_PP-OCRv4_rec_infer.onnx"
+            keys_path = None
+        required = [det_path, rec_path, cls_path]
+        if keys_path is not None:
+            required.append(keys_path)
+        missing = [str(path) for path in required if not path.is_file()]
         if missing:
             raise FileNotFoundError(
                 "RapidOCR model files are missing: " + ", ".join(missing)
@@ -87,11 +131,13 @@ class OCRService:
         config["Global"]["use_det"] = True
         config["Global"]["use_cls"] = False
         config["Global"]["use_rec"] = True
-        config["Det"]["model_path"] = os.fspath(model_paths["Det"])
+        config["Det"]["model_path"] = os.fspath(det_path)
         config["Det"]["box_thresh"] = 0.4
         config["Det"]["unclip_ratio"] = 1.8
-        config["Rec"]["model_path"] = os.fspath(model_paths["Rec"])
-        config["Cls"]["model_path"] = os.fspath(model_paths["Cls"])
+        config["Rec"]["model_path"] = os.fspath(rec_path)
+        config["Cls"]["model_path"] = os.fspath(cls_path)
+        if keys_path is not None:
+            config["Rec"]["rec_keys_path"] = os.fspath(keys_path)
 
         file = tempfile.NamedTemporaryFile(
             mode="w",
@@ -333,7 +379,20 @@ class OCRService:
             "line_height": round((normal_max - normal_min) / scale, 1),
         }
 
-    def recognize_image(self, img: Image.Image, allow_retry: bool = True) -> dict:
+    def _korean_fallback(self, img, allow_retry, use_korean):
+        """Try the Korean recognizer when the default model found no text."""
+        if use_korean or not self._korean_available():
+            return None
+        logger.info("OCR 默认模型无结果，改用韩语识别模型")
+        korean = self.recognize_image(img, allow_retry, source_lang="ko")
+        return korean if korean.get("text") else None
+
+    def recognize_image(
+        self,
+        img: Image.Image,
+        allow_retry: bool = True,
+        source_lang: str = None,
+    ) -> dict:
         """
         接收 PIL Image 进行 OCR 识别。
         返回格式:
@@ -346,8 +405,13 @@ class OCRService:
         allow_retry=False skips the second upscaled pass. The live loop captures
         continuously, so re-recognizing every frame at a larger scale doubles the
         cost for content the next frame will refresh anyway.
+
+        source_lang="ko" selects the Korean recognition model. In auto mode the
+        default model runs first; if it finds nothing (or only low-confidence
+        text), the Korean model is tried and returned when it does better.
         """
-        engine = self._ensure_engine()
+        use_korean = _is_korean_language(source_lang) and self._korean_available()
+        engine = self._ensure_engine("korean" if use_korean else "default")
 
         primary_img, primary_scale = self._preprocess_image(img)
         logger.info(
@@ -379,6 +443,9 @@ class OCRService:
                 logger.info("OCR 回退放弃: 保留 %.1fx 首轮结果", primary_scale)
 
         if not merged:
+            korean = self._korean_fallback(img, allow_retry, use_korean)
+            if korean is not None:
+                return korean
             return {
                 "text": "",
                 "lines": [],
@@ -408,6 +475,9 @@ class OCRService:
             )
 
         if not raw_boxes:
+            korean = self._korean_fallback(img, allow_retry, use_korean)
+            if korean is not None:
+                return korean
             return {
                 "text": "",
                 "lines": [],
@@ -474,7 +544,7 @@ class OCRService:
             })
 
         text = "\n".join(output_lines).strip()
-        return {
+        result = {
             "text": text,
             "lines": output_lines,
             "line_boxes": line_boxes,
@@ -482,3 +552,28 @@ class OCRService:
             "image_width": img.size[0],
             "image_height": img.size[1],
         }
+        if not use_korean and self._korean_available():
+            boxes = result["line_boxes"]
+            average_score = (
+                sum(box["score"] for box in boxes) / len(boxes) if boxes else 0.0
+            )
+            if not text or (boxes and average_score < 0.6) or (
+                _meaningful_text_ratio(text) < 0.5
+            ):
+                logger.info(
+                    "OCR 默认模型结果不足（len=%d score=%.2f），尝试韩语识别模型",
+                    len(text),
+                    average_score,
+                )
+                korean = self.recognize_image(img, allow_retry, source_lang="ko")
+                korean_boxes = korean.get("line_boxes") or []
+                korean_score = (
+                    sum(box["score"] for box in korean_boxes) / len(korean_boxes)
+                    if korean_boxes
+                    else 0.0
+                )
+                if korean.get("text") and (
+                    not text or korean_score > average_score
+                ):
+                    return korean
+        return result

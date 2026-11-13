@@ -2192,9 +2192,6 @@ html.live-mode body {
 
 .shot-block {
   position: absolute;
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
   overflow: hidden;
   padding: 1px 4px;
   border-radius: 3px;

@@ -9,6 +9,7 @@ import {
   Clipboard,
   Cpu,
   Download,
+  FileCode2,
   FileText,
   ImagePlus,
   Keyboard,
@@ -74,6 +75,7 @@ const icons = {
   Clipboard,
   Cpu,
   Download,
+  FileCode2,
   FileText,
   ImagePlus,
   Keyboard,
@@ -166,7 +168,6 @@ try {
 applyTheme(activeTheme)
 
 let startupWindowSized = false
-let mainWindowSized = false
 let startupDismissed = false
 let resultShowTimestamp = 0
 
@@ -316,7 +317,6 @@ function bindStateEvents() {
       windowShown = false
       lastResultHeight = 0
       startupWindowSized = false
-      mainWindowSized = false
       if (state.mode === "result") {
         app.innerHTML = ""
       }
@@ -477,6 +477,8 @@ function previewState() {
   const modeParam = params.get("mode")
   // ?loading=ocr|translate previews the progress indicator in the browser.
   const previewLoading = params.get("loading") || ""
+  const previewLong = params.get("long") === "1"
+  const previewMath = params.get("math") === "1"
   const previewProgress =
     previewLoading === "ocr" ? 15 : previewLoading === "translate" ? 55 : 0
   if (modeParam === "overlay") {
@@ -516,7 +518,9 @@ function previewState() {
         blocks: [
           {
             text: "Settings",
-            translation: "设置",
+            translation: previewLong
+              ? "设置面板会保留上次使用的源语言并记住用户的所有偏好"
+              : "设置",
             x: 48,
             y: 66,
             w: 130,
@@ -527,7 +531,9 @@ function previewState() {
           },
           {
             text: "Model download source",
-            translation: "模型下载源",
+            translation: previewMath
+              ? "模型下载源，公式 E = mc² 与 f(x) = x² + 2x + 1。"
+              : "模型下载源",
             x: 48,
             y: 148,
             w: 230,
@@ -769,6 +775,165 @@ function overlayTextAppearance(block) {
 // Translate the OCR line geometry into an unrotated CSS box plus a rotation.
 // Rotated lines (angle != 0) use the quadrilateral centre/edge lengths so the
 // translation keeps the original orientation instead of using its AABB.
+let overlayMeasureCanvas = null
+let overlayMeasureContext = null
+
+function measureOverlayText(text, font) {
+  if (!overlayMeasureContext) {
+    overlayMeasureCanvas = document.createElement("canvas")
+    overlayMeasureContext = overlayMeasureCanvas.getContext("2d")
+  }
+  overlayMeasureContext.font = font
+  return overlayMeasureContext.measureText(text).width
+}
+
+// Wrap text the same way the chip lays it out: CJK characters may break
+// anywhere, Latin text prefers the last space.
+function wrapOverlayText(text, maxWidth, font) {
+  const lines = []
+  for (const paragraph of String(text).split("\n")) {
+    let line = ""
+    for (const char of paragraph) {
+      const candidate = line + char
+      if (line && measureOverlayText(candidate, font) > maxWidth) {
+        const space = line.lastIndexOf(" ")
+        if (space > 0 && char !== " ") {
+          lines.push(line.slice(0, space))
+          line = line.slice(space + 1) + char
+        } else {
+          lines.push(line)
+          line = char
+        }
+      } else {
+        line = candidate
+      }
+    }
+    lines.push(line)
+  }
+  return lines.length ? lines : [""]
+}
+
+// Shrink the translated text until it fits the OCR line box, so a longer
+// translation stays readable without covering the next line.
+function fitOverlayFontSize(
+  text,
+  boxWidth,
+  boxHeight,
+  basePx,
+  fontFamily,
+  fontWeight,
+) {
+  const minPx = 6.5
+  const lineHeight = 1.16
+  const availableWidth = Math.max(8, boxWidth - 8)
+  const availableHeight = Math.max(6, boxHeight - 2)
+  const fits = (size) => {
+    const font = `${fontWeight} ${size}px ${fontFamily}`
+    const lines = wrapOverlayText(text, availableWidth, font)
+    return lines.length * size * lineHeight <= availableHeight + 0.5
+  }
+  if (fits(basePx)) return basePx
+  let low = minPx
+  let high = basePx
+  let best = minPx
+  for (let i = 0; i < 8; i++) {
+    const mid = (low + high) / 2
+    if (fits(mid)) {
+      best = mid
+      low = mid
+    } else {
+      high = mid
+    }
+  }
+  return Math.max(minPx, best)
+}
+
+function fitOverlayBlockText({
+  text,
+  index,
+  geometries,
+  imageAreaW,
+  imageAreaH,
+  fontFamily,
+  fontWeight,
+}) {
+  const geometry = geometries[index]
+  const boxWidth = (geometry.width / 100) * imageAreaW
+  let boxHeight = (geometry.height / 100) * imageAreaH
+  let fontPx = fitOverlayFontSize(
+    text,
+    boxWidth,
+    boxHeight,
+    geometry.fontPx,
+    fontFamily,
+    fontWeight,
+  )
+  // Extremely long translations may not fit even at the minimum size. Grow the
+  // chip downward into free space (never over another chip) so no text is lost.
+  if (Math.abs(geometry.angle) <= 3 && fontPx <= 6.6) {
+    const font = `${fontWeight} ${fontPx}px ${fontFamily}`
+    const lines = wrapOverlayText(text, Math.max(8, boxWidth - 8), font)
+    const neededHeight = lines.length * fontPx * 1.16 + 2
+    if (neededHeight > boxHeight + 0.5) {
+      let limitTop = 100
+      for (let otherIndex = 0; otherIndex < geometries.length; otherIndex++) {
+        if (otherIndex === index) continue
+        const other = geometries[otherIndex]
+        if (other.top <= geometry.top + 0.05) continue
+        const horizontalOverlap =
+          Math.min(
+            geometry.left + geometry.width,
+            other.left + other.width,
+          ) - Math.max(geometry.left, other.left)
+        if (horizontalOverlap <= 0) continue
+        limitTop = Math.min(limitTop, other.top - (2 / imageAreaH) * 100)
+      }
+      const maxHeight = Math.max(
+        boxHeight,
+        ((limitTop - geometry.top) / 100) * imageAreaH,
+      )
+      // Use the free space to pick a larger readable size, then size the chip
+      // to exactly the height that size needs (never past the next chip).
+      const expandedFont = fitOverlayFontSize(
+        text,
+        boxWidth,
+        maxHeight,
+        geometry.fontPx,
+        fontFamily,
+        fontWeight,
+      )
+      if (expandedFont > fontPx) {
+        const expandedFontSpec = `${fontWeight} ${expandedFont}px ${fontFamily}`
+        const expandedLines = wrapOverlayText(
+          text,
+          Math.max(8, boxWidth - 8),
+          expandedFontSpec,
+        )
+        boxHeight = Math.min(
+          maxHeight,
+          Math.max(
+            boxHeight,
+            expandedLines.length * expandedFont * 1.16 + 2,
+          ),
+        )
+        fontPx = fitOverlayFontSize(
+          text,
+          boxWidth,
+          boxHeight,
+          geometry.fontPx,
+          fontFamily,
+          fontWeight,
+        )
+      }
+    }
+  }
+  return {
+    ...geometry,
+    fontPx,
+    height: (boxHeight / imageAreaH) * 100,
+  }
+}
+
 function overlayBlockGeometry(block, imageW, imageH, areaHeight) {
   const angle = Number(block.angle) || 0
   const lineW = Number(block.line_width) || 0
@@ -796,6 +961,80 @@ function overlayBlockGeometry(block, imageW, imageH, areaHeight) {
   }
   const fontPx = Math.max(8, (sourceHeight / imageH) * areaHeight * 0.82)
   return { left, top, width, height, fontPx, angle }
+}
+
+const MARKDOWN_SUPERSCRIPTS = {
+  "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
+  "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
+  "⁺": "+", "⁻": "-", "⁼": "=", "⁽": "(", "⁾": ")", "ⁿ": "n",
+}
+const MARKDOWN_SUBSCRIPTS = {
+  "₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4",
+  "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9",
+  "₊": "+", "₋": "-", "₌": "=", "₍": "(", "₎": ")",
+}
+const MARKDOWN_MATH_SYMBOLS = {
+  "·": "\\cdot ", "×": "\\times ", "÷": "\\div ", "±": "\\pm ",
+  "≤": "\\le ", "≥": "\\ge ", "≠": "\\ne ", "≈": "\\approx ",
+  "∞": "\\infty ", "∂": "\\partial ", "∇": "\\nabla ",
+  "∫": "\\int ", "∑": "\\sum ", "√": "\\sqrt ", "→": "\\to ",
+  "π": "\\pi ", "α": "\\alpha ", "β": "\\beta ", "γ": "\\gamma ",
+  "δ": "\\delta ", "ε": "\\varepsilon ", "ζ": "\\zeta ", "η": "\\eta ",
+  "θ": "\\theta ", "λ": "\\lambda ", "μ": "\\mu ", "ν": "\\nu ",
+  "ξ": "\\xi ", "ρ": "\\rho ", "σ": "\\sigma ", "τ": "\\tau ",
+  "φ": "\\phi ", "χ": "\\chi ", "ψ": "\\psi ", "ω": "\\omega ",
+  "Δ": "\\Delta ", "Σ": "\\Sigma ", "Φ": "\\Phi ", "Ψ": "\\Psi ", "Ω": "\\Omega ",
+}
+const MARKDOWN_CJK_RE =
+  /[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]/
+const MARKDOWN_MATH_RE = /[=^_\\∫∑√±≈≠≤≥∞∂∇·×÷]/
+const MARKDOWN_SEGMENT_RE =
+  /[^\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af\n]+/g
+
+function unicodeMathToLatex(text) {
+  let result = text.replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿ]+/g, (run) => {
+    const value = [...run].map((char) => MARKDOWN_SUPERSCRIPTS[char] || char).join("")
+    return `^{${value}}`
+  })
+  result = result.replace(/[₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎]+/g, (run) => {
+    const value = [...run].map((char) => MARKDOWN_SUBSCRIPTS[char] || char).join("")
+    return `_{${value}}`
+  })
+  for (const [symbol, latex] of Object.entries(MARKDOWN_MATH_SYMBOLS)) {
+    result = result.split(symbol).join(latex)
+  }
+  return result
+}
+
+// Convert one translated OCR line to Markdown, wrapping formula-like spans in
+// inline math so a Markdown renderer displays the equations.
+function markdownMathLine(line) {
+  const text = String(line || "").trim()
+  if (!text) return ""
+  if (text.includes("$")) return text
+  if (!MARKDOWN_CJK_RE.test(text) && MARKDOWN_MATH_RE.test(text)) {
+    return `$$${unicodeMathToLatex(text)}$$`
+  }
+  return text.replace(MARKDOWN_SEGMENT_RE, (segment) => {
+    if (!segment.trim() || segment.includes("$")) return segment
+    if (
+      !MARKDOWN_MATH_RE.test(segment) &&
+      !/[A-Za-z][0-9]|[0-9][A-Za-z]/.test(segment)
+    ) {
+      return segment
+    }
+    const leading = segment.match(/^\s*/)[0]
+    const trailing = segment.match(/\s*$/)[0]
+    return `${leading}$${unicodeMathToLatex(segment.trim())}$${trailing}`
+  })
+}
+
+function markdownFromBlocks(blocks, fallback) {
+  const lines = (blocks || [])
+    .map((block) => String(block.translation || "").trim())
+    .filter(Boolean)
+  if (!lines.length) return String(fallback || "").trim()
+  return lines.map(markdownMathLine).join("\n")
 }
 
 function overlayProgressHtml(active, progress) {
@@ -826,6 +1065,10 @@ function renderOverlay() {
   )
   const barSide = overlay.bar_side === "bottom" ? "bottom" : "top"
   const imageAreaH = Math.max(80, (window.innerHeight || 600) - 48)
+  const imageAreaW = Math.max(80, (window.innerWidth || 800) - 4)
+  const geometries = blocks.map((block) =>
+    overlayBlockGeometry(block, imgW, imgH, imageAreaH),
+  )
 
   const renderedBlocks = blocks
     .map((block, index) => {
@@ -836,12 +1079,16 @@ function renderOverlay() {
       if (!showSource && !translated) return ""
       const text = showSource ? source : translated
       if (!text) return ""
-      const { left, top, width, height, fontPx, angle } = overlayBlockGeometry(
-        block,
-        imgW,
-        imgH,
-        imageAreaH,
-      )
+      const { left, top, width, height, fontPx, angle } =
+        fitOverlayBlockText({
+          text,
+          index,
+          geometries,
+          imageAreaW,
+          imageAreaH,
+          fontFamily: overlayFont,
+          fontWeight: overlayWeight,
+        })
       const classes = [
         "shot-block",
         showSource ? "is-original" : "",
@@ -910,6 +1157,9 @@ function renderOverlay() {
         <button class="shot-btn" id="shotCopyTargetBtn" type="button" title="复制译文 (Ctrl+C)">
           <i data-lucide="languages"></i><span>译文</span>
         </button>
+        <button class="shot-btn" id="shotCopyMarkdownBtn" type="button" title="复制 Markdown 译文（公式为 LaTeX）">
+          <i data-lucide="file-code-2"></i><span>MD</span>
+        </button>
         <button class="shot-btn" id="shotRefreshBtn" type="button" title="刷新译文">
           <i data-lucide="rotate-ccw"></i><span>刷新</span>
         </button>
@@ -935,6 +1185,9 @@ function renderOverlay() {
         <button class="shot-menu-item" type="button" data-target="shotCopyTargetBtn">
           <i data-lucide="languages"></i><span>复制译文</span>
         </button>
+        <button class="shot-menu-item" type="button" data-target="shotCopyMarkdownBtn">
+          <i data-lucide="file-code-2"></i><span>复制 Markdown 译文</span>
+        </button>
         <button class="shot-menu-item" type="button" data-target="shotRefreshBtn">
           <i data-lucide="rotate-ccw"></i><span>刷新译文</span>
         </button>
@@ -947,11 +1200,6 @@ function renderOverlay() {
       </div>
       <div class="shot-image-wrap">
         <div class="shot-blocks">${renderedBlocks}</div>
-        ${
-          loading
-            ? `<div class="shot-pill"><span class="loading-spinner"></span><span>${escapeHtml(progressLabel)}...</span></div>`
-            : ""
-        }
         ${error ? `<div class="shot-pill is-error" title="${escapeHtml(error)}">${escapeHtml(error)}</div>` : ""}
         ${fullText}
       </div>
@@ -989,6 +1237,14 @@ function renderOverlay() {
         showShotToast("正在刷新译文...")
       }
     })
+  document
+    .querySelector("#shotCopyMarkdownBtn")
+    ?.addEventListener("click", () =>
+      copyShotText(
+        markdownFromBlocks(blocks, overlay.translation),
+        "已复制 Markdown 译文",
+      ),
+    )
   document.querySelector("#shotPinBtn")?.addEventListener("click", () => {
     state.overlayPinned = !state.overlayPinned
     if (window.runtime?.WindowSetAlwaysOnTop) {
@@ -1391,8 +1647,12 @@ function renderLive() {
   const anchorW = Number(live.anchor?.width) || 1
   const anchorH = Number(live.anchor?.height) || 1
   const imageAreaH = Math.max(80, (window.innerHeight || 600) - 48)
+  const imageAreaW = Math.max(80, (window.innerWidth || 800) - 4)
   const showOriginal = Boolean(state.liveOriginal)
   const blockOriginal = state.liveBlockOriginal || new Set()
+  const geometries = blocks.map((block) =>
+    overlayBlockGeometry(block, anchorW, anchorH, imageAreaH),
+  )
 
   const renderedBlocks = blocks
     .map((block, index) => {
@@ -1403,12 +1663,16 @@ function renderLive() {
       if (!showSource && !translated) return ""
       const text = showSource ? source : translated
       if (!text) return ""
-      const { left, top, width, height, fontPx, angle } = overlayBlockGeometry(
-        block,
-        anchorW,
-        anchorH,
-        imageAreaH,
-      )
+      const { left, top, width, height, fontPx, angle } =
+        fitOverlayBlockText({
+          text,
+          index,
+          geometries,
+          imageAreaW,
+          imageAreaH,
+          fontFamily: overlayFont,
+          fontWeight: overlayWeight,
+        })
       const classes = [
         "shot-block",
         "live-block",
@@ -1456,6 +1720,9 @@ function renderLive() {
         <button class="shot-btn" id="liveCopyTargetBtn" type="button" title="复制译文">
           <i data-lucide="languages"></i><span>译文</span>
         </button>
+        <button class="shot-btn" id="liveCopyMarkdownBtn" type="button" title="复制 Markdown 译文（公式为 LaTeX）">
+          <i data-lucide="file-code-2"></i><span>MD</span>
+        </button>
         <button class="shot-btn" id="liveRefreshBtn" type="button" title="刷新实时译文">
           <i data-lucide="rotate-ccw"></i><span>刷新</span>
         </button>
@@ -1483,6 +1750,9 @@ function renderLive() {
         </button>
         <button class="shot-menu-item" type="button" data-target="liveCopyTargetBtn">
           <i data-lucide="languages"></i><span>复制译文</span>
+        </button>
+        <button class="shot-menu-item" type="button" data-target="liveCopyMarkdownBtn">
+          <i data-lucide="file-code-2"></i><span>复制 Markdown 译文</span>
         </button>
         <button class="shot-menu-item" type="button" data-target="liveRefreshBtn">
           <i data-lucide="rotate-ccw"></i><span>刷新实时译文</span>
@@ -1553,6 +1823,14 @@ function renderLive() {
         showShotToast("正在刷新实时译文...")
       }
     })
+  document
+    .querySelector("#liveCopyMarkdownBtn")
+    ?.addEventListener("click", () =>
+      copyShotText(
+        markdownFromBlocks(blocks, live.translation),
+        "已复制 Markdown 译文",
+      ),
+    )
   document.querySelector("#livePinBtn")?.addEventListener("click", () => {
     state.livePinned = !state.livePinned
     if (window.runtime?.WindowSetAlwaysOnTop) {
@@ -3782,18 +4060,10 @@ function renderStartup() {
   const isMain =
     (state.mode === "settings" || state.mode === "translate") &&
     state.settings_open
-  if (window.runtime?.WindowSetSize) {
-    if (isMain) {
-      if (!mainWindowSized) {
-        WindowSetSize(458, 640)
-        if (window.runtime?.WindowCenter) WindowCenter()
-        mainWindowSized = true
-      }
-    } else if (!startupWindowSized) {
-      WindowSetSize(360, 220)
-      if (window.runtime?.WindowCenter) WindowCenter()
-      startupWindowSized = true
-    }
+  if (window.runtime?.WindowSetSize && !isMain && !startupWindowSized) {
+    WindowSetSize(360, 220)
+    if (window.runtime?.WindowCenter) WindowCenter()
+    startupWindowSized = true
   }
   const status = state.startup_status || "正在加载翻译模型..."
   const error = state.startup_error

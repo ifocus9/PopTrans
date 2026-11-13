@@ -50,6 +50,7 @@ type App struct {
 	mode           string
 	visible        bool
 	settingsOpen   bool
+	mainSized      bool
 	result         ResultView
 	ready          bool
 	startupLoading bool
@@ -646,10 +647,43 @@ func positionResultWindow(ctx context.Context) {
 	runtime.WindowSetAlwaysOnTop(ctx, true)
 }
 
-func positionSettingsWindow(ctx context.Context) {
+func (a *App) positionMainWindow(ctx context.Context) {
 	runtime.WindowSetAlwaysOnTop(ctx, false)
-	runtime.WindowSetSize(ctx, 458, 640)
+	a.mu.Lock()
+	first := !a.mainSized
+	a.mainSized = true
+	a.mu.Unlock()
+	if first {
+		width, height := mainWindowSize(ctx)
+		runtime.WindowSetSize(ctx, width, height)
+	}
 	runtime.WindowCenter(ctx)
+}
+
+// mainWindowSize picks a comfortable initial workbench size. The Wails window
+// is resizable, so this only applies on the first show; user resizes persist.
+func mainWindowSize(ctx context.Context) (int, int) {
+	width, height := 520, 720
+	if screens, err := runtime.ScreenGetAll(ctx); err == nil {
+		for _, screen := range screens {
+			if screen.IsPrimary || screen.IsCurrent {
+				width = clampInt(int(float64(screen.Size.Width)*0.46), 460, 560)
+				height = clampInt(int(float64(screen.Size.Height)*0.80), 600, 760)
+				break
+			}
+		}
+	}
+	return width, height
+}
+
+func clampInt(value, min, max int) int {
+	if value < min {
+		return min
+	}
+	if value > max {
+		return max
+	}
+	return value
 }
 
 func (a *App) Shutdown(ctx context.Context) {
@@ -1150,7 +1184,7 @@ func (a *App) ShowSettings() error {
 	a.cancelIdleExitLocked()
 	a.mu.Unlock()
 
-	positionSettingsWindow(a.ctx)
+	a.positionMainWindow(a.ctx)
 	runtime.WindowUnminimise(a.ctx)
 	runtime.WindowShow(a.ctx)
 	a.emitState()
@@ -1173,7 +1207,7 @@ func (a *App) ShowTranslate() error {
 	a.cancelIdleExitLocked()
 	a.mu.Unlock()
 
-	positionSettingsWindow(a.ctx)
+	a.positionMainWindow(a.ctx)
 	runtime.WindowUnminimise(a.ctx)
 	runtime.WindowShow(a.ctx)
 	a.emitState()

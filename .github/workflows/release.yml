@@ -66,6 +66,8 @@ jobs:
           # 导出 RapidOCR 内置模型到发布目录
           if (-not (Test-Path "dist-go\models\rapidocr")) { New-Item -ItemType Directory -Path "dist-go\models\rapidocr" -Force }
           python -c "from pathlib import Path; import shutil, rapidocr_onnxruntime; src=Path(rapidocr_onnxruntime.__file__).resolve().parent/'models'; dst=Path('dist-go')/'models'/'rapidocr'; [shutil.copy2(src/name, dst/name) for name in ('ch_PP-OCRv4_det_infer.onnx','ch_PP-OCRv4_rec_infer.onnx','ch_ppocr_mobile_v2.0_cls_infer.onnx')]"
+          # 韩语识别模型与字典随包发布
+          Copy-Item "assets\rapidocr\*" "dist-go\models\rapidocr\" -Force
 
       - name: Build Go Host Core (PopTrans.exe)
         shell: pwsh

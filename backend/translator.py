@@ -511,13 +511,13 @@ def build_translation_prompt(
 # 截图覆盖层需要逐行译文与 OCR 行框一一对应。编号行让模型在一次推理里
 # 完成整屏翻译，避免每行一次调用带来的数十秒延迟。
 LINES_PROMPT_TEMPLATE = (
-    "Translate each numbered line below into {target_lang}. "
+    "Translate each numbered line below into {target_lang}.{math} "
     "Keep exactly one output line per input line, in the same order, formatted "
     "as \"[n] translated text\". Do not merge, split, omit or explain anything.\n\n"
     "{glossary}{lines_block}"
 )
 LINES_PROMPT_TEMPLATE_WITH_SOURCE = (
-    "Translate each numbered line below from {source_lang} into {target_lang}. "
+    "Translate each numbered line below from {source_lang} into {target_lang}.{math} "
     "Keep exactly one output line per input line, in the same order, formatted "
     "as \"[n] translated text\". Do not merge, split, omit or explain anything.\n\n"
     "{glossary}{lines_block}"
@@ -528,17 +528,44 @@ LINES_PROMPT_TEMPLATE_WITH_SOURCE = (
 # the live overlay uses this prompt first and only falls back to the numbered
 # prompt when the model changes the line count.
 LINES_PROMPT_PLAIN = (
-    "Translate each line below into {target_lang}. "
+    "Translate each line below into {target_lang}.{math} "
     "Output exactly {count} lines, one translation per input line, in the same "
     "order. Do not merge, split, omit, number or explain anything.\n\n"
     "{glossary}{lines_block}"
 )
 LINES_PROMPT_PLAIN_WITH_SOURCE = (
-    "Translate each line below from {source_lang} into {target_lang}. "
+    "Translate each line below from {source_lang} into {target_lang}.{math} "
     "Output exactly {count} lines, one translation per input line, in the same "
     "order. Do not merge, split, omit, number or explain anything.\n\n"
     "{glossary}{lines_block}"
 )
+
+MATH_INSTRUCTION = (
+    " Keep mathematical formulas as LaTeX inline math ($...$), repair obvious "
+    "OCR errors, and do not translate variable names."
+)
+
+_MATH_SYMBOLS = set(
+    "=+-×÷*/^_{}[]<>∫∑√±≈≠≤≥∞∂∇·"
+    "παβγδεζηθλμνξοπρστυφχψωΩ"
+)
+_MATH_ASSIGN_RE = re.compile(r"[A-Za-z0-9)\]}]\s*[=^_]\s*[A-Za-z0-9({\[]")
+
+
+def _is_math_line(text: str) -> bool:
+    """Heuristic used to attach the LaTeX instruction to formula-heavy lines."""
+    value = str(text or "").strip()
+    if not value:
+        return False
+    if "\\" in value or _MATH_ASSIGN_RE.search(value):
+        return True
+    compact = [char for char in value if not char.isspace()]
+    if len(compact) < 4:
+        return False
+    math_chars = sum(
+        1 for char in compact if char in _MATH_SYMBOLS or char.isdigit()
+    )
+    return math_chars / len(compact) >= 0.3
 
 _LINE_MARKER_RE = re.compile(r"^\s*(?:\[(\d+)\]|(\d+)[.、:：])\s*(.*)$")
 
@@ -549,11 +576,13 @@ def build_lines_prompt(
     source_lang: Optional[str] = None,
     glossary=None,
     numbered: bool = True,
+    math: bool = False,
 ) -> str:
     """Build the OCR line translation prompt.
 
     numbered=True prefixes each line with [n] and asks for the same markers;
     numbered=False asks for one plain line per input, which decodes faster.
+    math=True adds a LaTeX instruction for formula-heavy batches.
     """
     if numbered:
         block = "\n".join(
@@ -579,6 +608,7 @@ def build_lines_prompt(
         "glossary": glossary_section,
         "lines_block": block,
         "count": len(lines),
+        "math": MATH_INSTRUCTION if math else "",
     }
     if source_lang and source_lang in LANG_NAMES_EN:
         values["source_lang"] = LANG_NAMES_EN[source_lang]
@@ -1435,6 +1465,7 @@ class Translator:
 
         for batch in batches:
             batch_texts = [cleaned[index] for index in batch]
+            batch_math = any(_is_math_line(text) for text in batch_texts)
             # Plain one-line-per-input output avoids the "[n] " markers, which
             # cost several generated tokens per line and dominate CPU decode
             # time. If the model merges or splits lines, fall back to the
@@ -1445,6 +1476,7 @@ class Translator:
                 normalized_source,
                 glossary,
                 numbered=False,
+                math=batch_math,
             )
             content = self._complete_prompt(plain_prompt)
             parsed = parse_numbered_translations(content or "", len(batch))
@@ -1452,7 +1484,11 @@ class Translator:
 
             if parsed is None or any(value is None for value in parsed):
                 numbered_prompt = build_lines_prompt(
-                    target_code, batch_texts, normalized_source, glossary
+                    target_code,
+                    batch_texts,
+                    normalized_source,
+                    glossary,
+                    math=batch_math,
                 )
                 numbered_content = self._complete_prompt(numbered_prompt)
                 numbered_parsed = parse_numbered_translations(
