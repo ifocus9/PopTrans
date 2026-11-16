@@ -1,9 +1,10 @@
 name: Build, Sign and Release
 
 on:
-  push:
-    tags:
-      - 'v*' # 触发规则：当推送版本标签（如 v1.5.0）时自动运行
+  # 证书尚未生效，暂时关闭 tag 自动触发，改为本地手动打包上传 Release
+  # push:
+  #   tags:
+  #     - 'v*' # 触发规则：当推送版本标签（如 v1.5.0）时自动运行
   workflow_dispatch: # 支持在 GitHub 网页上手动点击运行
 
 permissions:
