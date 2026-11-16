@@ -39,6 +39,8 @@ const (
 	wmBackendStatus  = win.WmApp + 4
 	wmTranslateLoad  = win.WmApp + 5
 	wmSettingsClosed = win.WmApp + 6
+	wmHotkeyPause    = win.WmApp + 7
+	wmHotkeyResume   = win.WmApp + 8
 )
 
 var (
@@ -67,11 +69,12 @@ type App struct {
 	statusMu sync.Mutex
 	status   string
 
-	resultMu sync.Mutex
-	source   string
-	result   string
-	lastErr  string
-	busy     bool
+	resultMu  sync.Mutex
+	source    string
+	result    string
+	lastErr   string
+	elapsedMS int64
+	busy      bool
 
 	backendIdleMu      sync.Mutex
 	backendIdleUsers   int
@@ -162,27 +165,24 @@ func (a *App) Run() error {
 	}
 	log.Printf("app hotkeys registered")
 
-	// Start the Wails UI immediately so the user sees model download/load
-	// progress during application startup. The UI daemon owns only the loading
-	// window here; it hides itself once the backend reports translator_ready.
-	// Login autostart skips the UI entirely: the daemon is started on demand
-	// by the first tray/hotkey action, so boot only fills the tray.
-	if !a.autostart {
-		go a.ensureStartupUI()
+	// Open the workbench immediately so the user can interact with settings and UI
+	// without blocking on model download/load; the AI engine warms up in background.
+	// Login autostart skips opening the UI window until the first tray/hotkey action.
+	if a.autostart {
+		go a.ensureBackendReady()
+	} else {
+		go func() {
+			if err := a.showWailsTranslate(); err != nil {
+				log.Printf("app startup translate UI failed: %v", err)
+				a.setStatus("翻译窗口启动失败")
+				go a.ensureBackendReady()
+			}
+		}()
 	}
-	go a.ensureBackendReady()
 
 	_, err = win.MessageLoop()
 	log.Printf("app message loop exited: %v", err)
 	return err
-}
-
-func (a *App) ensureStartupUI() {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := a.ui.EnsureReady(ctx); err != nil {
-		log.Printf("app startup loading UI failed: %v", err)
-	}
 }
 
 func (a *App) Close() {
@@ -241,8 +241,7 @@ func (a *App) suspendHotkeys() {
 	if a.hotkeysSuspended {
 		return
 	}
-	win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
-	win.UnregisterHotKey(a.hwnd, hotkeyOCR)
+	a.unregisterHotkeys()
 	a.hotkeysSuspended = true
 	log.Printf("app hotkeys suspended")
 }
@@ -252,16 +251,28 @@ func (a *App) resumeHotkeys() error {
 		return nil
 	}
 
-	win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
-	win.UnregisterHotKey(a.hwnd, hotkeyOCR)
+	a.unregisterHotkeys()
 	if err := a.registerHotkeys(); err != nil {
-		win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
-		win.UnregisterHotKey(a.hwnd, hotkeyOCR)
+		a.unregisterHotkeys()
 		return err
 	}
 	a.hotkeysSuspended = false
 	log.Printf("app hotkeys resumed")
 	return nil
+}
+
+func (a *App) unregisterHotkeys() {
+	win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
+	win.UnregisterHotKey(a.hwnd, hotkeyOCR)
+}
+
+func (a *App) restoreConfig(prev config.Config, keepSuspended bool) {
+	a.unregisterHotkeys()
+	a.cfg = prev
+	_ = a.registerHotkeys()
+	if keepSuspended {
+		a.unregisterHotkeys()
+	}
 }
 
 func (a *App) ensureBackendReady() {
@@ -293,7 +304,6 @@ func (a *App) ensureBackendReady() {
 	if err != nil {
 		log.Printf("app ensure backend ready failed: %v", err)
 		a.setStatus("本地 API 启动失败")
-		a.pushError("", err.Error())
 		return
 	}
 
@@ -352,6 +362,7 @@ func (a *App) handleTranslate() {
 		ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 		defer cancel()
 
+		startedAt := time.Now()
 		var result string
 		err = a.withBackend(ctx, func(status string) {
 			if status == "" {
@@ -370,9 +381,10 @@ func (a *App) handleTranslate() {
 			return
 		}
 
-		log.Printf("app translate success: result_chars=%d preview=%q", len(result), previewText(result, 120))
+		elapsedMS := time.Since(startedAt).Milliseconds()
+		log.Printf("app translate success: elapsed_ms=%d result_chars=%d preview=%q", elapsedMS, len(result), previewText(result, 120))
 		a.setStatus("就绪")
-		a.pushResult(text, result)
+		a.pushResult(text, result, elapsedMS)
 	}()
 }
 
@@ -450,6 +462,7 @@ func (a *App) handleOCRSelection(rect win.Rect) {
 
 		a.setStatus("正在识别 OCR 文本...")
 
+		startedAt := time.Now()
 		var text string
 		var translation string
 		err = a.withBackend(ctx, func(status string) {
@@ -503,9 +516,10 @@ func (a *App) handleOCRSelection(rect win.Rect) {
 			return
 		}
 
-		log.Printf("app ocr translate success: source_chars=%d result_chars=%d source_preview=%q result_preview=%q", len(text), len(translation), previewText(text, 80), previewText(translation, 80))
+		elapsedMS := time.Since(startedAt).Milliseconds()
+		log.Printf("app ocr translate success: elapsed_ms=%d source_chars=%d result_chars=%d source_preview=%q result_preview=%q", elapsedMS, len(text), len(translation), previewText(text, 80), previewText(translation, 80))
 		a.setStatus("就绪")
-		a.pushResult(text, translation)
+		a.pushResult(text, translation, elapsedMS)
 	}()
 }
 
@@ -515,13 +529,14 @@ func (a *App) finishBusy() {
 	a.resultMu.Unlock()
 }
 
-func (a *App) pushResult(source, result string) {
+func (a *App) pushResult(source, result string, elapsedMS int64) {
 	a.resultMu.Lock()
 	a.source = source
 	a.result = result
 	a.lastErr = ""
+	a.elapsedMS = elapsedMS
 	a.resultMu.Unlock()
-	log.Printf("app push result: source_chars=%d result_chars=%d", len(source), len(result))
+	log.Printf("app push result: elapsed_ms=%d source_chars=%d result_chars=%d", elapsedMS, len(source), len(result))
 	win.PostMessage(a.hwnd, wmTranslateDone, 0, 0)
 }
 
@@ -530,6 +545,7 @@ func (a *App) pushError(source, errMsg string) {
 	a.source = source
 	a.result = ""
 	a.lastErr = errMsg
+	a.elapsedMS = 0
 	a.resultMu.Unlock()
 	log.Printf("app push error: source_chars=%d error=%q", len(source), errMsg)
 	win.PostMessage(a.hwnd, wmTranslateError, 0, 0)
@@ -540,6 +556,7 @@ func (a *App) pushLoading(source string) {
 	a.source = source
 	a.result = ""
 	a.lastErr = ""
+	a.elapsedMS = 0
 	a.resultMu.Unlock()
 	log.Printf("app push loading: source_chars=%d preview=%q", len(source), previewText(source, 120))
 	win.PostMessage(a.hwnd, wmTranslateLoad, 0, 0)
@@ -593,13 +610,9 @@ func (a *App) openTranslate() {
 }
 
 func (a *App) showWailsTranslate() error {
-	a.suspendHotkeys()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := a.ui.ShowTranslate(ctx); err != nil {
-		if resumeErr := a.resumeHotkeys(); resumeErr != nil {
-			log.Printf("app resume hotkeys after translate open failed: %v", resumeErr)
-		}
 		return err
 	}
 	log.Printf("app wake ai engine after translate opened")
@@ -617,13 +630,9 @@ func (a *App) openSettings() {
 }
 
 func (a *App) showWailsSettings() error {
-	a.suspendHotkeys()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := a.ui.ShowSettings(ctx); err != nil {
-		if resumeErr := a.resumeHotkeys(); resumeErr != nil {
-			log.Printf("app resume hotkeys after settings open failed: %v", resumeErr)
-		}
 		return err
 	}
 	// 设置弹窗会展示引擎状态徽标。若 AI 引擎正处于休眠（空闲自动回收），
@@ -647,12 +656,15 @@ func (a *App) reloadSettings() {
 	loggingChanged := next.LoggingEnabled != a.cfg.LoggingEnabled
 	portChanged := next.ServerPort != a.cfg.ServerPort
 	deviceChanged := next.AccelerationDevice != a.cfg.AccelerationDevice
+	threadsChanged := next.CpuThreads != a.cfg.CpuThreads
+	downloadChanged := next.ModelDownloadSource != a.cfg.ModelDownloadSource ||
+		next.ModelDownloadBaseURL != a.cfg.ModelDownloadBaseURL
 	if err := a.applySettings(next); err != nil {
 		log.Printf("app apply reloaded settings failed: %v", err)
 		a.pushError("", err.Error())
 		return
 	}
-	if loggingChanged || portChanged || deviceChanged {
+	if loggingChanged || portChanged || deviceChanged || threadsChanged || (downloadChanged && !config.ModelInstalled(a.baseDir)) {
 		go a.restartBackendForConfigChange(portChanged)
 	}
 }
@@ -661,56 +673,43 @@ func (a *App) applySettings(next config.Config) error {
 	prev := a.cfg
 	keepSuspended := a.hotkeysSuspended
 	launchChanged := next.LaunchAtLogin != prev.LaunchAtLogin
-	win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
-	win.UnregisterHotKey(a.hwnd, hotkeyOCR)
+	a.unregisterHotkeys()
 
 	a.cfg = next
 	if err := a.registerHotkeys(); err != nil {
-		log.Printf("app apply settings failed, restoring previous config: %v", err)
-		win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
-		win.UnregisterHotKey(a.hwnd, hotkeyOCR)
-		a.cfg = prev
-		_ = a.registerHotkeys()
-		if keepSuspended {
-			win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
-			win.UnregisterHotKey(a.hwnd, hotkeyOCR)
+		// Another application may own the requested hotkey. Preserve all other
+		// updated settings while restoring the previous hotkeys.
+		log.Printf("app hotkey registration failed, keeping previous hotkeys: %v", err)
+		a.cfg.Hotkey = prev.Hotkey
+		a.cfg.HotkeyDisplay = prev.HotkeyDisplay
+		a.cfg.OcrHotkey = prev.OcrHotkey
+		a.cfg.OcrHotkeyDisplay = prev.OcrHotkeyDisplay
+		a.unregisterHotkeys()
+		if restoreErr := a.registerHotkeys(); restoreErr != nil {
+			log.Printf("app restore previous hotkeys failed (hotkeys unavailable): %v", restoreErr)
+			a.setStatus("快捷键被占用，暂时无法注册")
+		} else {
+			log.Printf("app previous hotkeys restored")
 		}
-		_ = config.Save(a.baseDir, prev)
-		return err
 	}
 
 	if err := config.Save(a.baseDir, a.cfg); err != nil {
 		log.Printf("app save settings failed, restoring previous config: %v", err)
-		win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
-		win.UnregisterHotKey(a.hwnd, hotkeyOCR)
-		a.cfg = prev
-		_ = a.registerHotkeys()
-		if keepSuspended {
-			win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
-			win.UnregisterHotKey(a.hwnd, hotkeyOCR)
-		}
+		a.restoreConfig(prev, keepSuspended)
 		return err
 	}
 
 	if launchChanged {
 		if err := a.syncLaunchAtLogin(); err != nil {
 			log.Printf("app set launch at login failed, restoring previous config: %v", err)
-			win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
-			win.UnregisterHotKey(a.hwnd, hotkeyOCR)
-			a.cfg = prev
-			_ = a.registerHotkeys()
-			if keepSuspended {
-				win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
-				win.UnregisterHotKey(a.hwnd, hotkeyOCR)
-			}
+			a.restoreConfig(prev, keepSuspended)
 			_ = config.Save(a.baseDir, prev)
 			return fmt.Errorf("设置开机启动失败: %w", err)
 		}
 	}
 
 	if keepSuspended {
-		win.UnregisterHotKey(a.hwnd, hotkeyTranslate)
-		win.UnregisterHotKey(a.hwnd, hotkeyOCR)
+		a.unregisterHotkeys()
 	}
 	_ = applog.Configure(filepath.Join(a.baseDir, "translate.log"), a.cfg.LoggingEnabled)
 	a.setBackendIdleTimeout(a.cfg.AIIdleTimeout())
@@ -897,9 +896,10 @@ func (a *App) showTranslation() {
 	a.resultMu.Lock()
 	source := a.source
 	result := a.result
+	elapsedMS := a.elapsedMS
 	a.resultMu.Unlock()
 
-	if err := a.showWailsResult(source, result, "", false); err != nil {
+	if err := a.showWailsResult(source, result, "", false, elapsedMS); err != nil {
 		log.Printf("show translation wails popup failed: %v", err)
 		a.setStatus("翻译窗口启动失败")
 		return
@@ -913,7 +913,7 @@ func (a *App) showError() {
 	errMsg := a.lastErr
 	a.resultMu.Unlock()
 
-	if err := a.showWailsResult(source, "", errMsg, false); err != nil {
+	if err := a.showWailsResult(source, "", errMsg, false, 0); err != nil {
 		log.Printf("show error wails popup failed: %v", err)
 		a.setStatus("错误窗口启动失败")
 		return
@@ -926,7 +926,7 @@ func (a *App) showLoading() {
 	source := a.source
 	a.resultMu.Unlock()
 
-	if err := a.showWailsResult(source, "", "", true); err != nil {
+	if err := a.showWailsResult(source, "", "", true, 0); err != nil {
 		log.Printf("show loading wails popup failed: %v", err)
 		a.setStatus("加载窗口启动失败")
 		return
@@ -934,27 +934,28 @@ func (a *App) showLoading() {
 	log.Printf("show loading wails popup success")
 }
 
-func (a *App) showWailsResult(source, result, errMsg string, loading bool) error {
+func (a *App) showWailsResult(source, result, errMsg string, loading bool, elapsedMS int64) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	return a.ui.ShowResult(ctx, uidaemon.ResultPayload{
-		Source:  source,
-		Result:  result,
-		Error:   errMsg,
-		Loading: loading,
+		Source:    source,
+		Result:    result,
+		Error:     errMsg,
+		Loading:   loading,
+		ElapsedMS: elapsedMS,
 	})
 }
 
 func (a *App) handleUIDaemonEvent(event int) {
 	switch event {
-	case uidaemon.EventSettingsHidden:
+	case uidaemon.EventSettingsHidden, uidaemon.EventConfigSaved, uidaemon.EventUIExited:
+		// Always post for UI exit too: resumeHotkeys is idempotent and reading
+		// hotkeysSuspended from this callback goroutine would race the window thread.
 		win.PostMessage(a.hwnd, wmSettingsClosed, 0, 0)
-	case uidaemon.EventConfigSaved:
-		win.PostMessage(a.hwnd, wmSettingsClosed, 0, 0)
-	case uidaemon.EventUIExited:
-		if a.hotkeysSuspended {
-			win.PostMessage(a.hwnd, wmSettingsClosed, 0, 0)
-		}
+	case uidaemon.EventHotkeyPause:
+		win.PostMessage(a.hwnd, wmHotkeyPause, 0, 0)
+	case uidaemon.EventHotkeyResume:
+		win.PostMessage(a.hwnd, wmHotkeyResume, 0, 0)
 	}
 }
 
@@ -1051,6 +1052,16 @@ func mainWindowProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		if err := currentApp.resumeHotkeys(); err != nil {
 			log.Printf("resume hotkeys after wails settings closed: %v", err)
 			currentApp.pushError("", err.Error())
+		}
+		return 0
+	case wmHotkeyPause:
+		log.Printf("main window proc: hotkey recording started")
+		currentApp.suspendHotkeys()
+		return 0
+	case wmHotkeyResume:
+		log.Printf("main window proc: hotkey recording finished")
+		if err := currentApp.resumeHotkeys(); err != nil {
+			log.Printf("resume hotkeys after recording: %v", err)
 		}
 		return 0
 	case win.WmClose:

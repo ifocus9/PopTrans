@@ -338,3 +338,151 @@ func TestLaunchAtLoginMissingUsesDefault(t *testing.T) {
 	}
 }
 
+func TestModelDownloadSourceDefaultsToModelScope(t *testing.T) {
+	cfg, err := Load(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ModelDownloadSource != ModelSourceModelScope {
+		t.Fatalf("expected %q, got %q", ModelSourceModelScope, cfg.ModelDownloadSource)
+	}
+	if cfg.ModelDownloadBaseURL != "" {
+		t.Fatalf("expected empty base URL, got %q", cfg.ModelDownloadBaseURL)
+	}
+}
+
+func TestModelDownloadSourceRoundTripAndFallback(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Default
+	cfg.ModelDownloadSource = "CUSTOM"
+	cfg.ModelDownloadBaseURL = " https://mirror.example.com/hf/ "
+	if err := Save(dir, cfg); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ModelDownloadSource != ModelSourceCustom {
+		t.Fatalf("expected %q, got %q", ModelSourceCustom, loaded.ModelDownloadSource)
+	}
+	if loaded.ModelDownloadBaseURL != "https://mirror.example.com/hf" {
+		t.Fatalf("expected trimmed URL, got %q", loaded.ModelDownloadBaseURL)
+	}
+
+	if err := os.WriteFile(
+		filepath.Join(dir, "settings.json"),
+		[]byte(`{"model_download_source":"custom","model_download_base_url":"ftp://invalid.example.com"}`),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	fallback, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fallback.ModelDownloadSource != ModelSourceModelScope {
+		t.Fatalf("expected fallback %q, got %q", ModelSourceModelScope, fallback.ModelDownloadSource)
+	}
+	if fallback.ModelDownloadBaseURL != "" {
+		t.Fatalf("expected invalid base URL to clear, got %q", fallback.ModelDownloadBaseURL)
+	}
+
+	if err := os.WriteFile(
+		filepath.Join(dir, "settings.json"),
+		[]byte(`{"model_download_source":"unknown-source"}`),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	unknown, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unknown.ModelDownloadSource != ModelSourceModelScope {
+		t.Fatalf("expected fallback %q for unknown source, got %q", ModelSourceModelScope, unknown.ModelDownloadSource)
+	}
+}
+
+func TestModelInstalled(t *testing.T) {
+	dir := t.TempDir()
+	if ModelInstalled(dir) {
+		t.Fatal("expected false before model file exists")
+	}
+	modelDir := filepath.Join(dir, "models", DefaultModelDirName)
+	if err := os.MkdirAll(modelDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	modelPath := filepath.Join(modelDir, DefaultModelFilename)
+	if err := os.WriteFile(modelPath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if ModelInstalled(dir) {
+		t.Fatal("expected false for empty placeholder model file")
+	}
+	if err := os.WriteFile(modelPath, []byte("gguf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !ModelInstalled(dir) {
+		t.Fatal("expected true when non-empty model file exists")
+	}
+}
+
+func TestCpuThreadsAndResidentIdleSettings(t *testing.T) {
+	dir := t.TempDir()
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CpuThreads != 0 {
+		t.Fatalf("cpu_threads should default to 0, got %d", cfg.CpuThreads)
+	}
+
+	cfg.CpuThreads = 6
+	cfg.UIIdleMinutes = 0
+	cfg.AIIdleMinutes = 0
+	if err := Save(dir, cfg); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.CpuThreads != 6 || loaded.UIIdleMinutes != 0 || loaded.AIIdleMinutes != 0 {
+		t.Fatalf("unexpected persisted config: %+v", loaded)
+	}
+	if loaded.UIIdleTimeout() != 0 || loaded.AIIdleTimeout() != 0 {
+		t.Fatalf("expected 0 resident idle timeouts, got ui=%s ai=%s", loaded.UIIdleTimeout(), loaded.AIIdleTimeout())
+	}
+
+	if err := os.WriteFile(
+		filepath.Join(dir, "settings.json"),
+		[]byte(`{"cpu_threads":-5}`),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	neg, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if neg.CpuThreads != 0 {
+		t.Fatalf("negative cpu_threads should normalize to 0, got %d", neg.CpuThreads)
+	}
+
+	if err := os.WriteFile(
+		filepath.Join(dir, "settings.json"),
+		[]byte(`{"cpu_threads":9999}`),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	high, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if high.CpuThreads != MaxCpuThreads {
+		t.Fatalf("oversized cpu_threads should clamp to %d, got %d", MaxCpuThreads, high.CpuThreads)
+	}
+}
+

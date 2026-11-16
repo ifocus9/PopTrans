@@ -30,26 +30,69 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: 'backend/requirements*.txt'
 
-      - name: Install Python build dependencies
+      - name: Restore cached llama-cpp-python wheelhouse
+        id: llama-wheel-cache
+        uses: actions/cache@v4
+        with:
+          path: .wheelhouse
+          key: llama-wheel-${{ runner.os }}-py312-cpu-${{ hashFiles('backend/requirements.txt', 'backend/requirements-build.txt', 'scripts/prepare_llama_wheel.ps1') }}
+          restore-keys: |
+            llama-wheel-${{ runner.os }}-py312-cpu-
+
+      - name: Install Python build dependencies (using precompiled wheel)
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          pip install -r backend/requirements-build.txt
+          & .\scripts\prepare_llama_wheel.ps1 -WheelDir ".wheelhouse" -Variant "cpu" -ReleaseTag "llama-wheels-py312" -TryUpstreamBinary -Install
+        env:
+          GH_TOKEN: ${{ github.token }}
 
-      # 2. 编译各核心模块
-      - name: Build Wails UI (translate-ui.exe)
+      - name: Restore Wails CLI cache
+        id: wails-cache
+        uses: actions/cache@v4
+        with:
+          path: .gobin
+          key: wails-cli-${{ runner.os }}-v2.13.0
+
+      - name: Restore frontend dependencies
         shell: pwsh
         run: |
-          go install github.com/wailsapp/wails/v2/cmd/wails@v2.13.0
+          Push-Location frontend
+          try {
+            npm ci
+          } finally {
+            Pop-Location
+          }
+
+      # 2. 编译前验证与各核心模块构建
+      - name: Build Wails UI (translate-ui.exe)
+        shell: pwsh
+        env:
+          GOBIN: ${{ github.workspace }}\.gobin
+        run: |
+          $wailsExe = Join-Path $env:GOBIN "wails.exe"
+          if (-not (Test-Path $wailsExe)) {
+            go install github.com/wailsapp/wails/v2/cmd/wails@v2.13.0
+          }
           if (-not (Test-Path "build\windows")) { New-Item -ItemType Directory -Path "build\windows" -Force }
           Copy-Item "assets\icon.ico" "build\windows\icon.ico" -Force
-          wails build -clean
+          & $wailsExe build -clean
+
+      - name: Run unit tests
+        shell: pwsh
+        run: |
+          python -m unittest discover -s backend -p "test_*.py" -v
+          go test -count=1 ./...
 
       - name: Build AI Engine (ai_engine.exe)
         shell: pwsh

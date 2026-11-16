@@ -1,7 +1,13 @@
+import json
+import os
+import tempfile
 import unittest
+from unittest.mock import patch
 
 from backend.translator import (
     Translator,
+    _read_cpu_threads,
+    _resolve_n_threads,
     build_translation_prompt,
     normalize_target_language,
 )
@@ -98,6 +104,32 @@ class TranslatorLanguageTests(unittest.TestCase):
         self.assertIn("configured", info)
         self.assertIn("actual", info)
         self.assertIn("gpu_layers", info)
+        self.assertIn("configured_threads", info)
+        self.assertIn("threads", info)
+        self.assertGreaterEqual(info["threads"], 1)
+
+    def test_cpu_threads_config_and_resolution(self):
+        self.assertGreaterEqual(_resolve_n_threads(0), 1)
+        self.assertEqual(_resolve_n_threads(6), 6)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            from pathlib import Path
+
+            cfg_file = Path(tmpdir) / "settings.json"
+            with patch("backend.translator.settings_path", return_value=cfg_file):
+                self.assertEqual(_read_cpu_threads(), 0)
+
+                cfg_file.write_text(json.dumps({"cpu_threads": 8}), encoding="utf-8")
+                self.assertEqual(_read_cpu_threads(), 8)
+
+                cfg_file.write_text(json.dumps({"cpu_threads": -2}), encoding="utf-8")
+                self.assertEqual(_read_cpu_threads(), 0)
+
+                cfg_file.write_text(json.dumps({"cpu_threads": 999}), encoding="utf-8")
+                self.assertEqual(_read_cpu_threads(), 256)
+
+                cfg_file.write_text(json.dumps({"cpu_threads": True}), encoding="utf-8")
+                self.assertEqual(_read_cpu_threads(), 0)
 
 
 if __name__ == "__main__":

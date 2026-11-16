@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"translate-plugin/internal/config"
+	win "translate-plugin/internal/platform/windows"
 )
 
 // createNoWindow 对应 Windows 的 CREATE_NO_WINDOW 进程创建标志。
@@ -128,6 +129,7 @@ func (s *Supervisor) EnsureRunning(ctx context.Context, onStatus func(string)) e
 			serverPort = cfg.ServerPort
 		}
 		cmd.Env = environmentWith(os.Environ(), serverPortEnv, strconv.Itoa(serverPort))
+		cmd.Env = environmentWith(cmd.Env, "POPTRANS_BASE_DIR", s.baseDir)
 		if loggingEnabled {
 			backendLogPath := filepath.Join(s.baseDir, "translate.log")
 			backendLogFile, err = os.OpenFile(backendLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
@@ -260,8 +262,9 @@ func (s *Supervisor) waitForReady(ctx, stopCtx context.Context, onStatus func(st
 
 func (s *Supervisor) backendCommand() (*exec.Cmd, string, error) {
 	enginePath := filepath.Join(s.baseDir, "ai_engine.exe")
-	if _, err := os.Stat(enginePath); err == nil {
-		return exec.Command(enginePath), "ai_engine.exe", nil
+	if trustedPath, err := win.TrustedExecutable(enginePath, "ai_engine.exe"); err == nil {
+		// Launch the validated absolute path directly without PATH resolution.
+		return &exec.Cmd{Path: trustedPath, Args: []string{trustedPath}}, "ai_engine.exe", nil
 	}
 
 	scriptPath := filepath.Join(s.baseDir, "backend", "api_server.py")
@@ -273,15 +276,7 @@ func (s *Supervisor) backendCommand() (*exec.Cmd, string, error) {
 }
 
 func environmentWith(environ []string, key, value string) []string {
-	prefix := key + "="
-	result := make([]string, 0, len(environ)+1)
-	for _, entry := range environ {
-		if strings.HasPrefix(strings.ToUpper(entry), strings.ToUpper(prefix)) {
-			continue
-		}
-		result = append(result, entry)
-	}
-	return append(result, prefix+value)
+	return config.EnvironmentWith(environ, key, value)
 }
 
 func translatorInitializationError(health Health) error {
@@ -349,15 +344,12 @@ func (s *Supervisor) waitForOwnedExit() {
 func (s *Supervisor) killEngineByPath() {
 	target := filepath.Join(s.baseDir, "ai_engine.exe")
 	log.Printf("supervisor sweeping leftover engine at %s", target)
-	ps := fmt.Sprintf(
-		"Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq '%s' } | ForEach-Object { taskkill.exe /PID $_.ProcessId /T /F }",
-		strings.ReplaceAll(target, "'", "''"),
-	)
-	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", ps)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
-	if out, err := cmd.CombinedOutput(); err != nil {
-		log.Printf("supervisor engine sweep finished (pids may have already exited): %v | %s", err, strings.TrimSpace(string(out)))
+	killed, err := win.KillProcessesByImagePath(target)
+	if err != nil {
+		log.Printf("supervisor engine sweep failed: %v", err)
+		return
 	}
+	log.Printf("supervisor engine sweep finished: killed=%d", killed)
 }
 
 func (s *Supervisor) Restart(ctx context.Context, onStatus func(string)) error {

@@ -161,11 +161,11 @@ func (c *Client) Translate(ctx context.Context, text string) (string, error) {
 	return result, nil
 }
 
-func (c *Client) OCRImage(ctx context.Context, pngBytes []byte) (string, error) {
+func (c *Client) OCRImage(ctx context.Context, imageBytes []byte) (string, error) {
 	startedAt := time.Now()
-	log.Printf("backend ocr request start: bytes=%d", len(pngBytes))
+	log.Printf("backend ocr request start: bytes=%d", len(imageBytes))
 
-	body, contentType, err := multipartPNGBody(pngBytes)
+	body, contentType, err := multipartImageBody(imageBytes)
 	if err != nil {
 		return "", err
 	}
@@ -200,12 +200,12 @@ func (c *Client) OCRImage(ctx context.Context, pngBytes []byte) (string, error) 
 	return decoded.Text, nil
 }
 
-func (c *Client) OCRTranslateImage(ctx context.Context, pngBytes []byte) (OCRTranslateResult, error) {
+func (c *Client) OCRTranslateImage(ctx context.Context, imageBytes []byte) (OCRTranslateResult, error) {
 	var decoded OCRTranslateResult
 	startedAt := time.Now()
-	log.Printf("backend ocr_translate request start: bytes=%d", len(pngBytes))
+	log.Printf("backend ocr_translate request start: bytes=%d", len(imageBytes))
 
-	body, contentType, err := multipartPNGBody(pngBytes)
+	body, contentType, err := multipartImageBody(imageBytes)
 	if err != nil {
 		return decoded, err
 	}
@@ -246,17 +246,45 @@ func (c *Client) OCRTranslateImage(ctx context.Context, pngBytes []byte) (OCRTra
 	return decoded, nil
 }
 
-func multipartPNGBody(pngBytes []byte) (*bytes.Buffer, string, error) {
+func detectImageFormat(data []byte) (mimeType, ext string) {
+	if len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP" {
+		return "image/webp", ".webp"
+	}
+	if len(data) >= 2 && data[0] == 'B' && data[1] == 'M' {
+		return "image/bmp", ".bmp"
+	}
+	detected := http.DetectContentType(data)
+	switch detected {
+	case "image/jpeg":
+		return "image/jpeg", ".jpg"
+	case "image/gif":
+		return "image/gif", ".gif"
+	case "image/png":
+		return "image/png", ".png"
+	case "image/webp":
+		return "image/webp", ".webp"
+	case "image/bmp":
+		return "image/bmp", ".bmp"
+	default:
+		if strings.HasPrefix(detected, "image/") {
+			return detected, ".img"
+		}
+		return "image/png", ".png"
+	}
+}
+
+func multipartImageBody(imgBytes []byte) (*bytes.Buffer, string, error) {
+	mimeType, ext := detectImageFormat(imgBytes)
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	header := make(textproto.MIMEHeader)
-	header.Set("Content-Disposition", `form-data; name="file"; filename="screenshot.png"`)
-	header.Set("Content-Type", "image/png")
+	header.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename="image%s"`, ext))
+	header.Set("Content-Type", mimeType)
 	part, err := writer.CreatePart(header)
 	if err != nil {
 		return nil, "", err
 	}
-	if _, err := part.Write(pngBytes); err != nil {
+	if _, err := part.Write(imgBytes); err != nil {
 		return nil, "", err
 	}
 	if err := writer.Close(); err != nil {

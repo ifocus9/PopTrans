@@ -1,0 +1,99 @@
+name: Precompile llama-cpp-python Wheel
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'CMake backend variant to build'
+        required: true
+        default: 'cpu'
+        type: choice
+        options:
+          - cpu
+          - vulkan
+      llama_cpp_version:
+        description: 'Optional exact llama-cpp-python version (blank uses backend/requirements.txt)'
+        required: false
+        default: ''
+        type: string
+      publish_release:
+        description: 'Publish/update wheel assets in GitHub Release (tag: llama-wheels-py312)'
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches:
+      - master
+      - main
+    paths:
+      - 'backend/requirements.txt'
+      - 'backend/requirements-build.txt'
+      - 'scripts/prepare_llama_wheel.ps1'
+      - '.github/workflows/llama-wheel.yml'
+  schedule:
+    # Weekly run to keep the GitHub Actions wheelhouse cache warm
+    - cron: '0 3 * * 1'
+
+permissions:
+  contents: write
+
+jobs:
+  build-wheel:
+    name: Build llama-cpp-python Wheel (${{ inputs.variant || 'cpu' }})
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: 'backend/requirements*.txt'
+
+      - name: Restore cached llama-cpp-python wheelhouse
+        uses: actions/cache@v4
+        with:
+          path: .wheelhouse
+          key: llama-wheel-${{ runner.os }}-py312-${{ inputs.variant || 'cpu' }}-${{ hashFiles('backend/requirements.txt', 'backend/requirements-build.txt', 'scripts/prepare_llama_wheel.ps1') }}
+
+      - name: Build and verify llama-cpp-python wheel
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          $argsList = @(
+            '-WheelDir', '.wheelhouse',
+            '-Variant', '${{ inputs.variant || 'cpu' }}',
+            '-Install',
+            '-TryUpstreamBinary'
+          )
+          if ('${{ inputs.llama_cpp_version }}' -ne '') {
+            $argsList += @('-Version', '${{ inputs.llama_cpp_version }}', '-Rebuild')
+          }
+          & .\scripts\prepare_llama_wheel.ps1 @argsList
+
+      - name: Upload precompiled wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-cpp-python-wheel-${{ runner.os }}-py312-${{ inputs.variant || 'cpu' }}
+          path: |
+            .wheelhouse/*.whl
+            .wheelhouse/SHA256SUMS.txt
+          retention-days: 90
+
+      - name: Publish wheel release asset (optional)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: llama-wheels-py312
+          name: Precompiled llama-cpp-python Wheels (Windows py312)
+          prerelease: true
+          make_latest: false
+          files: |
+            .wheelhouse/*.whl
+            .wheelhouse/SHA256SUMS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

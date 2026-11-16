@@ -4,17 +4,25 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
 const (
-	DefaultServerPort    = 8989
-	MinServerPort        = 1024
-	MaxServerPort        = 65535
-	DefaultUIIdleMinutes = 5
-	DefaultAIIdleMinutes = 15
+	DefaultServerPort      = 8989
+	MinServerPort          = 1024
+	MaxServerPort          = 65535
+	DefaultUIIdleMinutes   = 5
+	DefaultAIIdleMinutes   = 15
+	MaxCpuThreads          = 256
+	ModelSourceModelScope  = "modelscope"
+	ModelSourceHuggingFace = "huggingface"
+	ModelSourceCustom      = "custom"
+	DefaultModelDirName    = "Hy-MT2-1.8B-GGUF"
+	DefaultModelFilename   = "Hy-MT2-1.8B-Q4_K_M.gguf"
 )
 
 type Config struct {
@@ -28,6 +36,8 @@ type Config struct {
 	Theme            string `json:"theme"`
 	// AccelerationDevice: "auto" | "gpu" | "cpu"
 	AccelerationDevice string `json:"acceleration_device"`
+	// CpuThreads limits llama.cpp worker threads; 0 lets backend auto-detect.
+	CpuThreads int `json:"cpu_threads"`
 	// UIIdleMinutes is how long the UI process stays alive after the window is hidden.
 	// 0 means never auto-exit. Missing values fall back to DefaultUIIdleMinutes.
 	UIIdleMinutes int `json:"ui_idle_minutes"`
@@ -37,21 +47,30 @@ type Config struct {
 	// LaunchAtLogin enables starting the app automatically when the user logs in.
 	// The host process writes its own executable path to the HKCU Run key.
 	LaunchAtLogin bool `json:"launch_at_login"`
+	// ModelDownloadSource selects where the translation model is downloaded from:
+	// "modelscope" (default), "huggingface", or "custom".
+	ModelDownloadSource string `json:"model_download_source"`
+	// ModelDownloadBaseURL specifies the mirror root or direct .gguf URL when
+	// ModelDownloadSource is "custom".
+	ModelDownloadBaseURL string `json:"model_download_base_url"`
 }
 
 var Default = Config{
-	Hotkey:             "<ctrl>+<alt>+q",
-	HotkeyDisplay:      "Ctrl+Alt+Q",
-	OcrEnabled:         false,
-	OcrHotkey:          "<ctrl>+<alt>+e",
-	OcrHotkeyDisplay:   "Ctrl+Alt+E",
-	LoggingEnabled:     false,
-	ServerPort:         DefaultServerPort,
-	Theme:              "system",
-	AccelerationDevice: "auto",
-	UIIdleMinutes:      DefaultUIIdleMinutes,
-	AIIdleMinutes:      DefaultAIIdleMinutes,
-	LaunchAtLogin:      false,
+	Hotkey:               "<ctrl>+<alt>+q",
+	HotkeyDisplay:        "Ctrl+Alt+Q",
+	OcrEnabled:           false,
+	OcrHotkey:            "<ctrl>+<alt>+e",
+	OcrHotkeyDisplay:     "Ctrl+Alt+E",
+	LoggingEnabled:       false,
+	ServerPort:           DefaultServerPort,
+	Theme:                "system",
+	AccelerationDevice:   "auto",
+	CpuThreads:           0,
+	UIIdleMinutes:        DefaultUIIdleMinutes,
+	AIIdleMinutes:        DefaultAIIdleMinutes,
+	LaunchAtLogin:        false,
+	ModelDownloadSource:  ModelSourceModelScope,
+	ModelDownloadBaseURL: "",
 }
 
 func ResolveBaseDir() string {
@@ -157,6 +176,8 @@ func mergeDefaults(cfg *Config) {
 	if cfg.AIIdleMinutes < 0 {
 		cfg.AIIdleMinutes = Default.AIIdleMinutes
 	}
+	cfg.CpuThreads = clampCpuThreads(cfg.CpuThreads)
+	normalizeDownloadSettings(cfg)
 }
 
 func mergeLoadedDefaults(cfg *Config, rawKeys map[string]json.RawMessage) {
@@ -179,6 +200,59 @@ func mergeLoadedDefaults(cfg *Config, rawKeys map[string]json.RawMessage) {
 	if cfg.AIIdleMinutes < 0 {
 		cfg.AIIdleMinutes = Default.AIIdleMinutes
 	}
+	cfg.CpuThreads = clampCpuThreads(cfg.CpuThreads)
+	normalizeDownloadSettings(cfg)
+}
+
+func clampCpuThreads(threads int) int {
+	if threads < 0 {
+		return 0
+	}
+	if threads > MaxCpuThreads {
+		return MaxCpuThreads
+	}
+	return threads
+}
+
+func normalizeDownloadSettings(cfg *Config) {
+	cfg.ModelDownloadSource = NormalizeModelDownloadSource(cfg.ModelDownloadSource)
+	cfg.ModelDownloadBaseURL = NormalizeModelDownloadBaseURL(cfg.ModelDownloadBaseURL)
+	if cfg.ModelDownloadSource == ModelSourceCustom && cfg.ModelDownloadBaseURL == "" {
+		cfg.ModelDownloadSource = ModelSourceModelScope
+	}
+}
+
+// NormalizeModelDownloadSource normalizes a model download source identifier.
+func NormalizeModelDownloadSource(source string) string {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case "", ModelSourceModelScope:
+		return ModelSourceModelScope
+	case ModelSourceHuggingFace:
+		return ModelSourceHuggingFace
+	case ModelSourceCustom:
+		return ModelSourceCustom
+	default:
+		return ModelSourceModelScope
+	}
+}
+
+// NormalizeModelDownloadBaseURL normalizes an HTTP(S) mirror or direct model URL.
+func NormalizeModelDownloadBaseURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return ""
+	}
+	return strings.TrimRight(trimmed, "/")
+}
+
+// ModelInstalled reports whether the default GGUF model file exists under baseDir.
+func ModelInstalled(baseDir string) bool {
+	info, err := os.Stat(filepath.Join(baseDir, "models", DefaultModelDirName, DefaultModelFilename))
+	return err == nil && !info.IsDir() && info.Size() > 0
 }
 
 // UIIdleTimeout returns how long the UI should stay alive after hide.
@@ -235,4 +309,18 @@ func isProjectRoot(dir string) bool {
 func isPackagedRoot(dir string) bool {
 	return exists(filepath.Join(dir, "ai_engine.exe")) &&
 		exists(filepath.Join(dir, "translate-ui.exe"))
+}
+
+// EnvironmentWith returns environ with key set to value, replacing any existing
+// case-insensitive match for key.
+func EnvironmentWith(environ []string, key, value string) []string {
+	prefix := key + "="
+	result := make([]string, 0, len(environ)+1)
+	for _, entry := range environ {
+		if strings.HasPrefix(strings.ToUpper(entry), strings.ToUpper(prefix)) {
+			continue
+		}
+		result = append(result, entry)
+	}
+	return append(result, prefix+value)
 }

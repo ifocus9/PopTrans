@@ -66,6 +66,25 @@ func (s *CallbackServer) Start() (url, token string, err error) {
 		}
 		writeJSON(w, map[string]any{"ok": true})
 	}))
+	mux.HandleFunc(EndpointNotifyHotkeyHold, s.withAuth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var payload HotkeyHoldPayload
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&payload); err != nil {
+			http.Error(w, "invalid payload", http.StatusBadRequest)
+			return
+		}
+		if s.onEvent != nil {
+			if payload.Paused {
+				s.onEvent(EventHotkeyPause)
+			} else {
+				s.onEvent(EventHotkeyResume)
+			}
+		}
+		writeJSON(w, map[string]any{"ok": true})
+	}))
 
 	server := &http.Server{Handler: mux, ReadHeaderTimeout: 2 * time.Second}
 	s.token = token
@@ -127,6 +146,12 @@ func (c *NotifyClient) Hidden(ctx context.Context) error {
 
 func (c *NotifyClient) ConfigSaved(ctx context.Context) error {
 	return c.post(ctx, EndpointNotifyConfig, map[string]any{"ok": true})
+}
+
+// HotkeyHold pauses or resumes global hotkeys while the settings UI records a
+// key combination so Windows does not intercept existing hotkeys before WebView.
+func (c *NotifyClient) HotkeyHold(ctx context.Context, paused bool) error {
+	return c.post(ctx, EndpointNotifyHotkeyHold, HotkeyHoldPayload{Paused: paused})
 }
 
 func (c *NotifyClient) post(ctx context.Context, path string, body any) error {

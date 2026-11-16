@@ -26,7 +26,9 @@ func main() {
 	baseDir := config.ResolveBaseDir()
 	configureWailsLogging(baseDir)
 
-	daemonMode := hasArg(os.Args, "--daemon")
+	launch := wailsui.LaunchOptionsFromEnv()
+	launch.ApplyModeArgs(os.Args[1:])
+	daemonMode := launch.Daemon
 	background := &options.RGBA{A: 0}
 
 	cfg, err := config.Load(baseDir)
@@ -49,14 +51,14 @@ func main() {
 		WindowIsTranslucent:  true,
 		BackdropType:         wailswindows.Acrylic,
 	}
-	app := wailsui.NewApp(baseDir, os.Args)
+	app := wailsui.NewApp(baseDir, launch)
 
 	err = wails.Run(&options.App{
 		Title:         "选中翻译",
-		Width:         458,
-		Height:        640,
+		Width:         wailsui.MainDefaultWidth,
+		Height:        wailsui.MainDefaultHeight,
 		StartHidden:   true,
-		DisableResize: true,
+		DisableResize: false,
 		Frameless:     true,
 		AlwaysOnTop:   false,
 		AssetServer: &assetserver.Options{
@@ -76,15 +78,6 @@ func main() {
 	if daemonMode {
 		log.Printf("translate-ui daemon exited")
 	}
-}
-
-func hasArg(args []string, name string) bool {
-	for _, arg := range args {
-		if arg == name {
-			return true
-		}
-	}
-	return false
 }
 
 func configureWailsLogging(baseDir string) {

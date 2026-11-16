@@ -10,6 +10,10 @@ export function HideWindow() {
   return window['go']['wailsui']['App']['HideWindow']();
 }
 
+export function OCRImage(arg1) {
+  return window['go']['wailsui']['App']['OCRImage'](arg1);
+}
+
 export function OnConfigSaved() {
   return window['go']['wailsui']['App']['OnConfigSaved']();
 }
@@ -24,6 +28,10 @@ export function Quit() {
 
 export function SaveConfig(arg1) {
   return window['go']['wailsui']['App']['SaveConfig'](arg1);
+}
+
+export function SetHotkeyRecording(arg1) {
+  return window['go']['wailsui']['App']['SetHotkeyRecording'](arg1);
 }
 
 export function ShowResult(arg1) {

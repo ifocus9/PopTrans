@@ -11,10 +11,13 @@ import sys
 import re
 import json
 import time
+import socket
+import ipaddress
 import threading
 import logging
 from collections import OrderedDict
 from typing import Optional, Tuple
+from urllib.parse import urljoin, urlsplit
 
 from backend.runtime_paths import application_dir, settings_path
 
@@ -23,6 +26,7 @@ logger = logging.getLogger(__name__)
 # ── 模型配置 ──────────────────────────────────────────────
 
 MODEL_ID = "tencent/Hy-MT2-1.8B-GGUF"
+MODELSCOPE_MODEL_ID = "Tencent-Hunyuan/Hy-MT2-1.8B-GGUF"
 MODEL_FILENAME = "Hy-MT2-1.8B-Q4_K_M.gguf"
 
 _BASE_DIR = os.fspath(application_dir())
@@ -30,10 +34,12 @@ _BASE_DIR = os.fspath(application_dir())
 MODEL_DIR = os.path.join(_BASE_DIR, "models", "Hy-MT2-1.8B-GGUF")
 MODEL_PATH = os.path.join(MODEL_DIR, MODEL_FILENAME)
 
-# 直接从 HuggingFace 官网下载模型。
-# 之前使用的 hf-mirror.com 镜像连不上会导致下载失败，故改为官方源。
+MODEL_SOURCE_MODELSCOPE = "modelscope"
+MODEL_SOURCE_HUGGINGFACE = "huggingface"
+MODEL_SOURCE_CUSTOM = "custom"
+MODELSCOPE_BASE_URL = "https://modelscope.cn"
 HF_ENDPOINT = "https://huggingface.co"
-os.environ["HF_ENDPOINT"] = HF_ENDPOINT
+os.environ.setdefault("HF_ENDPOINT", HF_ENDPOINT)
 
 # 离线模式开关：设置环境变量 POPTRANS_OFFLINE=1 时禁止联网下载（其余情况本地缺模型即自动下载）。
 _OFFLINE_MODE = os.environ.get("POPTRANS_OFFLINE", "").strip() == "1"
@@ -42,6 +48,64 @@ _OFFLINE_MODE = os.environ.get("POPTRANS_OFFLINE", "").strip() == "1"
 MODEL_N_CTX = 1536
 TRANSLATION_MAX_TOKENS = 384
 CACHE_MAX_ENTRIES = 256
+_MAX_MODEL_REDIRECTS = 5
+_MAX_CPU_THREADS = 256
+
+
+class UnsafeModelURLError(ValueError):
+    """Raised when a model download URL targets an unapproved or local address."""
+
+
+def _is_http_url(raw: str) -> bool:
+    """Return True when raw is an http or https URL with a non-empty host."""
+    try:
+        parsed = urlsplit((raw or "").strip())
+    except ValueError:
+        return False
+    return parsed.scheme.lower() in ("http", "https") and bool(parsed.netloc)
+
+
+def _read_model_download_config() -> Tuple[str, str]:
+    """Read normalized (model_download_source, model_download_base_url) from settings.json."""
+    try:
+        path = settings_path()
+        if not os.path.exists(path):
+            return MODEL_SOURCE_MODELSCOPE, ""
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return MODEL_SOURCE_MODELSCOPE, ""
+    if not isinstance(data, dict):
+        return MODEL_SOURCE_MODELSCOPE, ""
+
+    source = str(data.get("model_download_source") or "").strip().lower()
+    base_url = str(data.get("model_download_base_url") or "").strip().rstrip("/")
+    if source == MODEL_SOURCE_CUSTOM:
+        if _is_http_url(base_url):
+            return MODEL_SOURCE_CUSTOM, base_url
+        return MODEL_SOURCE_MODELSCOPE, ""
+    if source in (MODEL_SOURCE_MODELSCOPE, MODEL_SOURCE_HUGGINGFACE):
+        return source, base_url if _is_http_url(base_url) else ""
+    return MODEL_SOURCE_MODELSCOPE, ""
+
+
+def _resolve_model_url(source: str, base_url: str = "") -> Tuple[str, str]:
+    """Resolve (download_url, display_label) for the selected download source."""
+    normalized = (source or "").strip().lower()
+    cleaned_base = (base_url or "").strip().rstrip("/")
+
+    if normalized == MODEL_SOURCE_CUSTOM and _is_http_url(cleaned_base):
+        if cleaned_base.lower().endswith(".gguf"):
+            return cleaned_base, "自定义下载链接"
+        return f"{cleaned_base}/{MODEL_ID}/resolve/main/{MODEL_FILENAME}", "自定义镜像源"
+
+    if normalized == MODEL_SOURCE_HUGGINGFACE:
+        return f"{HF_ENDPOINT}/{MODEL_ID}/resolve/main/{MODEL_FILENAME}", "HuggingFace 官网"
+
+    return (
+        f"{MODELSCOPE_BASE_URL}/models/{MODELSCOPE_MODEL_ID}/resolve/master/{MODEL_FILENAME}",
+        "魔搭 ModelScope",
+    )
 # 长文翻译：上下文窗口有限（n_ctx=1536）。单次请求必须同时容纳
 # prompt 模板、源文与译文，源文过长时要么触发 "requested tokens exceed
 # context window" 报错，要么输出被 max_tokens 截断。因此：
@@ -355,6 +419,76 @@ def _split_long_text(text: str):
     return chunks, True
 
 
+def _validate_model_url(url: str) -> str:
+    """Reject non-HTTP schemes and loopback/private/link-local/reserved hosts."""
+    try:
+        parts = urlsplit(url)
+    except ValueError as error:
+        raise UnsafeModelURLError(f"无效的下载地址: {error}") from error
+
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise UnsafeModelURLError(f"仅支持 http/https 下载地址: {url}")
+
+    host = parts.hostname
+    if not host:
+        raise UnsafeModelURLError(f"下载地址缺少主机名: {url}")
+
+    lowered = host.lower()
+    if lowered == "localhost" or lowered.endswith(".localhost"):
+        raise UnsafeModelURLError(f"拒绝下载到本机地址: {host}")
+
+    addresses = []
+    literal_host = host.split("%", 1)[0]
+    try:
+        addresses = [ipaddress.ip_address(literal_host)]
+    except ValueError:
+        try:
+            port = parts.port or (443 if scheme == "https" else 80)
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError as error:
+            raise UnsafeModelURLError(f"无法解析下载地址主机 {host}: {error}") from error
+        for info in infos:
+            raw = str(info[4][0]).split("%", 1)[0]
+            try:
+                addresses.append(ipaddress.ip_address(raw))
+            except ValueError:
+                continue
+
+    if not addresses:
+        raise UnsafeModelURLError(f"下载地址无法解析: {host}")
+
+    for address in addresses:
+        if (
+            address.is_loopback
+            or address.is_private
+            or address.is_link_local
+            or address.is_reserved
+            or address.is_multicast
+            or address.is_unspecified
+        ):
+            raise UnsafeModelURLError(f"下载地址 {host} 指向回环/内网/保留地址，已拒绝")
+
+    return url
+
+
+def _request_with_validated_redirects(session, method: str, url: str, **kwargs):
+    """Issue an HTTP request while validating every redirect hop before following."""
+    current = url
+    for _ in range(_MAX_MODEL_REDIRECTS + 1):
+        _validate_model_url(current)
+        response = session.request(method, current, allow_redirects=False, **kwargs)
+        if response.status_code in (301, 302, 303, 307, 308):
+            location = response.headers.get("Location")
+            response.close()
+            if not location:
+                raise IOError("下载服务器返回了缺少 Location 的重定向")
+            current = urljoin(current, location)
+            continue
+        return response
+    raise IOError("模型下载重定向次数过多")
+
+
 def _read_acceleration_preference() -> str:
     """读取用户配置的推理硬件偏好（auto / gpu / cpu）"""
     try:
@@ -369,6 +503,31 @@ def _read_acceleration_preference() -> str:
     return "auto"
 
 
+def _read_cpu_threads() -> int:
+    """读取用户配置的 CPU 推理线程数（0 表示自动检测）"""
+    try:
+        cfg_file = settings_path()
+        if cfg_file.is_file():
+            data = json.loads(cfg_file.read_text(encoding="utf-8"))
+            raw = data.get("cpu_threads", 0)
+            if isinstance(raw, bool):
+                return 0
+            val = int(raw)
+            if val <= 0:
+                return 0
+            return min(val, _MAX_CPU_THREADS)
+    except Exception as e:
+        logger.warning("读取 CPU 线程数配置失败，使用自动检测: %s", e)
+    return 0
+
+
+def _resolve_n_threads(configured: Optional[int] = None) -> int:
+    """Return effective llama.cpp worker thread count."""
+    if configured is not None and not isinstance(configured, bool) and 0 < int(configured) <= _MAX_CPU_THREADS:
+        return int(configured)
+    return max(1, os.cpu_count() or 4)
+
+
 class Translator:
     """Hy-MT2-1.8B 翻译引擎封装（使用 llama-cpp-python）"""
 
@@ -379,12 +538,15 @@ class Translator:
         self.ready = False
         self._model = None
         self._setup_lock = threading.Lock()
+        self._infer_lock = threading.Lock()
         self._cache_lock = threading.Lock()
         self._translation_cache = OrderedDict()
         self._status_message = "翻译引擎未初始化"
         self._configured_device = "auto"
         self._actual_device = "cpu"
         self._gpu_layers = 0
+        self._configured_threads = 0
+        self._actual_threads = _resolve_n_threads(0)
 
     @property
     def status(self) -> str:
@@ -396,6 +558,8 @@ class Translator:
             "configured": self._configured_device,
             "actual": self._actual_device,
             "gpu_layers": self._gpu_layers,
+            "configured_threads": self._configured_threads,
+            "threads": self._actual_threads,
         }
 
     # ── 初始化 ──────────────────────────────────────────────
@@ -425,7 +589,7 @@ class Translator:
 
         with self._setup_lock:
             try:
-                # 本地缺少模型时，自动从 HuggingFace 官网下载
+                # 本地缺少模型时，按配置的下载源自动下载
                 if not os.path.exists(MODEL_PATH):
                     if _OFFLINE_MODE:
                         raise FileNotFoundError(
@@ -453,36 +617,50 @@ class Translator:
                     on_ready(False)
 
     def _download_model(self, update_status):
-        """从 HuggingFace 官网下载 Hy-MT2 GGUF 模型（支持断点续传、重试）"""
+        """按配置下载源下载 Hy-MT2 GGUF 模型（支持断点续传、重试）"""
         import requests
-        from huggingface_hub import hf_hub_url
 
-        update_status("正在从 HuggingFace 官网下载模型...")
+        source, base_url = _read_model_download_config()
+        url, source_label = _resolve_model_url(source, base_url)
+        update_status(f"正在从 {source_label} 下载模型...")
         os.makedirs(MODEL_DIR, exist_ok=True)
 
-        # 走系统代理访问官网（默认 requests 行为），避免直连被网络阻断
+        # 走系统代理访问下载源（默认 requests 行为），避免直连被网络阻断。
+        # 证书校验保持开启；如需自定义 CA，请使用 REQUESTS_CA_BUNDLE。
         session = requests.Session()
-        url = hf_hub_url(MODEL_ID, MODEL_FILENAME, repo_type="model")
+        try:
+            _validate_model_url(url)
+        except UnsafeModelURLError as e:
+            update_status(f"模型下载地址不安全，已拒绝: {e}")
+            raise RuntimeError(f"模型下载地址不安全，已拒绝: {e}") from e
 
         # 探测文件大小（最多重试 5 次）
         total_size = 1133080448
         for attempt in range(1, 6):
             try:
-                resp = session.head(url, verify=False, timeout=(15, 30), allow_redirects=True)
-                resp.raise_for_status()
-                try:
-                    size = int(resp.headers.get("Content-Length", total_size))
-                except (ValueError, TypeError):
-                    size = total_size
-                if size >= 1024 * 1024:
-                    total_size = size
+                with _request_with_validated_redirects(
+                    session,
+                    "HEAD",
+                    url,
+                    timeout=(15, 30),
+                ) as resp:
+                    resp.raise_for_status()
+                    try:
+                        size = int(resp.headers.get("Content-Length", total_size))
+                    except (ValueError, TypeError):
+                        size = total_size
+                    if size >= 1024 * 1024:
+                        total_size = size
                 break
+            except UnsafeModelURLError as e:
+                update_status(f"模型下载地址不安全，已拒绝: {e}")
+                raise RuntimeError(f"模型下载地址不安全，已拒绝: {e}") from e
             except Exception as e:
                 logger.warning("探测模型大小第 %d/5 次失败: %s", attempt, e)
                 if attempt == 5:
                     update_status("无法获取模型大小，使用默认 1.13GB 继续下载")
                 else:
-                    update_status(f"连接官网失败，正在重试（{attempt}/5）...")
+                    update_status(f"连接 {source_label} 失败，正在重试（{attempt}/5）...")
                     time.sleep(1)
 
         part_path = MODEL_PATH + ".part"
@@ -504,14 +682,15 @@ class Translator:
                 headers["Range"] = f"bytes={existing}-"
                 mode = "ab"
 
+            response = None
             try:
-                response = session.get(
+                response = _request_with_validated_redirects(
+                    session,
+                    "GET",
                     url,
                     stream=True,
                     headers=headers,
-                    verify=False,
                     timeout=(15, 300),
-                    allow_redirects=True,
                 )
 
                 # 200 表示服务器忽略 Range 要求从头传；206 才是断点续传
@@ -528,6 +707,16 @@ class Translator:
                     existing = 0
                     mode = "wb"
                     update_status("服务器不支持断点续传，从头开始下载...")
+                elif response.status_code == 416:
+                    # .part 文件偏移超出远端大小或 Range 校验失败，清理后从头重下
+                    try:
+                        os.remove(part_path)
+                    except OSError:
+                        pass
+                    if attempt < max_retries:
+                        update_status("断点续传校验异常，从头开始下载...")
+                        continue
+                    response.raise_for_status()
                 else:
                     response.raise_for_status()
 
@@ -564,6 +753,9 @@ class Translator:
                 # 走到这里说明连接被提前关闭，但已有数据已落盘，可续传
                 raise IOError(f"连接提前关闭：已下载 {downloaded} / {total_size} 字节")
 
+            except UnsafeModelURLError as e:
+                update_status(f"模型下载地址不安全，已拒绝: {e}")
+                raise RuntimeError(f"模型下载地址不安全，已拒绝: {e}") from e
             except Exception as e:
                 logger.warning("模型下载第 %d/%d 次失败: %s", attempt, max_retries, e)
                 if attempt < max_retries:
@@ -576,6 +768,9 @@ class Translator:
                 else:
                     update_status(f"模型下载失败（已重试 {max_retries} 次）: {e}")
                     raise RuntimeError(f"模型下载失败（已重试 {max_retries} 次）: {e}") from e
+            finally:
+                if response is not None:
+                    response.close()
 
     def _load_model(self):
         """加载 llama-cpp-python 模型，支持根据配置启用显卡加速并在异常时自动回退 CPU"""
@@ -591,7 +786,20 @@ class Translator:
         from llama_cpp import Llama, llama_supports_gpu_offload
 
         preference = _read_acceleration_preference()
+        configured_threads = _read_cpu_threads()
+        n_threads = _resolve_n_threads(configured_threads)
         self._configured_device = preference
+        self._configured_threads = configured_threads
+        self._actual_threads = n_threads
+
+        def load_llama(n_gpu_layers: int):
+            return Llama(
+                model_path=MODEL_PATH,
+                n_ctx=MODEL_N_CTX,
+                n_gpu_layers=n_gpu_layers,
+                n_threads=n_threads,
+                verbose=False,
+            )
 
         can_gpu = False
         try:
@@ -600,20 +808,16 @@ class Translator:
             can_gpu = False
 
         logger.info(
-            "加载翻译模型: 配置偏好=%s, 环境支持GPU卸载=%s",
+            "加载翻译模型: 配置偏好=%s, 线程数=%d(配置=%d), 环境支持GPU卸载=%s",
             preference,
+            n_threads,
+            configured_threads,
             can_gpu,
         )
 
         if preference == "cpu":
             logger.info("用户配置使用 CPU 推理")
-            self._model = Llama(
-                model_path=MODEL_PATH,
-                n_ctx=MODEL_N_CTX,
-                n_gpu_layers=0,
-                n_threads=os.cpu_count(),
-                verbose=False,
-            )
+            self._model = load_llama(0)
             self._actual_device = "cpu"
             self._gpu_layers = 0
             self._status_message = "翻译引擎就绪 (CPU)"
@@ -624,13 +828,7 @@ class Translator:
                 logger.warning("用户配置为 GPU 模式，但当前 llama-cpp 运行库未启用 GPU 支持，降级使用 CPU")
             else:
                 logger.info("当前环境未检测到 GPU 卸载支持，使用 CPU 推理")
-            self._model = Llama(
-                model_path=MODEL_PATH,
-                n_ctx=MODEL_N_CTX,
-                n_gpu_layers=0,
-                n_threads=os.cpu_count(),
-                verbose=False,
-            )
+            self._model = load_llama(0)
             self._actual_device = "cpu"
             self._gpu_layers = 0
             self._status_message = "翻译引擎就绪 (CPU)"
@@ -639,26 +837,14 @@ class Translator:
         # 尝试使用 GPU 加载
         try:
             logger.info("尝试启用显卡 (GPU) 加速加载模型 (n_gpu_layers=-1)...")
-            self._model = Llama(
-                model_path=MODEL_PATH,
-                n_ctx=MODEL_N_CTX,
-                n_gpu_layers=-1,
-                n_threads=os.cpu_count(),
-                verbose=False,
-            )
+            self._model = load_llama(-1)
             self._actual_device = "gpu"
             self._gpu_layers = -1
             self._status_message = "翻译引擎就绪 (GPU 加速)"
             logger.info("模型成功加载至 GPU")
         except Exception as gpu_err:
             logger.warning("显卡 (GPU) 加载失败 (%s)，安全降级至纯 CPU 模式...", gpu_err)
-            self._model = Llama(
-                model_path=MODEL_PATH,
-                n_ctx=MODEL_N_CTX,
-                n_gpu_layers=0,
-                n_threads=os.cpu_count(),
-                verbose=False,
-            )
+            self._model = load_llama(0)
             self._actual_device = "cpu"
             self._gpu_layers = 0
             self._status_message = "翻译引擎就绪 (CPU 降级)"
@@ -686,11 +872,12 @@ class Translator:
             min(OUTPUT_MAX_TOKENS, MODEL_N_CTX - prompt_tokens - SAFETY_MARGIN_TOKENS),
         )
 
-        response = self._model.create_chat_completion(
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=max_tokens,
-            **GENERATION_CONFIG,
-        )
+        with self._infer_lock:
+            response = self._model.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                **GENERATION_CONFIG,
+            )
         if (
             response
             and "choices" in response
@@ -797,28 +984,28 @@ class Translator:
                 target_code = "en" if self._is_chinese(text) else "zh"
 
             chunks, split = _split_long_text(text)
-            for index, chunk in enumerate(chunks):
-                if split and index > 0:
-                    yield "\n"
-                prompt = build_translation_prompt(target_code, chunk)
-                prompt_tokens = estimate_tokens(prompt)
-                max_tokens = max(
-                    64,
-                    min(OUTPUT_MAX_TOKENS, MODEL_N_CTX - prompt_tokens - SAFETY_MARGIN_TOKENS),
-                )
-                response_stream = self._model.create_chat_completion(
-                    messages=[{"role": "user", "content": prompt}],
-                    stream=True,
-                    max_tokens=max_tokens,
-                    **GENERATION_CONFIG,
-                )
-
-            for chunk in response_stream:
-                if "choices" in chunk and len(chunk["choices"]) > 0:
-                    delta = chunk["choices"][0].get("delta", {})
-                    content = delta.get("content")
-                    if content:
-                        yield content
+            with self._infer_lock:
+                for index, chunk in enumerate(chunks):
+                    if split and index > 0:
+                        yield "\n"
+                    prompt = build_translation_prompt(target_code, chunk)
+                    prompt_tokens = estimate_tokens(prompt)
+                    max_tokens = max(
+                        64,
+                        min(OUTPUT_MAX_TOKENS, MODEL_N_CTX - prompt_tokens - SAFETY_MARGIN_TOKENS),
+                    )
+                    response_stream = self._model.create_chat_completion(
+                        messages=[{"role": "user", "content": prompt}],
+                        stream=True,
+                        max_tokens=max_tokens,
+                        **GENERATION_CONFIG,
+                    )
+                    for part in response_stream:
+                        if "choices" in part and len(part["choices"]) > 0:
+                            delta = part["choices"][0].get("delta", {})
+                            content = delta.get("content")
+                            if content:
+                                yield content
 
         except Exception as e:
             logger.exception(f"流式翻译失败: {text[:30]}...")

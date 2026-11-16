@@ -35,9 +35,12 @@ export namespace config {
 	    server_port: number;
 	    theme: string;
 	    acceleration_device: string;
+	    cpu_threads: number;
 	    ui_idle_minutes: number;
 	    ai_idle_minutes: number;
 	    launch_at_login: boolean;
+	    model_download_source: string;
+	    model_download_base_url: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new Config(source);
@@ -54,9 +57,12 @@ export namespace config {
 	        this.server_port = source["server_port"];
 	        this.theme = source["theme"];
 	        this.acceleration_device = source["acceleration_device"];
+	        this.cpu_threads = source["cpu_threads"];
 	        this.ui_idle_minutes = source["ui_idle_minutes"];
 	        this.ai_idle_minutes = source["ai_idle_minutes"];
 	        this.launch_at_login = source["launch_at_login"];
+	        this.model_download_source = source["model_download_source"];
+	        this.model_download_base_url = source["model_download_base_url"];
 	    }
 	}
 
@@ -69,6 +75,7 @@ export namespace uidaemon {
 	    result: string;
 	    error: string;
 	    loading: boolean;
+	    elapsed_ms?: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new ResultPayload(source);
@@ -80,6 +87,7 @@ export namespace uidaemon {
 	        this.result = source["result"];
 	        this.error = source["error"];
 	        this.loading = source["loading"];
+	        this.elapsed_ms = source["elapsed_ms"];
 	    }
 	}
 	export class Status {
@@ -107,11 +115,26 @@ export namespace uidaemon {
 
 export namespace wailsui {
 	
+	export class OCRResult {
+	    text: string;
+	    elapsed_ms: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new OCRResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.text = source["text"];
+	        this.elapsed_ms = source["elapsed_ms"];
+	    }
+	}
 	export class ResultView {
 	    source: string;
 	    result: string;
 	    error: string;
 	    loading: boolean;
+	    elapsed_ms?: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new ResultView(source);
@@ -123,11 +146,13 @@ export namespace wailsui {
 	        this.result = source["result"];
 	        this.error = source["error"];
 	        this.loading = source["loading"];
+	        this.elapsed_ms = source["elapsed_ms"];
 	    }
 	}
 	export class TranslateResult {
 	    source: string;
 	    result: string;
+	    elapsed_ms: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new TranslateResult(source);
@@ -137,6 +162,7 @@ export namespace wailsui {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.source = source["source"];
 	        this.result = source["result"];
+	        this.elapsed_ms = source["elapsed_ms"];
 	    }
 	}
 	export class UIState {

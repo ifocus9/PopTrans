@@ -62,10 +62,13 @@ New-Item -ItemType Directory -Path $tempStaging -Force | Out-Null
 
 try {
     Write-Host "[INFO] Staging files for packaging..." -ForegroundColor Cyan
-    if ($IncludeModel) {
-        robocopy $distPath $tempStaging /E /XF *.log settings.json capture_selection.py translate-wails.exe /XD __pycache__ > $null
-    } else {
-        robocopy $distPath $tempStaging /E /XF *.gguf *.part *.log settings.json capture_selection.py translate-wails.exe /XD __pycache__ > $null
+    $excludedFiles = @("*.log", "*~", "settings.json", "capture_selection.py", "translate-wails.exe", "translate-ui-endpoint.json")
+    if (-not $IncludeModel) {
+        $excludedFiles = @("*.gguf", "*.part") + $excludedFiles
+    }
+    robocopy $distPath $tempStaging /E /XF @excludedFiles /XD __pycache__ > $null
+    if ($LASTEXITCODE -ge 8) {
+        throw "robocopy staging failed with exit code $LASTEXITCODE"
     }
 
     # Ensure empty models directory structure is preserved if models dir existed
@@ -104,3 +107,7 @@ if (Test-Path $zipPath) {
     Write-Host "[ERROR] Output zip file was not created!" -ForegroundColor Red
     exit 1
 }
+
+# robocopy exits 1..7 on successful copies; explicitly exit 0 after verification
+# so callers/CI do not treat a completed archive as a build failure.
+exit 0

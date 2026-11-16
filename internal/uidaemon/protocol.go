@@ -17,8 +17,9 @@ const (
 	EndpointShowResult    = "/show/result"
 	EndpointHide          = "/hide"
 	EndpointShutdown      = "/shutdown"
-	EndpointNotifyHidden  = "/notify/hidden"
-	EndpointNotifyConfig  = "/notify/config-saved"
+	EndpointNotifyHidden     = "/notify/hidden"
+	EndpointNotifyConfig     = "/notify/config-saved"
+	EndpointNotifyHotkeyHold = "/notify/hotkey-hold"
 
 	headerToken = "X-PopTrans-Token"
 )
@@ -42,15 +43,22 @@ type Status struct {
 
 // ResultPayload is pushed by the host to update the result window.
 type ResultPayload struct {
-	Source  string `json:"source"`
-	Result  string `json:"result"`
-	Error   string `json:"error"`
-	Loading bool   `json:"loading"`
+	Source    string `json:"source"`
+	Result    string `json:"result"`
+	Error     string `json:"error"`
+	Loading   bool   `json:"loading"`
+	ElapsedMS int64  `json:"elapsed_ms,omitempty"`
 }
 
 // ConfigSavedPayload is sent from UI to host after settings are saved.
 type ConfigSavedPayload struct {
 	OK bool `json:"ok"`
+}
+
+// HotkeyHoldPayload temporarily suspends global hotkeys while the settings UI
+// is recording a new key combination.
+type HotkeyHoldPayload struct {
+	Paused bool `json:"paused"`
 }
 
 func EndpointPath(baseDir string) string {

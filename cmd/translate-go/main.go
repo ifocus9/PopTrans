@@ -23,6 +23,19 @@ func main() {
 		logHint = "\n\n详见 translate.log"
 	}
 
+	alreadyRunning, mutexErr := win.AcquireSingleInstance(`Local\PopTrans.Host`)
+	if mutexErr != nil {
+		log.Printf("single instance check failed: %v", mutexErr)
+	}
+	if alreadyRunning {
+		log.Printf("another PopTrans host is already running, exiting")
+		if !hasArg(os.Args, "--autostart") {
+			win.MessageBox(0, "PopTrans 已在运行，请从任务栏托盘打开。", "PopTrans")
+		}
+		return
+	}
+	defer win.ReleaseSingleInstance()
+
 	desktopApp, err := app.New()
 	if err != nil {
 		win.MessageBox(0, "创建 Go 前端失败:\n\n"+err.Error()+logHint, "选中翻译")
@@ -65,4 +78,13 @@ func removeLegacyLogs(baseDir string) {
 	} {
 		_ = os.Remove(filepath.Join(baseDir, name))
 	}
+}
+
+func hasArg(args []string, name string) bool {
+	for _, arg := range args {
+		if arg == name {
+			return true
+		}
+	}
+	return false
 }

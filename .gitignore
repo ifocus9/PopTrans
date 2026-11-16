@@ -65,6 +65,8 @@ dist-go/
 build-ai/
 dist-ai/
 .icon-probe/
+.wheelhouse/
+wheelhouse/
 frontend/node_modules/
 translate-go.exe
 PopTrans.exe

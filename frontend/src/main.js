@@ -6,14 +6,23 @@ import {
   Check,
   CheckCheck,
   Clipboard,
+  Clock,
+  Cloud,
   Cpu,
+  Download,
   FileText,
+  Globe,
+  ImageUp,
   Keyboard,
   Languages,
+  Link,
+  Maximize2,
+  Minimize2,
   Monitor,
   MonitorUp,
   Moon,
   Network,
+  Power,
   RotateCcw,
   Sliders,
   Sparkles,
@@ -21,22 +30,25 @@ import {
   Trash2,
   X,
   Zap,
-  Power,
 } from "lucide"
 import {
   HideWindow,
+  OCRImage,
   SaveConfig,
+  SetHotkeyRecording,
   State,
   Translate,
 } from "../wailsjs/go/wailsui/App"
 import {
   EventsOn,
   WindowCenter,
+  WindowIsMaximised,
   WindowSetDarkTheme,
   WindowSetLightTheme,
   WindowSetSize,
   WindowSetSystemDefaultTheme,
   WindowShow,
+  WindowToggleMaximise,
 } from "../wailsjs/runtime/runtime"
 
 const app = document.querySelector("#app")
@@ -47,14 +59,23 @@ const icons = {
   Check,
   CheckCheck,
   Clipboard,
+  Clock,
+  Cloud,
   Cpu,
+  Download,
   FileText,
+  Globe,
+  ImageUp,
   Keyboard,
   Languages,
+  Link,
+  Maximize2,
+  Minimize2,
   Monitor,
   MonitorUp,
   Moon,
   Network,
+  Power,
   RotateCcw,
   Sliders,
   Sparkles,
@@ -62,7 +83,6 @@ const icons = {
   Trash2,
   X,
   Zap,
-  Power,
 }
 const systemTheme = window.matchMedia("(prefers-color-scheme: dark)")
 let healthTimer
@@ -86,6 +106,20 @@ let mainWindowSized = false
 let startupDismissed = false
 let resultShowTimestamp = 0
 
+const MAX_OCR_IMAGE_BYTES = 10 * 1024 * 1024
+
+function emptyManualTranslateState() {
+  return {
+    sourceText: "",
+    translatedText: "",
+    isLoading: false,
+    ocrLoading: false,
+    error: "",
+    elapsedText: "",
+    notice: "",
+  }
+}
+
 let state = {
   mode: "translate", // "translate" | "settings" | "result"
   active_tab: "translate", // "translate" | "settings"
@@ -104,16 +138,15 @@ let state = {
     server_port: 8989,
     theme: "system",
     acceleration_device: "auto",
+    cpu_threads: 0,
+    ui_idle_minutes: 5,
     ai_idle_minutes: 15,
     launch_at_login: false,
+    model_download_source: "modelscope",
+    model_download_base_url: "",
   },
   health: {},
-  manualTranslate: {
-    sourceText: "",
-    translatedText: "",
-    isLoading: false,
-    error: "",
-  },
+  manualTranslate: emptyManualTranslateState(),
 }
 
 function bindStateEvents() {
@@ -140,11 +173,11 @@ function bindStateEvents() {
       mode: nextMode,
       settings_open: Boolean(next.settings_open),
       startup_loading: Boolean(next.startup_loading),
-      startup_status: next.startup_status || state.startup_status,
+      startup_status: next.startup_status ?? "",
       startup_error: next.startup_error || "",
     }
 
-    if (nextMode === "settings" || nextMode === "translate") {
+    if (nextMode !== prevMode && (nextMode === "settings" || nextMode === "translate")) {
       state.active_tab = nextMode
     }
 
@@ -159,12 +192,7 @@ function bindStateEvents() {
 
     if (!windowShown || prevMode !== state.mode) {
       if (!windowShown) {
-        state.manualTranslate = {
-          sourceText: "",
-          translatedText: "",
-          isLoading: false,
-          error: "",
-        }
+        state.manualTranslate = emptyManualTranslateState()
       }
       windowShown = false
       lastResultHeight = 0
@@ -177,10 +205,7 @@ function bindStateEvents() {
       return
     }
 
-    if (
-      prevStartupLoading !== state.startup_loading ||
-      prevStartupStatus !== state.startup_status
-    ) {
+    if (prevStartupLoading !== state.startup_loading) {
       render({ forceShow: false })
       return
     }
@@ -193,17 +218,12 @@ function bindStateEvents() {
       return
     }
 
-    // Main window (translate/settings) can refresh engine badge without full rerender
-    const node = document.querySelector("#engineState")
-    const textNode = document.querySelector("#engineText")
-    if (!node || !textNode) {
+    // Main window (translate/settings) updates status badge & banner in place without wiping inputs
+    if (!document.querySelector("#engineState")) {
       render({ forceShow: false })
       return
     }
-    const ready = Boolean(state.health?.translator_ready)
-    node.classList.toggle("is-ready", ready)
-    node.classList.toggle("is-loading", !ready)
-    textNode.textContent = ready ? "引擎就绪" : "正在启动"
+    updateEngineIndicators()
   })
 }
 
@@ -330,6 +350,10 @@ function renderResult() {
   const isRecognizing = isLoading && !hasSource
   const hasError = !isLoading && Boolean(result.error)
   const copyText = hasError ? result.error : result.result
+  const elapsedLabel =
+    !isLoading && !hasError && Number(result.elapsed_ms) > 0
+      ? formatDuration(Number(result.elapsed_ms))
+      : ""
   resultSignature = JSON.stringify(result)
 
   if (!document.querySelector(".result-shell")) {
@@ -341,6 +365,7 @@ function renderResult() {
           <h1 id="resultTitle">选中翻译</h1>
         </div>
         <div class="result-header-actions">
+          <span id="resultElapsed" class="elapsed-badge hidden" aria-live="polite"></span>
           <span id="copyStatus" class="result-copy-status" aria-live="polite"></span>
           <button class="icon-button result-copy-button" id="copyBtn" type="button" title="复制译文" aria-label="复制译文">
             <i data-lucide="clipboard"></i>
@@ -366,7 +391,13 @@ function renderResult() {
   const title = document.querySelector("#resultTitle")
   const content = document.querySelector("#resultContent")
   const copyBtn = document.querySelector("#copyBtn")
+  const resultElapsed = document.querySelector("#resultElapsed")
   if (!shell || !title || !content || !copyBtn) return
+
+  if (resultElapsed) {
+    resultElapsed.textContent = elapsedLabel ? `耗时 ${elapsedLabel}` : ""
+    resultElapsed.classList.toggle("hidden", !elapsedLabel)
+  }
 
   shell.classList.toggle("is-error", hasError)
   title.textContent = isRecognizing
@@ -435,10 +466,90 @@ function renderResult() {
   requestAnimationFrame(fitResultWindow)
 }
 
+function isFailureStatusText(text) {
+  if (!text || text.includes("正在重试") || text.includes("断点续传")) {
+    return false
+  }
+  const lower = text.toLowerCase()
+  return (
+    text.includes("失败") ||
+    text.includes("拒绝") ||
+    text.includes("未找到") ||
+    text.includes("超时") ||
+    lower.includes("error") ||
+    lower.includes("failed")
+  )
+}
+
+function engineStatusInfo() {
+  const ready = Boolean(state.health?.translator_ready)
+  if (ready) {
+    return {
+      ready: true,
+      isError: false,
+      badgeClass: "is-ready",
+      badgeText: "引擎就绪",
+      bannerText: "",
+    }
+  }
+
+  const healthStatus = (state.health?.translator_status || "").trim()
+  const errText = (state.startup_error || "").trim()
+  const statusText = (
+    healthStatus ||
+    state.startup_status ||
+    "正在后台准备翻译模型..."
+  ).trim()
+
+  if (errText || isFailureStatusText(healthStatus)) {
+    return {
+      ready: false,
+      isError: true,
+      badgeClass: "is-error",
+      badgeText: "启动异常",
+      bannerText: errText || healthStatus,
+    }
+  }
+
+  return {
+    ready: false,
+    isError: false,
+    badgeClass: "is-loading",
+    badgeText: "正在启动",
+    bannerText: statusText || "正在后台下载或加载翻译模型...",
+  }
+}
+
+function updateEngineIndicators() {
+  const info = engineStatusInfo()
+  const node = document.querySelector("#engineState")
+  const textNode = document.querySelector("#engineText")
+  if (node && textNode) {
+    node.classList.toggle("is-ready", info.ready)
+    node.classList.toggle("is-loading", !info.ready && !info.isError)
+    node.classList.toggle("is-error", !info.ready && info.isError)
+    textNode.textContent = info.badgeText
+  }
+
+  const banner = document.querySelector("#engineBanner")
+  const bannerText = document.querySelector("#engineBannerText")
+  const bannerAction = document.querySelector("#engineBannerActionBtn")
+  if (banner && bannerText) {
+    banner.classList.toggle("hidden", info.ready)
+    banner.classList.toggle("is-loading", !info.ready && !info.isError)
+    banner.classList.toggle("is-error", !info.ready && info.isError)
+    bannerText.textContent = info.bannerText
+    if (bannerAction) {
+      bannerAction.textContent = info.isError ? "切换下载源" : "下载源"
+      bannerAction.classList.toggle("hidden", state.active_tab !== "translate")
+    }
+  }
+}
+
 function renderMainWindow() {
   const isTranslateTab = state.active_tab === "translate"
   const isSettingsTab = state.active_tab === "settings"
-  const isReady = Boolean(state.health?.translator_ready)
+  const info = engineStatusInfo()
   const titleText = isTranslateTab ? "文本翻译" : "设置"
 
   app.innerHTML = `
@@ -464,9 +575,9 @@ function renderMainWindow() {
         <div class="header-copy">
           <h1 id="mainTitle">${titleText}</h1>
         </div>
-        <div class="engine-state ${isReady ? "is-ready" : "is-loading"}" id="engineState" title="AI 引擎状态">
+        <div class="engine-state ${info.badgeClass}" id="engineState" title="AI 引擎状态">
           <span class="state-dot"></span>
-          <span id="engineText">${isReady ? "引擎就绪" : "正在启动"}</span>
+          <span id="engineText">${info.badgeText}</span>
         </div>
         <div class="main-header-actions">
           ${
@@ -484,11 +595,26 @@ function renderMainWindow() {
           `
               : ""
           }
+          <button
+            class="icon-button header-tool-button"
+            id="mainMaxBtn"
+            type="button"
+            title="最大化 / 还原"
+            aria-label="最大化 / 还原"
+          >
+            <i data-lucide="maximize-2"></i>
+          </button>
           <button class="icon-button close-button" id="mainCloseBtn" type="button" title="关闭窗口" aria-label="关闭窗口">
             <i data-lucide="x"></i>
           </button>
         </div>
       </header>
+
+      <div class="engine-banner ${info.ready ? "hidden" : info.isError ? "is-error" : "is-loading"}" id="engineBanner" role="status">
+        <span class="engine-banner-dot"></span>
+        <span class="engine-banner-text" id="engineBannerText">${escapeHtml(info.bannerText)}</span>
+        <button class="engine-banner-action ${isTranslateTab ? "" : "hidden"}" id="engineBannerActionBtn" type="button">${info.isError ? "切换下载源" : "下载源"}</button>
+      </div>
 
       <div class="main-body">
         ${isTranslateTab ? renderTranslateViewHTML() : renderSettingsViewHTML()}
@@ -507,6 +633,35 @@ function renderMainWindow() {
     render()
   })
   document
+    .querySelector("#engineBannerActionBtn")
+    ?.addEventListener("click", () => {
+      state.active_tab = "settings"
+      render()
+      requestAnimationFrame(() => {
+        document
+          .querySelector("#modelDownloadSection")
+          ?.scrollIntoView({ behavior: "smooth", block: "start" })
+      })
+    })
+  const maxBtn = document.querySelector("#mainMaxBtn")
+  const syncMaxIcon = async () => {
+    if (!maxBtn || !window.runtime?.WindowIsMaximised) return
+    try {
+      const maximised = await WindowIsMaximised()
+      maxBtn.innerHTML = `<i data-lucide="${maximised ? "minimize-2" : "maximize-2"}"></i>`
+      maxBtn.title = maximised ? "还原窗口" : "最大化"
+      createIcons({ icons, attrs: { "stroke-width": 1.8 } })
+    } catch {
+      // ignore
+    }
+  }
+  maxBtn?.addEventListener("click", () => {
+    if (!window.runtime?.WindowToggleMaximise) return
+    WindowToggleMaximise()
+    setTimeout(syncMaxIcon, 80)
+  })
+  syncMaxIcon()
+  document
     .querySelector("#mainCloseBtn")
     ?.addEventListener("click", closeWindow)
 
@@ -517,25 +672,44 @@ function renderMainWindow() {
     bindSettingsViewEvents()
   }
 
-  healthTimer = setInterval(refreshHealth, 2500)
+  if (healthTimer) clearInterval(healthTimer)
+  healthTimer = setInterval(refreshHealth, 1200)
 }
 
 function renderTranslateViewHTML() {
   const source = state.manualTranslate.sourceText || ""
   const hasText = Boolean(source.trim())
   const charCount = source.length
-  const isLoading = state.manualTranslate.isLoading
+  const isBusy =
+    state.manualTranslate.isLoading || state.manualTranslate.ocrLoading
+  const elapsedText = state.manualTranslate.elapsedText || ""
 
   return `
     <div class="translate-workbench">
-      <section class="workbench-card source-card" aria-labelledby="sourceHeading">
+      <section class="workbench-card source-card" id="sourceCard" aria-labelledby="sourceHeading">
         <div class="card-toolbar">
           <div class="card-title" id="sourceHeading">
             <i data-lucide="sparkles"></i>
-            <span>原文 <span class="card-subtitle">(中英自动识别)</span></span>
+            <span>原文 <span class="card-subtitle">(支持中英文本及图片 OCR)</span></span>
           </div>
           <div class="card-actions">
-            <button class="card-action-btn" id="clearBtn" type="button" title="清空内容" ${hasText ? "" : "disabled"}>
+            <button
+              class="card-action-btn"
+              id="importImageBtn"
+              type="button"
+              title="导入图片并识别文字（支持粘贴 / 拖拽图片）"
+              ${isBusy ? "disabled" : ""}
+            >
+              <i data-lucide="image-up"></i>
+              <span>图片 OCR</span>
+            </button>
+            <input
+              id="imageFileInput"
+              type="file"
+              accept="image/png,image/jpeg,image/webp,image/bmp,image/gif,image/*"
+              class="hidden"
+            />
+            <button class="card-action-btn" id="clearBtn" type="button" title="清空内容" ${hasText && !isBusy ? "" : "disabled"}>
               <i data-lucide="trash-2"></i>
               <span>清空</span>
             </button>
@@ -546,24 +720,30 @@ function renderTranslateViewHTML() {
           <textarea
             id="sourceInput"
             class="source-textarea"
-            placeholder="输入需要翻译的文本，按 Ctrl + Enter 快速翻译..."
+            placeholder="输入需要翻译的文本，或直接粘贴 (Ctrl+V) / 拖拽图片到此处识别..."
             spellcheck="false"
           >${escapeHtml(source)}</textarea>
+          <div class="source-drop-overlay" aria-hidden="true">
+            <i data-lucide="image-up"></i>
+            <span>松开即可识别图片文字并翻译</span>
+          </div>
         </div>
         <div class="source-bottom-bar">
           <div class="shortcut-hint">
-            <span class="kbd-badge">Ctrl</span> + <span class="kbd-badge">Enter</span> 快速翻译
+            <span class="kbd-badge">Ctrl</span> + <span class="kbd-badge">Enter</span> 翻译 · 可粘贴/拖拽图片
           </div>
           <button
             id="doTranslateBtn"
             class="primary-button translate-submit-button"
             type="button"
-            ${isLoading || !hasText ? "disabled" : ""}
+            ${isBusy || !hasText ? "disabled" : ""}
           >
             ${
-              isLoading
+              state.manualTranslate.isLoading
                 ? '<span class="loading-spinner"></span><span>翻译中...</span>'
-                : '<i data-lucide="arrow-right-left"></i><span>立即翻译</span>'
+                : state.manualTranslate.ocrLoading
+                  ? '<span class="loading-spinner"></span><span>识别中...</span>'
+                  : '<i data-lucide="arrow-right-left"></i><span>立即翻译</span>'
             }
           </button>
         </div>
@@ -584,6 +764,10 @@ function renderTranslateViewHTML() {
             <span>译文</span>
           </div>
           <div class="card-actions">
+            <span id="manualElapsed" class="elapsed-badge ${elapsedText ? "" : "hidden"}" aria-live="polite">
+              <i data-lucide="clock"></i>
+              <span>${escapeHtml(elapsedText)}</span>
+            </span>
             <span id="manualCopyStatus" class="result-copy-status" aria-live="polite"></span>
             <button
               class="icon-button result-copy-button"
@@ -604,7 +788,17 @@ function renderTranslateViewHTML() {
 }
 
 function renderResultBoxContent() {
-  const { isLoading, error, translatedText } = state.manualTranslate
+  const { isLoading, ocrLoading, error, translatedText, notice } =
+    state.manualTranslate
+
+  if (ocrLoading) {
+    return `
+      <div class="translation-loading manual-loading" role="status" aria-live="polite">
+        <span class="loading-spinner" aria-hidden="true"></span>
+        <span>正在识别图片中的文字...</span>
+      </div>
+    `
+  }
 
   if (isLoading) {
     return `
@@ -618,12 +812,16 @@ function renderResultBoxContent() {
   if (error) {
     return `
       <div class="error-panel" role="alert">
-        <span class="section-label">翻译失败</span>
+        <span class="section-label">处理失败</span>
         <div class="result-text error-text">${escapeHtml(error.trim())}</div>
-        <button class="retry-button" id="manualRetryBtn" type="button">
-          <i data-lucide="rotate-ccw"></i>
-          <span>重试</span>
-        </button>
+        ${
+          state.manualTranslate.sourceText.trim()
+            ? `<button class="retry-button" id="manualRetryBtn" type="button">
+                <i data-lucide="rotate-ccw"></i>
+                <span>重试</span>
+              </button>`
+            : ""
+        }
       </div>
     `
   }
@@ -632,31 +830,47 @@ function renderResultBoxContent() {
     return `<div class="result-text translated-text manual-translated-text" tabindex="0">${escapeHtml(translatedText.trim())}</div>`
   }
 
+  if (notice) {
+    return `
+      <div class="manual-placeholder manual-notice">
+        <div class="placeholder-icon"><i data-lucide="image-up"></i></div>
+        <p>${escapeHtml(notice)}</p>
+      </div>
+    `
+  }
+
   return `
     <div class="manual-placeholder">
       <div class="placeholder-icon"><i data-lucide="languages"></i></div>
-      <p>在上方输入文本并点击“立即翻译”或按 <span class="kbd-badge">Ctrl + Enter</span></p>
+      <p>输入文本后按 <span class="kbd-badge">Ctrl + Enter</span>，或粘贴/拖拽/导入图片进行 OCR 翻译</p>
     </div>
   `
 }
 
 function bindTranslateViewEvents() {
+  const sourceCard = document.querySelector("#sourceCard")
   const textarea = document.querySelector("#sourceInput")
   const charCount = document.querySelector("#charCount")
   const clearBtn = document.querySelector("#clearBtn")
+  const importImageBtn = document.querySelector("#importImageBtn")
+  const imageFileInput = document.querySelector("#imageFileInput")
   const translateBtn = document.querySelector("#doTranslateBtn")
   const copyBtn = document.querySelector("#manualCopyBtn")
 
+  const syncInputUI = () => {
+    const value = textarea?.value || ""
+    state.manualTranslate.sourceText = value
+    const hasText = Boolean(value.trim())
+    const isBusy =
+      state.manualTranslate.isLoading || state.manualTranslate.ocrLoading
+    if (charCount) charCount.textContent = `${value.length} 字符`
+    if (clearBtn) clearBtn.disabled = !hasText || isBusy
+    if (translateBtn) translateBtn.disabled = !hasText || isBusy
+    if (importImageBtn) importImageBtn.disabled = isBusy
+  }
+
   if (textarea) {
-    textarea.addEventListener("input", () => {
-      state.manualTranslate.sourceText = textarea.value
-      const len = textarea.value.length
-      const hasText = Boolean(textarea.value.trim())
-      if (charCount) charCount.textContent = `${len} 字符`
-      if (clearBtn) clearBtn.disabled = !hasText
-      if (translateBtn)
-        translateBtn.disabled = !hasText || state.manualTranslate.isLoading
-    })
+    textarea.addEventListener("input", syncInputUI)
 
     textarea.addEventListener("keydown", (event) => {
       if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
@@ -666,19 +880,83 @@ function bindTranslateViewEvents() {
     })
   }
 
-  translateBtn?.addEventListener("click", handleManualTranslate)
+  const handlePaste = (event) => {
+    const items = Array.from(event.clipboardData?.items || [])
+    const imageItem = items.find(
+      (item) => item.kind === "file" && item.type?.startsWith("image/"),
+    )
+    const file =
+      imageItem?.getAsFile() ||
+      Array.from(event.clipboardData?.files || []).find(isSupportedImageFile)
+    if (!file) return
+    event.preventDefault()
+    handleImageOCRFile(file)
+  }
+
+  sourceCard?.addEventListener("paste", handlePaste)
+
+  if (sourceCard) {
+    let dragDepth = 0
+    sourceCard.addEventListener("dragenter", (event) => {
+      if (!hasDraggedFiles(event.dataTransfer)) return
+      event.preventDefault()
+      dragDepth += 1
+      sourceCard.classList.add("is-drag-over")
+    })
+    sourceCard.addEventListener("dragover", (event) => {
+      if (!hasDraggedFiles(event.dataTransfer)) return
+      event.preventDefault()
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "copy"
+    })
+    sourceCard.addEventListener("dragleave", (event) => {
+      if (!hasDraggedFiles(event.dataTransfer)) return
+      dragDepth = Math.max(0, dragDepth - 1)
+      if (dragDepth === 0 || !sourceCard.contains(event.relatedTarget)) {
+        dragDepth = 0
+        sourceCard.classList.remove("is-drag-over")
+      }
+    })
+    sourceCard.addEventListener("drop", (event) => {
+      event.preventDefault()
+      dragDepth = 0
+      sourceCard.classList.remove("is-drag-over")
+      const files = Array.from(event.dataTransfer?.files || [])
+      if (!files.length) return
+      const imageFile = files.find(isSupportedImageFile)
+      if (!imageFile) {
+        state.manualTranslate.error =
+          "请拖入 PNG、JPG、WebP、BMP 或 GIF 格式的图片文件"
+        updateManualResultBox()
+        return
+      }
+      handleImageOCRFile(imageFile)
+    })
+  }
+
+  importImageBtn?.addEventListener("click", () => {
+    if (!imageFileInput || state.manualTranslate.ocrLoading || state.manualTranslate.isLoading)
+      return
+    imageFileInput.value = ""
+    imageFileInput.click()
+  })
+
+  imageFileInput?.addEventListener("change", () => {
+    const file = imageFileInput.files?.[0]
+    if (file) {
+      handleImageOCRFile(file)
+    }
+    imageFileInput.value = ""
+  })
+
+  translateBtn?.addEventListener("click", () => handleManualTranslate())
 
   clearBtn?.addEventListener("click", () => {
     if (textarea) {
       textarea.value = ""
       textarea.focus()
     }
-    state.manualTranslate.sourceText = ""
-    state.manualTranslate.translatedText = ""
-    state.manualTranslate.error = ""
-    if (charCount) charCount.textContent = "0 字符"
-    if (clearBtn) clearBtn.disabled = true
-    if (translateBtn) translateBtn.disabled = true
+    state.manualTranslate = emptyManualTranslateState()
+    syncInputUI()
     updateManualResultBox()
   })
 
@@ -692,47 +970,177 @@ function bindTranslateViewEvents() {
 
   document
     .querySelector("#manualRetryBtn")
-    ?.addEventListener("click", handleManualTranslate)
+    ?.addEventListener("click", () => handleManualTranslate())
 }
 
-async function handleManualTranslate() {
+function hasDraggedFiles(dataTransfer) {
+  if (!dataTransfer) return false
+  if (dataTransfer.files?.length) return true
+  return Array.from(dataTransfer.types || []).includes("Files")
+}
+
+function isSupportedImageFile(file) {
+  if (!file) return false
+  if (file.type && file.type.startsWith("image/")) return true
+  return /\.(png|jpe?g|webp|bmp|gif)$/i.test(file.name || "")
+}
+
+async function fileToBase64(file) {
+  const buffer = await file.arrayBuffer()
+  const bytes = new Uint8Array(buffer)
+  const chunkSize = 0x8000
+  let binary = ""
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize))
+  }
+  return btoa(binary)
+}
+
+function formatDuration(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return ""
+  if (ms < 1000) return `${Math.round(ms)} ms`
+  return `${(ms / 1000).toFixed(2)} s`
+}
+
+function syncManualControlStates() {
+  const textarea = document.querySelector("#sourceInput")
+  const charCount = document.querySelector("#charCount")
+  const clearBtn = document.querySelector("#clearBtn")
+  const importImageBtn = document.querySelector("#importImageBtn")
+  const translateBtn = document.querySelector("#doTranslateBtn")
+  const text = state.manualTranslate.sourceText || ""
+  const hasText = Boolean(text.trim())
+  const isBusy =
+    state.manualTranslate.isLoading || state.manualTranslate.ocrLoading
+
+  if (textarea && textarea.value !== text) {
+    textarea.value = text
+  }
+  if (charCount) charCount.textContent = `${text.length} 字符`
+  if (clearBtn) clearBtn.disabled = !hasText || isBusy
+  if (importImageBtn) importImageBtn.disabled = isBusy
+  if (translateBtn) {
+    translateBtn.disabled = !hasText || isBusy
+    translateBtn.innerHTML = state.manualTranslate.isLoading
+      ? '<span class="loading-spinner"></span><span>翻译中...</span>'
+      : state.manualTranslate.ocrLoading
+        ? '<span class="loading-spinner"></span><span>识别中...</span>'
+        : '<i data-lucide="arrow-right-left"></i><span>立即翻译</span>'
+    createIcons({ icons, attrs: { "stroke-width": 1.8 } })
+  }
+}
+
+async function handleImageOCRFile(file) {
+  if (state.manualTranslate.ocrLoading || state.manualTranslate.isLoading) return
+  if (!isSupportedImageFile(file)) {
+    state.manualTranslate.error =
+      "不支持的文件类型，请选择 PNG、JPG、WebP、BMP 或 GIF 图片"
+    updateManualResultBox()
+    return
+  }
+  if (file.size > MAX_OCR_IMAGE_BYTES) {
+    state.manualTranslate.error = "图片大小超过 10MB 限制，请压缩后重试"
+    updateManualResultBox()
+    return
+  }
+
+  state.manualTranslate.ocrLoading = true
+  state.manualTranslate.error = ""
+  state.manualTranslate.notice = ""
+  state.manualTranslate.translatedText = ""
+  state.manualTranslate.elapsedText = ""
+  syncManualControlStates()
+  updateManualResultBox()
+
+  let recognizedText = ""
+  let ocrElapsedMs = 0
+  try {
+    if (window.go?.wailsui?.App?.OCRImage) {
+      const base64 = await fileToBase64(file)
+      const res = await OCRImage(base64)
+      recognizedText = (res?.text || "").trim()
+      ocrElapsedMs = Number(res?.elapsed_ms) || 0
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, 450))
+      recognizedText = `Recognized text from ${file.name || "clipboard image"}`
+      ocrElapsedMs = 450
+    }
+  } catch (error) {
+    state.manualTranslate.ocrLoading = false
+    state.manualTranslate.error = `图片文字识别失败: ${readableError(error)}`
+    syncManualControlStates()
+    updateManualResultBox()
+    return
+  }
+
+  state.manualTranslate.ocrLoading = false
+  if (!recognizedText) {
+    state.manualTranslate.notice = "未从图片中识别到文字，可换张更清晰的截图试试"
+    syncManualControlStates()
+    updateManualResultBox()
+    return
+  }
+
+  state.manualTranslate.sourceText = recognizedText
+  const engineReady =
+    Boolean(state.health?.translator_ready) || !window.go?.wailsui?.App?.Translate
+  if (!engineReady) {
+    const ocrLabel = formatDuration(ocrElapsedMs)
+    state.manualTranslate.elapsedText = ocrLabel ? `OCR ${ocrLabel}` : ""
+    state.manualTranslate.notice =
+      "已识别图片文字并填入原文区，AI 引擎仍在加载中，就绪后点击“立即翻译”即可"
+    syncManualControlStates()
+    updateManualResultBox()
+    return
+  }
+
+  syncManualControlStates()
+  await handleManualTranslate({ ocrElapsedMs })
+}
+
+async function handleManualTranslate({ ocrElapsedMs = null } = {}) {
   const text = (state.manualTranslate.sourceText || "").trim()
-  if (!text || state.manualTranslate.isLoading) return
+  if (!text || state.manualTranslate.isLoading || state.manualTranslate.ocrLoading)
+    return
 
   state.manualTranslate.isLoading = true
   state.manualTranslate.error = ""
+  state.manualTranslate.notice = ""
+  state.manualTranslate.elapsedText = ""
+  syncManualControlStates()
   updateManualResultBox()
 
-  const translateBtn = document.querySelector("#doTranslateBtn")
-  if (translateBtn) {
-    translateBtn.disabled = true
-    translateBtn.innerHTML =
-      '<span class="loading-spinner"></span><span>翻译中...</span>'
-  }
-
+  const startedAt = performance.now()
   try {
     let resultText = ""
+    let elapsedMs = 0
     if (window.go?.wailsui?.App?.Translate) {
       const res = await Translate(text)
       resultText = (res?.result || "").trim()
+      elapsedMs = Number(res?.elapsed_ms) || Math.round(performance.now() - startedAt)
     } else {
       // Mock for Vite local preview
-      await new Promise((resolve) => setTimeout(resolve, 600))
+      await new Promise((resolve) => setTimeout(resolve, 420))
       resultText = `好的设计让工具退居幕后，专注于创造价值。（模拟译文：${text}）`
+      elapsedMs = Math.round(performance.now() - startedAt)
     }
     state.manualTranslate.translatedText = resultText.trim()
+    const trLabel = formatDuration(elapsedMs)
+    const ocrLabel =
+      Number.isFinite(ocrElapsedMs) && ocrElapsedMs > 0
+        ? formatDuration(ocrElapsedMs)
+        : ""
+    if (ocrLabel && trLabel) {
+      state.manualTranslate.elapsedText = `OCR ${ocrLabel} · 翻译 ${trLabel}`
+    } else if (trLabel) {
+      state.manualTranslate.elapsedText = `耗时 ${trLabel}`
+    }
   } catch (error) {
     state.manualTranslate.error = readableError(error)
   } finally {
     state.manualTranslate.isLoading = false
+    syncManualControlStates()
     updateManualResultBox()
-    const btn = document.querySelector("#doTranslateBtn")
-    if (btn) {
-      btn.disabled = !state.manualTranslate.sourceText.trim()
-      btn.innerHTML =
-        '<i data-lucide="arrow-right-left"></i><span>立即翻译</span>'
-      createIcons({ icons, attrs: { "stroke-width": 1.8 } })
-    }
   }
 }
 
@@ -743,7 +1151,15 @@ function updateManualResultBox() {
     createIcons({ icons, attrs: { "stroke-width": 1.8 } })
     document
       .querySelector("#manualRetryBtn")
-      ?.addEventListener("click", handleManualTranslate)
+      ?.addEventListener("click", () => handleManualTranslate())
+  }
+
+  const elapsedBadge = document.querySelector("#manualElapsed")
+  if (elapsedBadge) {
+    const label = state.manualTranslate.elapsedText || ""
+    elapsedBadge.classList.toggle("hidden", !label)
+    const textSpan = elapsedBadge.querySelector("span")
+    if (textSpan) textSpan.textContent = label
   }
 
   const copyBtn = document.querySelector("#manualCopyBtn")
@@ -791,6 +1207,49 @@ function renderSettingsViewHTML() {
           ${deviceOption("cpu", "cpu", "仅使用 CPU")}
         </div>
         ${renderCurrentDeviceBadge()}
+        <div class="port-field source-sub-field">
+          <label class="field-label" for="cpuThreads">线程</label>
+          <input
+            class="number-input"
+            id="cpuThreads"
+            type="number"
+            inputmode="numeric"
+            min="0"
+            max="256"
+            step="1"
+            value="${Number.isInteger(Number(state.config.cpu_threads)) ? Math.max(0, Number(state.config.cpu_threads)) : 0}"
+            aria-describedby="cpuThreadsHelp"
+          />
+          <p class="field-help" id="cpuThreadsHelp">CPU 推理线程数（0 表示自动检测核心数）</p>
+        </div>
+      </section>
+
+      <div class="section-rule"></div>
+
+      <section class="settings-section" id="modelDownloadSection" aria-labelledby="downloadHeading">
+        <div class="section-heading">
+          <div class="section-icon"><i data-lucide="download"></i></div>
+          <div>
+            <h2 id="downloadHeading">模型下载源</h2>
+            <p>首次下载 Hy-MT2 模型时的下载通道</p>
+          </div>
+        </div>
+        <div class="theme-options" role="radiogroup" aria-labelledby="downloadHeading">
+          ${modelSourceOption("modelscope", "globe", "魔搭 ModelScope")}
+          ${modelSourceOption("huggingface", "cloud", "HuggingFace")}
+          ${modelSourceOption("custom", "link", "自定义镜像")}
+        </div>
+        <div class="source-field ${(state.config.model_download_source || "modelscope") === "custom" ? "" : "hidden"}" id="customSourceField">
+          <label class="field-label" for="modelDownloadBaseUrl">镜像根地址或 .gguf 直链</label>
+          <input
+            class="text-input"
+            id="modelDownloadBaseUrl"
+            type="url"
+            placeholder="https://hf-mirror.com 或完整 .gguf 链接"
+            value="${escapeHtml(state.config.model_download_base_url || "")}"
+          />
+          <p class="field-help">支持 HF 镜像根地址或直接指向 .gguf 文件的 URL</p>
+        </div>
       </section>
 
       <div class="section-rule"></div>
@@ -865,15 +1324,47 @@ function renderSettingsViewHTML() {
 
       <div class="section-rule"></div>
 
-      <section class="settings-section" aria-labelledby="aiIdleHeading">
-        <div class="section-heading">
-          <div class="section-icon"><i data-lucide="languages"></i></div>
+      <section class="settings-section" aria-labelledby="uiResidentHeading">
+        <div class="section-heading with-toggle">
+          <div class="section-icon"><i data-lucide="monitor"></i></div>
           <div>
-            <h2 id="aiIdleHeading">AI 空闲回收</h2>
-            <p>空闲一段时间后自动关闭 AI 服务，下次翻译再重新拉起</p>
+            <h2 id="uiResidentHeading">界面常驻内存</h2>
+            <p>关闭窗口后保留托盘与界面进程，再次唤醒零等待</p>
           </div>
+          <label class="switch" title="界面常驻内存">
+            <input
+              id="uiResidentToggle"
+              type="checkbox"
+              data-last-minutes="${Number(state.config.ui_idle_minutes) > 0 ? Number(state.config.ui_idle_minutes) : 5}"
+              ${(Number.isInteger(Number(state.config.ui_idle_minutes)) ? Number(state.config.ui_idle_minutes) : 5) === 0 ? "checked" : ""}
+            />
+            <span class="switch-track"><span class="switch-thumb"></span></span>
+            <span class="sr-only">界面常驻内存</span>
+          </label>
         </div>
-        <div class="port-field">
+      </section>
+
+      <div class="section-rule"></div>
+
+      <section class="settings-section" aria-labelledby="aiIdleHeading">
+        <div class="section-heading with-toggle">
+          <div class="section-icon"><i data-lucide="cpu"></i></div>
+          <div>
+            <h2 id="aiIdleHeading">AI 引擎常驻内存</h2>
+            <p>开启后模型常驻后台；关闭则按空闲时间自动回收</p>
+          </div>
+          <label class="switch" title="AI 引擎常驻内存">
+            <input
+              id="aiResidentToggle"
+              type="checkbox"
+              data-last-minutes="${Number(state.config.ai_idle_minutes) > 0 ? Number(state.config.ai_idle_minutes) : 15}"
+              ${(Number.isInteger(Number(state.config.ai_idle_minutes)) ? Number(state.config.ai_idle_minutes) : 15) === 0 ? "checked" : ""}
+            />
+            <span class="switch-track"><span class="switch-thumb"></span></span>
+            <span class="sr-only">AI 引擎常驻内存</span>
+          </label>
+        </div>
+        <div id="aiIdleField" class="port-field ocr-field ${(Number.isInteger(Number(state.config.ai_idle_minutes)) ? Number(state.config.ai_idle_minutes) : 15) === 0 ? "is-disabled" : ""}">
           <label class="field-label" for="aiIdleMinutes">分钟</label>
           <input
             class="number-input"
@@ -882,10 +1373,11 @@ function renderSettingsViewHTML() {
             inputmode="numeric"
             min="0"
             step="1"
+            ${(Number.isInteger(Number(state.config.ai_idle_minutes)) ? Number(state.config.ai_idle_minutes) : 15) === 0 ? "disabled" : ""}
             value="${Number.isInteger(Number(state.config.ai_idle_minutes)) ? Number(state.config.ai_idle_minutes) : 15}"
             aria-describedby="aiIdleHelp"
           />
-          <p class="field-help" id="aiIdleHelp">0 表示常驻，默认 15 分钟</p>
+          <p class="field-help" id="aiIdleHelp">关闭常驻后的自动休眠等待分钟数（0 等同常驻）</p>
         </div>
       </section>
 
@@ -944,18 +1436,124 @@ function bindSettingsViewEvents() {
   document
     .querySelector("#ocrEnabled")
     ?.addEventListener("change", toggleOcrField)
+  const aiResidentToggle = document.querySelector("#aiResidentToggle")
+  const aiIdleField = document.querySelector("#aiIdleField")
+  const aiIdleInput = document.querySelector("#aiIdleMinutes")
+  aiResidentToggle?.addEventListener("change", () => {
+    const resident = Boolean(aiResidentToggle.checked)
+    if (aiIdleField) aiIdleField.classList.toggle("is-disabled", resident)
+    if (aiIdleInput) {
+      if (resident) {
+        const cur = Number(aiIdleInput.value)
+        if (Number.isInteger(cur) && cur > 0) {
+          aiResidentToggle.dataset.lastMinutes = String(cur)
+        }
+        aiIdleInput.value = "0"
+        aiIdleInput.disabled = true
+      } else {
+        aiIdleInput.disabled = false
+        aiIdleInput.value = aiResidentToggle.dataset.lastMinutes || "15"
+      }
+    }
+  })
+  aiIdleInput?.addEventListener("change", () => {
+    const val = Number(aiIdleInput.value)
+    if (Number.isInteger(val) && val > 0 && aiResidentToggle) {
+      aiResidentToggle.dataset.lastMinutes = String(val)
+    } else if (val === 0 && aiResidentToggle) {
+      aiResidentToggle.checked = true
+      aiIdleInput.disabled = true
+      aiIdleField?.classList.add("is-disabled")
+    }
+  })
+  document
+    .querySelectorAll('input[name="model_download_source"]')
+    .forEach((input) =>
+      input.addEventListener("change", () => applyDownloadSourceChange(true)),
+    )
+  document
+    .querySelector("#modelDownloadBaseUrl")
+    ?.addEventListener("change", () => applyDownloadSourceChange(false))
   document.querySelector("#cancelSettingsBtn")?.addEventListener("click", () => {
+    setHotkeyRecording(false)
     state.active_tab = "translate"
     render()
   })
   document.querySelector("#saveBtn")?.addEventListener("click", saveSettings)
 }
 
-function themeOption(value, icon, label) {
-  const selected = (state.config.theme || "system") === value
+function isHttpUrl(raw) {
+  return /^https?:\/\/[^/\s]+/i.test((raw || "").trim())
+}
+
+async function applyDownloadSourceChange(fromRadio) {
+  const source =
+    document.querySelector('input[name="model_download_source"]:checked')
+      ?.value || "modelscope"
+  const customField = document.querySelector("#customSourceField")
+  const urlInput = document.querySelector("#modelDownloadBaseUrl")
+  const status = document.querySelector("#saveStatus")
+  if (customField) {
+    customField.classList.toggle("hidden", source !== "custom")
+  }
+
+  const baseUrl = (urlInput?.value || "").trim().replace(/\/+$/, "")
+  if (source === "custom" && !baseUrl) {
+    if (fromRadio) {
+      urlInput?.focus()
+      if (status) showStatus(status, "请输入自定义镜像地址或 .gguf 直链", "pending")
+    }
+    return
+  }
+  if (source === "custom" && !isHttpUrl(baseUrl)) {
+    if (status)
+      showStatus(status, "自定义地址需要以 http:// 或 https:// 开头", "error")
+    urlInput?.focus()
+    return
+  }
+
+  const next = {
+    ...state.config,
+    model_download_source: source,
+    model_download_base_url: baseUrl,
+  }
+  if (!window.go?.wailsui?.App) {
+    state.config = next
+    return
+  }
+
+  try {
+    await SaveConfig(next)
+    const synced = await State()
+    state.config = synced.config || next
+    if (synced.health) state.health = synced.health
+    if (urlInput) {
+      urlInput.value = state.config.model_download_base_url || ""
+    }
+    updateEngineIndicators()
+    if (status) {
+      showStatus(status, "下载源已切换，如模型未完成将自动重试", "success")
+    }
+  } catch (error) {
+    if (status) showStatus(status, `切换下载源失败: ${readableError(error)}`, "error")
+  }
+}
+
+function setHotkeyRecording(recording) {
+  try {
+    if (window.go?.wailsui?.App?.SetHotkeyRecording) {
+      SetHotkeyRecording(recording).catch(() => {})
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function radioCardOption(name, selectedValue, value, icon, label) {
+  const selected = selectedValue === value
   return `
     <label class="theme-option">
-      <input type="radio" name="theme" value="${value}" ${selected ? "checked" : ""} />
+      <input type="radio" name="${name}" value="${value}" ${selected ? "checked" : ""} />
       <span class="theme-option-content">
         <i data-lucide="${icon}"></i>
         <span>${label}</span>
@@ -964,17 +1562,28 @@ function themeOption(value, icon, label) {
   `
 }
 
+function themeOption(value, icon, label) {
+  return radioCardOption("theme", state.config.theme || "system", value, icon, label)
+}
+
 function deviceOption(value, icon, label) {
-  const selected = (state.config.acceleration_device || "auto") === value
-  return `
-    <label class="theme-option">
-      <input type="radio" name="acceleration_device" value="${value}" ${selected ? "checked" : ""} />
-      <span class="theme-option-content">
-        <i data-lucide="${icon}"></i>
-        <span>${label}</span>
-      </span>
-    </label>
-  `
+  return radioCardOption(
+    "acceleration_device",
+    state.config.acceleration_device || "auto",
+    value,
+    icon,
+    label,
+  )
+}
+
+function modelSourceOption(value, icon, label) {
+  return radioCardOption(
+    "model_download_source",
+    state.config.model_download_source || "modelscope",
+    value,
+    icon,
+    label,
+  )
 }
 
 function renderCurrentDeviceBadge() {
@@ -982,7 +1591,8 @@ function renderCurrentDeviceBadge() {
   if (!info) return ""
   const actual = String(info.actual || "cpu")
   const isGpu = actual.toLowerCase().includes("gpu")
-  const label = isGpu ? "当前已生效：显卡 (GPU) 加速" : "当前运行模式：纯 CPU 推理"
+  const threads = Number(info.threads) > 0 ? ` · ${Number(info.threads)} 线程` : ""
+  const label = `${isGpu ? "当前已生效：显卡 (GPU) 加速" : "当前运行模式：纯 CPU 推理"}${threads}`
   return `
     <div class="device-status-badge ${isGpu ? "is-gpu" : "is-cpu"}">
       <i data-lucide="${isGpu ? "zap" : "cpu"}"></i>
@@ -1021,12 +1631,14 @@ function applyTheme(theme = "system") {
 function bindHotkeyInput(input) {
   if (!input) return
   input.addEventListener("focus", () => {
+    setHotkeyRecording(true)
     input.dataset.previous = input.value
     input.value = "请按下组合键"
     input.classList.add("is-recording")
   })
 
   input.addEventListener("blur", () => {
+    setHotkeyRecording(false)
     if (input.classList.contains("is-recording"))
       input.value = input.dataset.previous || ""
     input.classList.remove("is-recording")
@@ -1073,10 +1685,34 @@ async function saveSettings() {
   const ocrHotkeyDisplay =
     document.querySelector("#ocrHotkeyDisplay")?.value.trim() || ""
   const serverPort = Number(document.querySelector("#serverPort")?.value)
-  const aiIdleMinutes = Number(document.querySelector("#aiIdleMinutes")?.value)
+  const cpuThreads = Number(document.querySelector("#cpuThreads")?.value)
+  const uiResidentToggle = document.querySelector("#uiResidentToggle")
+  const aiResident = Boolean(document.querySelector("#aiResidentToggle")?.checked)
+  const aiIdleMinutes = aiResident
+    ? 0
+    : Number(document.querySelector("#aiIdleMinutes")?.value)
+  const uiIdleMinutes = uiResidentToggle?.checked
+    ? 0
+    : Number(uiResidentToggle?.dataset.lastMinutes) > 0
+      ? Number(uiResidentToggle.dataset.lastMinutes)
+      : 5
+  const modelDownloadSource =
+    document.querySelector('input[name="model_download_source"]:checked')
+      ?.value || "modelscope"
+  const modelDownloadBaseUrl = (
+    document.querySelector("#modelDownloadBaseUrl")?.value || ""
+  )
+    .trim()
+    .replace(/\/+$/, "")
 
   if (!isValidHotkey(hotkeyDisplay) || !isValidHotkey(ocrHotkeyDisplay)) {
     if (status) showStatus(status, "快捷键需要包含修饰键和普通按键", "error")
+    return
+  }
+  if (modelDownloadSource === "custom" && !isHttpUrl(modelDownloadBaseUrl)) {
+    if (status)
+      showStatus(status, "自定义下载地址需要以 http:// 或 https:// 开头", "error")
+    document.querySelector("#modelDownloadBaseUrl")?.focus()
     return
   }
   if (
@@ -1087,6 +1723,16 @@ async function saveSettings() {
     if (status)
       showStatus(status, "端口必须是 1024 到 65535 之间的整数", "error")
     document.querySelector("#serverPort")?.focus()
+    return
+  }
+  if (
+    !Number.isInteger(cpuThreads) ||
+    cpuThreads < 0 ||
+    cpuThreads > 256
+  ) {
+    if (status)
+      showStatus(status, "CPU 线程数必须是 0 到 256 之间的整数", "error")
+    document.querySelector("#cpuThreads")?.focus()
     return
   }
   if (!Number.isInteger(aiIdleMinutes) || aiIdleMinutes < 0) {
@@ -1110,18 +1756,25 @@ async function saveSettings() {
       document.querySelector("#launchAtLogin")?.checked,
     ),
     server_port: serverPort,
+    cpu_threads: cpuThreads,
+    ui_idle_minutes: uiIdleMinutes,
     ai_idle_minutes: aiIdleMinutes,
     acceleration_device:
       document.querySelector('input[name="acceleration_device"]:checked')?.value || "auto",
     theme:
       document.querySelector('input[name="theme"]:checked')?.value || "system",
+    model_download_source: modelDownloadSource,
+    model_download_base_url: modelDownloadBaseUrl,
   }
 
   if (button) button.disabled = true
   if (status) showStatus(status, "正在保存...", "pending")
   try {
     await SaveConfig(next)
-    state.config = next
+    const synced = await State()
+    state.config = synced.config || next
+    if (synced.health) state.health = synced.health
+    updateEngineIndicators()
     if (status) {
       showStatus(status, "设置已保存", "success")
       setTimeout(() => {
@@ -1244,15 +1897,10 @@ async function refreshHealth() {
   if (!window.go?.wailsui?.App) return
   try {
     const next = await State()
-    const ready = Boolean(next.health?.translator_ready)
-    state.health = next.health
-    if (ready) clearInterval(healthTimer)
-    const node = document.querySelector("#engineState")
-    const text = document.querySelector("#engineText")
-    if (!node || !text) return
-    node.classList.toggle("is-ready", ready)
-    node.classList.toggle("is-loading", !ready)
-    text.textContent = ready ? "引擎就绪" : "正在启动"
+    state.health = next.health || {}
+    state.startup_status = next.startup_status ?? ""
+    state.startup_error = next.startup_error ?? ""
+    updateEngineIndicators()
   } catch {
     // The next interval retries
   }
@@ -1305,12 +1953,7 @@ function closeWindow() {
   windowShown = false
   lastResultHeight = 0
   resultSignature = ""
-  state.manualTranslate = {
-    sourceText: "",
-    translatedText: "",
-    isLoading: false,
-    error: "",
-  }
+  state.manualTranslate = emptyManualTranslateState()
   if (document.querySelector(".result-shell")) {
     app.innerHTML = ""
   }
@@ -1459,6 +2102,14 @@ function escapeHtml(value) {
   )
 }
 
+window.addEventListener("dragover", (event) => {
+  event.preventDefault()
+})
+window.addEventListener("drop", (event) => {
+  if (!event.target?.closest?.("#sourceCard")) {
+    event.preventDefault()
+  }
+})
 window.addEventListener("keydown", handleWindowKeydown)
 systemTheme.addEventListener("change", () => {
   if (activeTheme === "system") applyTheme("system")

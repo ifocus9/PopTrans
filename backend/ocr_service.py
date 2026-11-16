@@ -27,6 +27,7 @@ class OCRService:
     def __init__(self):
         self._engine = None
         self._loading_lock = threading.Lock()
+        self._run_lock = threading.Lock()
 
     def is_loaded(self) -> bool:
         """OCR 模型是否已加载"""
@@ -39,6 +40,11 @@ class OCRService:
             if self._engine is not None:
                 self._engine = None
                 logger.info("OCR 模型已释放")
+
+    def _run_engine(self, engine, img):
+        """Serialize RapidOCR ONNX inference calls across worker threads."""
+        with self._run_lock:
+            return engine(img)
 
     def _ensure_engine(self):
         """懒加载 RapidOCR"""
@@ -286,7 +292,7 @@ class OCRService:
             primary_scale,
         )
 
-        primary_result, _ = engine(primary_img)
+        primary_result, _ = self._run_engine(engine, primary_img)
         primary_stats = self._summarize_ocr_result(primary_result)
 
         merged = primary_result or []
@@ -295,7 +301,7 @@ class OCRService:
         retry_scale = self._next_scale_factor(img.size, primary_scale)
         if self._needs_retry(primary_stats, retry_scale):
             retry_img, retry_scale = self._preprocess_image(img, scale_factor=retry_scale)
-            retry_result, _ = engine(retry_img)
+            retry_result, _ = self._run_engine(engine, retry_img)
             retry_stats = self._summarize_ocr_result(retry_result)
 
             if self._result_quality_score(retry_stats) >= self._result_quality_score(primary_stats):

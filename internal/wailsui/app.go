@@ -2,7 +2,12 @@ package wailsui
 
 import (
 	"context"
+	"encoding/base64"
+	"errors"
 	"log"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -17,7 +22,12 @@ import (
 )
 
 const (
-	eventUIState = "ui:state"
+	eventUIState      = "ui:state"
+	MainDefaultWidth  = 480
+	MainDefaultHeight = 660
+	MainMinWidth      = 400
+	MainMinHeight     = 500
+	maxOCRImageBytes  = 10 << 20
 )
 
 type App struct {
@@ -44,6 +54,8 @@ type App struct {
 	startupStarted time.Time
 	idleTimer      *time.Timer
 	idleTimeout    time.Duration
+	mainWidth      int
+	mainHeight     int
 
 	clickOutsideMu     sync.Mutex
 	clickOutsideCancel context.CancelFunc
@@ -62,71 +74,105 @@ type UIState struct {
 }
 
 type TranslateResult struct {
-	Source string `json:"source"`
-	Result string `json:"result"`
+	Source    string `json:"source"`
+	Result    string `json:"result"`
+	ElapsedMS int64  `json:"elapsed_ms"`
+}
+
+type OCRResult struct {
+	Text      string `json:"text"`
+	ElapsedMS int64  `json:"elapsed_ms"`
 }
 
 type ResultView struct {
-	Source  string `json:"source"`
-	Result  string `json:"result"`
-	Error   string `json:"error"`
-	Loading bool   `json:"loading"`
+	Source    string `json:"source"`
+	Result    string `json:"result"`
+	Error     string `json:"error"`
+	Loading   bool   `json:"loading"`
+	ElapsedMS int64  `json:"elapsed_ms,omitempty"`
 }
 
-func NewApp(baseDir string, args []string) *App {
+// LaunchOptions configures translate-ui without passing secrets on the command line.
+type LaunchOptions struct {
+	Daemon        bool
+	Mode          string
+	Visible       bool
+	SettingsOpen  bool
+	CallbackURL   string
+	CallbackToken string
+}
+
+// LaunchOptionsFromEnv reads daemon configuration from validated environment variables.
+func LaunchOptionsFromEnv() LaunchOptions {
+	var opts LaunchOptions
+	opts.Daemon = os.Getenv("POPTRANS_UI_DAEMON") == "1"
+	if raw := strings.TrimSpace(os.Getenv("POPTRANS_UI_CALLBACK_URL")); isLoopbackHTTPURL(raw) {
+		opts.CallbackURL = raw
+	}
+	if token := strings.TrimSpace(os.Getenv("POPTRANS_UI_CALLBACK_TOKEN")); token != "" && len(token) <= 256 {
+		opts.CallbackToken = token
+	}
+	return opts
+}
+
+// ApplyModeArgs applies non-secret display mode flags for manual standalone launches.
+func (o *LaunchOptions) ApplyModeArgs(args []string) {
+	for _, arg := range args {
+		switch arg {
+		case "--settings":
+			o.Mode = "settings"
+			o.Visible = true
+			o.SettingsOpen = true
+		case "--translate":
+			o.Mode = "translate"
+			o.Visible = true
+			o.SettingsOpen = true
+		case "--result":
+			o.Mode = "result"
+			o.Visible = true
+		}
+	}
+}
+
+func NewApp(baseDir string, launch LaunchOptions) *App {
 	cfg, err := config.Load(baseDir)
 	if err != nil {
 		cfg = config.Default
 	}
 	client := backend.NewClient(config.BackendURL(cfg.ServerPort))
+	mode := launch.Mode
+	if mode == "" {
+		mode = "settings"
+	}
 	app := &App{
 		baseDir:       baseDir,
 		client:        client,
 		supervisor:    backend.NewSupervisor(baseDir, client),
-		mode:          "settings",
-		visible:       false,
+		daemonMode:    launch.Daemon,
+		mode:          mode,
+		visible:       launch.Visible,
+		settingsOpen:  launch.SettingsOpen,
+		callbackURL:   launch.CallbackURL,
+		callbackToken: launch.CallbackToken,
 		idleTimeout:   cfg.UIIdleTimeout(),
 		startupStatus: "正在启动本地服务...",
-	}
-
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--daemon":
-			app.daemonMode = true
-		case "--callback-url":
-			if i+1 < len(args) {
-				app.callbackURL = args[i+1]
-				i++
-			}
-		case "--callback-token":
-			if i+1 < len(args) {
-				app.callbackToken = args[i+1]
-				i++
-			}
-		case "--settings":
-			// Backward-compatible launch mode: open settings once.
-			app.mode = "settings"
-			app.visible = true
-			app.settingsOpen = true
-		case "--translate":
-			app.mode = "translate"
-			app.visible = true
-			app.settingsOpen = true
-		case "--result":
-			// Legacy one-shot result mode is no longer used by the host.
-			// Keep parsing so old shortcuts do not crash.
-			app.mode = "result"
-			app.visible = true
-			if i+1 < len(args) {
-				i++
-			}
-		}
 	}
 
 	if app.callbackURL != "" && app.callbackToken != "" {
 		app.notify = uidaemon.NewNotifyClient(app.callbackURL, app.callbackToken)
 	}
 	return app
+}
+
+// isLoopbackHTTPURL accepts only http://127.0.0.1[:port] or http://[::1][:port],
+// matching the host process callback server.
+func isLoopbackHTTPURL(raw string) bool {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme != "http" || parsed.Host == "" {
+		return false
+	}
+	ip := net.ParseIP(parsed.Hostname())
+	return ip != nil && ip.IsLoopback()
 }
 
 func (a *App) Startup(ctx context.Context) {
@@ -139,20 +185,25 @@ func (a *App) Startup(ctx context.Context) {
 		}
 		a.mu.Lock()
 		a.ready = true
-		a.mode = "settings"
+		a.mode = "translate"
 		a.visible = true
 		a.settingsOpen = false
-		a.startupLoading = true
+		a.startupLoading = false
+		a.startupStatus = ""
+		a.startupError = ""
 		a.startupStarted = time.Now()
 		a.mu.Unlock()
-		// The host process starts the backend. Poll its health here so the UI can
-		// show download/load progress without racing a second backend process.
+		runtime.WindowSetMinSize(ctx, MainMinWidth, MainMinHeight)
+		// The host process starts the backend. Poll its health here so the
+		// non-blocking workbench badge/banner reflects download/load progress.
 		go a.monitorStartup()
 		return
 	}
 
 	// Non-daemon fallback (manual/dev launch).
 	if a.mode == "result" {
+		runtime.WindowSetMinSize(ctx, 320, 140)
+		runtime.WindowSetMaxSize(ctx, 0, 0)
 		positionResultWindow(ctx)
 		a.mu.Lock()
 		a.ready = true
@@ -161,6 +212,7 @@ func (a *App) Startup(ctx context.Context) {
 		return
 	}
 
+	a.positionMainWindow()
 	a.mu.Lock()
 	a.ready = true
 	if !a.visible {
@@ -175,6 +227,39 @@ func (a *App) Startup(ctx context.Context) {
 	}()
 }
 
+func isStartupFailureStatus(status string) bool {
+	if status == "" || strings.Contains(status, "正在重试") || strings.Contains(status, "断点续传") {
+		return false
+	}
+	lower := strings.ToLower(status)
+	return strings.Contains(status, "失败") ||
+		strings.Contains(status, "拒绝") ||
+		strings.Contains(status, "未找到") ||
+		strings.Contains(status, "超时") ||
+		strings.Contains(lower, "error") ||
+		strings.Contains(lower, "failed")
+}
+
+func (a *App) applyHealthToStartupLocked(health backend.Health) (ready bool) {
+	if health.TranslatorReady {
+		a.startupLoading = false
+		a.startupStatus = "引擎就绪"
+		a.startupError = ""
+		return true
+	}
+	status := strings.TrimSpace(health.TranslatorStatus)
+	if status == "" {
+		status = "正在加载翻译模型..."
+	}
+	a.startupStatus = status
+	if isStartupFailureStatus(status) {
+		a.startupError = status
+	} else {
+		a.startupError = ""
+	}
+	return false
+}
+
 func (a *App) monitorStartup() {
 	ctx := a.ctx
 	if ctx == nil {
@@ -184,49 +269,35 @@ func (a *App) monitorStartup() {
 	defer ticker.Stop()
 	deadline := time.NewTimer(backend.StartupReadyTimeout)
 	defer deadline.Stop()
+	connFailCount := 0
 	for {
 		select {
 		case <-ticker.C:
-			health, err := a.client.Health(ctx)
+			healthCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+			health, err := a.client.Health(healthCtx)
+			cancel()
+
 			a.mu.Lock()
+			var ready bool
 			if err != nil {
+				connFailCount++
 				a.startupStatus = "正在连接本地服务..."
-			} else if health.TranslatorStatus != "" {
-				a.startupStatus = health.TranslatorStatus
-			} else if !health.TranslatorReady {
-				a.startupStatus = "正在加载翻译模型..."
-			}
-			ready := err == nil && health.TranslatorReady && time.Since(a.startupStarted) >= 1200*time.Millisecond
-			// 冷启动由本函数收尾：模型就绪后隐藏启动窗口。但 daemon 可能因
-			// UI 空闲退出后被宿主首个快捷键/设置请求重新拉起，此时宿主已把
-			// 视图切到 result 弹窗(ShowResult)或打开设置(ShowSettings)。
-			// 若这里无条件 WindowHide，会藏掉正在显示的翻译/加载弹窗，且 Go
-			// 侧 visible=true 与真实窗口不可见不一致——这就是"AI 引擎休眠后
-			// 首个翻译弹窗看不到"的根因。仅纯冷启动(settings 未打开)才收尾。
-			mode := a.mode
-			settingsOpen := a.settingsOpen
-			if ready {
-				a.startupLoading = false
-				a.startupStatus = "模型加载完成"
-			}
-			if ready && (mode == "settings" || mode == "translate") && !settingsOpen {
-				a.visible = false
+				if connFailCount >= 20 {
+					a.startupError = "无法连接本地 AI 服务"
+				}
+			} else {
+				connFailCount = 0
+				ready = a.applyHealthToStartupLocked(health)
 			}
 			a.mu.Unlock()
 			a.emitState()
 			if ready {
-				if (mode == "settings" || mode == "translate") && !settingsOpen {
-					runtime.WindowHide(ctx)
-				}
-				a.scheduleIdleExit()
 				return
 			}
 		case <-deadline.C:
 			a.mu.Lock()
-			// Keep the startup page visible on timeout so the user can see why the
-			// app did not move to the tray.
-			a.startupLoading = true
-			a.startupError = "等待模型加载超时，请检查网络或模型文件"
+			a.startupLoading = false
+			a.startupError = "等待模型加载超时，请检查网络或下载源设置"
 			a.startupStatus = "模型加载超时"
 			a.mu.Unlock()
 			a.emitState()
@@ -276,10 +347,42 @@ func positionResultWindow(ctx context.Context) {
 	runtime.WindowSetAlwaysOnTop(ctx, true)
 }
 
-func positionSettingsWindow(ctx context.Context) {
-	runtime.WindowSetAlwaysOnTop(ctx, false)
-	runtime.WindowSetSize(ctx, 458, 640)
-	runtime.WindowCenter(ctx)
+func (a *App) captureMainWindowSize() {
+	if a.ctx == nil {
+		return
+	}
+	if runtime.WindowIsMaximised(a.ctx) || runtime.WindowIsMinimised(a.ctx) {
+		return
+	}
+	w, h := runtime.WindowGetSize(a.ctx)
+	if w >= MainMinWidth && h >= MainMinHeight {
+		a.mu.Lock()
+		a.mainWidth = w
+		a.mainHeight = h
+		a.mu.Unlock()
+	}
+}
+
+func (a *App) positionMainWindow() {
+	if a.ctx == nil {
+		return
+	}
+	runtime.WindowSetAlwaysOnTop(a.ctx, false)
+	runtime.WindowSetMinSize(a.ctx, MainMinWidth, MainMinHeight)
+	runtime.WindowSetMaxSize(a.ctx, 0, 0)
+
+	a.mu.Lock()
+	w, h := a.mainWidth, a.mainHeight
+	a.mu.Unlock()
+
+	if w >= MainMinWidth && h >= MainMinHeight {
+		if !runtime.WindowIsMaximised(a.ctx) {
+			runtime.WindowSetSize(a.ctx, w, h)
+		}
+		return
+	}
+	runtime.WindowSetSize(a.ctx, MainDefaultWidth, MainDefaultHeight)
+	runtime.WindowCenter(a.ctx)
 }
 
 func (a *App) Shutdown(ctx context.Context) {
@@ -315,10 +418,18 @@ func (a *App) State() (UIState, error) {
 	state.Visible = a.visible
 	a.mu.Unlock()
 	if mode == "settings" || mode == "translate" || state.StartupLoading {
-		healthCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		health, _ := a.client.Health(healthCtx)
+		healthCtx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+		health, healthErr := a.client.Health(healthCtx)
 		cancel()
 		state.Health = health
+		if healthErr == nil {
+			a.mu.Lock()
+			a.applyHealthToStartupLocked(health)
+			state.StartupLoading = a.startupLoading
+			state.StartupStatus = a.startupStatus
+			state.StartupError = a.startupError
+			a.mu.Unlock()
+		}
 	}
 	return state, nil
 }
@@ -343,16 +454,99 @@ func (a *App) Translate(text string) (TranslateResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
 	defer cancel()
 
+	startedAt := time.Now()
 	result, err := a.client.Translate(ctx, text)
 	if err != nil {
 		return TranslateResult{}, err
 	}
-	return TranslateResult{Source: text, Result: strings.TrimSpace(result)}, nil
+	return TranslateResult{
+		Source:    text,
+		Result:    strings.TrimSpace(result),
+		ElapsedMS: time.Since(startedAt).Milliseconds(),
+	}, nil
+}
+
+// OCRImage decodes a base64 image payload (or data URL), validates its format
+// and 10MB size limit, and extracts text via the local OCR endpoint.
+func (a *App) OCRImage(imageBase64 string) (OCRResult, error) {
+	imgBytes, err := decodeBase64Image(imageBase64)
+	if err != nil {
+		return OCRResult{}, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	startedAt := time.Now()
+	text, err := a.client.OCRImage(ctx, imgBytes)
+	if err != nil {
+		return OCRResult{}, err
+	}
+	return OCRResult{
+		Text:      strings.TrimSpace(text),
+		ElapsedMS: time.Since(startedAt).Milliseconds(),
+	}, nil
+}
+
+func isSupportedImageBytes(data []byte) bool {
+	if len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP" {
+		return true
+	}
+	if len(data) >= 2 && data[0] == 'B' && data[1] == 'M' {
+		return true
+	}
+	return strings.HasPrefix(http.DetectContentType(data), "image/")
+}
+
+func decodeBase64Image(raw string) ([]byte, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, errors.New("图片内容为空")
+	}
+	if strings.HasPrefix(strings.ToLower(trimmed), "data:") {
+		idx := strings.Index(trimmed, ",")
+		if idx < 0 {
+			return nil, errors.New("无效的图片 Data URL")
+		}
+		meta := strings.ToLower(trimmed[:idx])
+		if !strings.Contains(meta, ";base64") {
+			return nil, errors.New("仅支持 base64 编码图片")
+		}
+		trimmed = trimmed[idx+1:]
+	}
+	if base64.StdEncoding.DecodedLen(len(trimmed)) > maxOCRImageBytes+3 {
+		return nil, errors.New("图片大小不能超过 10MB")
+	}
+	data, err := base64.StdEncoding.DecodeString(trimmed)
+	if err != nil {
+		return nil, errors.New("图片数据解码失败")
+	}
+	if len(data) == 0 {
+		return nil, errors.New("图片内容为空")
+	}
+	if len(data) > maxOCRImageBytes {
+		return nil, errors.New("图片大小不能超过 10MB")
+	}
+	if !isSupportedImageBytes(data) {
+		return nil, errors.New("不支持的图片格式，请使用 PNG、JPG、WebP、BMP 或 GIF")
+	}
+	return data, nil
 }
 
 // HideWindow is called by the frontend close button in daemon mode.
 func (a *App) HideWindow() error {
 	return a.Hide()
+}
+
+// SetHotkeyRecording pauses or resumes global hotkeys while a settings hotkey
+// input has focus so Windows does not intercept existing combinations.
+func (a *App) SetHotkeyRecording(recording bool) error {
+	if a.notify == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return a.notify.HotkeyHold(ctx, recording)
 }
 
 func (a *App) startClickOutsideMonitor() {
@@ -464,44 +658,33 @@ func (a *App) Status() uidaemon.Status {
 	}
 }
 
-// ShowSettings implements uidaemon.Handler.
-func (a *App) ShowSettings() error {
+func (a *App) showMainMode(mode string) error {
 	if a.ctx == nil {
 		return context.Canceled
 	}
 
 	a.mu.Lock()
-	a.mode = "settings"
+	a.mode = mode
 	a.visible = true
 	a.settingsOpen = true
 	a.cancelIdleExitLocked()
 	a.mu.Unlock()
 
-	positionSettingsWindow(a.ctx)
+	a.positionMainWindow()
 	runtime.WindowUnminimise(a.ctx)
 	runtime.WindowShow(a.ctx)
 	a.emitState()
 	return nil
 }
 
+// ShowSettings implements uidaemon.Handler.
+func (a *App) ShowSettings() error {
+	return a.showMainMode("settings")
+}
+
 // ShowTranslate implements uidaemon.Handler.
 func (a *App) ShowTranslate() error {
-	if a.ctx == nil {
-		return context.Canceled
-	}
-
-	a.mu.Lock()
-	a.mode = "translate"
-	a.visible = true
-	a.settingsOpen = true
-	a.cancelIdleExitLocked()
-	a.mu.Unlock()
-
-	positionSettingsWindow(a.ctx)
-	runtime.WindowUnminimise(a.ctx)
-	runtime.WindowShow(a.ctx)
-	a.emitState()
-	return nil
+	return a.showMainMode("translate")
 }
 
 // ShowResult implements uidaemon.Handler.
@@ -512,15 +695,24 @@ func (a *App) ShowResult(payload uidaemon.ResultPayload) error {
 
 	a.mu.Lock()
 	wasVisibleResult := a.visible && a.mode == "result"
+	wasVisibleMain := a.visible && (a.mode == "settings" || a.mode == "translate")
+	a.mu.Unlock()
+
+	if wasVisibleMain {
+		a.captureMainWindowSize()
+	}
+
+	a.mu.Lock()
 	a.mode = "result"
 	a.visible = true
 	// Result can temporarily replace settings view; keep settingsOpen sticky so
 	// host continues suspending hotkeys until settings are explicitly closed.
 	a.result = ResultView{
-		Source:  payload.Source,
-		Result:  payload.Result,
-		Error:   payload.Error,
-		Loading: payload.Loading,
+		Source:    payload.Source,
+		Result:    payload.Result,
+		Error:     payload.Error,
+		Loading:   payload.Loading,
+		ElapsedMS: payload.ElapsedMS,
 	}
 	a.cancelIdleExitLocked()
 	a.mu.Unlock()
@@ -528,6 +720,11 @@ func (a *App) ShowResult(payload uidaemon.ResultPayload) error {
 	// Only place the popup on first show. Subsequent loading/result updates must
 	// not chase the cursor or reset size, which causes a visible jump.
 	if !wasVisibleResult {
+		if runtime.WindowIsMaximised(a.ctx) {
+			runtime.WindowUnmaximise(a.ctx)
+		}
+		runtime.WindowSetMinSize(a.ctx, 320, 140)
+		runtime.WindowSetMaxSize(a.ctx, 0, 0)
 		positionResultWindow(a.ctx)
 		runtime.WindowSetSize(a.ctx, 425, 300)
 		runtime.WindowUnminimise(a.ctx)
@@ -551,9 +748,16 @@ func (a *App) Hide() error {
 		return nil
 	}
 
-	wasSettings := false
 	a.mu.Lock()
-	wasSettings = a.settingsOpen || a.mode == "settings" || a.mode == "translate"
+	wasSettings := a.settingsOpen || a.mode == "settings" || a.mode == "translate"
+	prevMode := a.mode
+	a.mu.Unlock()
+
+	if prevMode == "settings" || prevMode == "translate" {
+		a.captureMainWindowSize()
+	}
+
+	a.mu.Lock()
 	a.visible = false
 	a.settingsOpen = false
 	if a.mode == "result" {

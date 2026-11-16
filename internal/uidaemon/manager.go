@@ -11,6 +11,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"translate-plugin/internal/config"
+	win "translate-plugin/internal/platform/windows"
 )
 
 const (
@@ -20,6 +23,10 @@ const (
 	EventConfigSaved = 2
 	// EventUIExited is posted when the UI process exits unexpectedly.
 	EventUIExited = 3
+	// EventHotkeyPause pauses host global hotkeys while recording a hotkey.
+	EventHotkeyPause = 4
+	// EventHotkeyResume resumes host global hotkeys after recording ends.
+	EventHotkeyResume = 5
 
 	processQueryLimitedInformation = 0x1000
 	stillActive                    = 259
@@ -231,9 +238,9 @@ func (m *Manager) killStaleDaemon() {
 }
 
 func (m *Manager) startProcess(ctx context.Context) error {
-	exePath := m.resolveUI()
-	if exePath == "" {
-		return errors.New("translate-ui.exe not found")
+	exePath, err := win.TrustedExecutable(m.resolveUI(), "translate-ui.exe")
+	if err != nil {
+		return err
 	}
 
 	m.mu.Lock()
@@ -245,13 +252,15 @@ func (m *Manager) startProcess(ctx context.Context) error {
 	}
 
 	RemoveEndpoint(m.baseDir)
-	cmd := exec.Command(
-		exePath,
-		"--daemon",
-		"--callback-url", callbackURL,
-		"--callback-token", callbackTok,
-	)
+	// Pass callback URL/token through environment variables rather than CLI
+	// arguments so the token is not exposed in process command lines.
+	cmd := &exec.Cmd{Path: exePath, Args: []string{exePath}}
 	cmd.Dir = filepath.Dir(exePath)
+	env := config.EnvironmentWith(os.Environ(), "POPTRANS_BASE_DIR", m.baseDir)
+	env = config.EnvironmentWith(env, "POPTRANS_UI_DAEMON", "1")
+	env = config.EnvironmentWith(env, "POPTRANS_UI_CALLBACK_URL", callbackURL)
+	env = config.EnvironmentWith(env, "POPTRANS_UI_CALLBACK_TOKEN", callbackTok)
+	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,
 		CreationFlags: 0x08000000, // CREATE_NO_WINDOW

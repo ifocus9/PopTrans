@@ -98,3 +98,15 @@ func TestTerminateProcessTreeAllowsNilProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestBackendCommandSkipsDirectoryNamedEngine(t *testing.T) {
+	baseDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(baseDir, "ai_engine.exe"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	supervisor := NewSupervisor(baseDir, NewClient("http://127.0.0.1:0"))
+	if _, _, err := supervisor.backendCommand(); err == nil {
+		t.Fatal("expected error when ai_engine.exe is a directory and backend script is absent")
+	}
+}
